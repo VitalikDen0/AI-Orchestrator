@@ -256,6 +256,5 @@ python 1.py --web
 - DonationAlerts: `later`
 <span style="display:none"></span>
 
-<div style="text-align: center">⁂</div>
-[^3]: index.html
+
 
