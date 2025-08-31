@@ -72,7 +72,7 @@ pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorc
 #### Основная модель (мозг)
 
 - **huihui-qwen3-4b-thinking-2507-abliterated** 
-- Скачайте через LM Studio или найдите на [Hugging Face](https://huggingface.co/)
+- Скачайте через LM Studio или на [Hugging Face](https://huggingface.co/)
 - Требования: ~4GB VRAM
 p.s. **abliterated** по причине того, что она будет меньше отказывать в действиях
 
