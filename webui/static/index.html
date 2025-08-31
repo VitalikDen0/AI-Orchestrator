@@ -1,0 +1,1359 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Orchestrator - Веб-интерфейс (порт 8001)</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #8b5cf6;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --dark: #0f172a;
+            --darker: #020617;
+            --light: #f8fafc;
+            --gray: #64748b;
+            --border: #334155;
+            --card-bg: #1e293b;
+            --input-bg: #334155;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, var(--darker) 0%, var(--dark) 100%);
+            color: var(--light);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Header */
+        .header {
+            background: rgba(30, 41, 59, 0.8);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border);
+            padding: 20px 0;
+            margin-bottom: 30px;
+            border-radius: 0 0 20px 20px;
+        }
+
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--primary);
+        }
+
+        .logo i {
+            font-size: 28px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 12px;
+        }
+
+        /* Main Layout */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 400px;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+        }
+
+        .card-header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .card-header h2 {
+            font-size: 18px;
+            font-weight: 600;
+            color: white;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-content {
+            padding: 24px;
+        }
+
+        /* Inputs */
+        .input-group {
+            margin-bottom: 20px;
+        }
+
+        .input-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: var(--gray);
+        }
+
+        .input-field {
+            width: 100%;
+            background: var(--input-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px;
+            color: var(--light);
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        textarea.input-field {
+            resize: vertical;
+            min-height: 120px;
+            font-family: inherit;
+        }
+
+        /* Buttons */
+        .btn {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn:hover {
+            background: var(--primary-dark);
+            transform: translateY(-1px);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        /* Active checkbox styling */
+        .input-group input[type="checkbox"]:checked + label {
+            color: var(--primary);
+            font-weight: 600;
+        }
+        
+        .input-group input[type="checkbox"]:checked {
+            accent-color: var(--primary);
+        }
+
+        .btn-success {
+            background: var(--success);
+        }
+
+        .btn-success:hover {
+            background: #059669;
+        }
+
+        .btn-warning {
+            background: var(--warning);
+        }
+
+        .btn-warning:hover {
+            background: #d97706;
+        }
+
+        .btn-danger {
+            background: var(--danger);
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        .btn-secondary {
+            background: var(--secondary);
+        }
+
+        .btn-secondary:hover {
+            background: #7c3aed;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        /* Performance Metrics */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .metric-card {
+            background: rgba(99, 102, 241, 0.1);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            border-radius: 12px;
+            padding: 16px;
+            text-align: center;
+        }
+
+        .metric-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--primary);
+            margin-bottom: 4px;
+        }
+
+        .metric-label {
+            font-size: 12px;
+            color: var(--gray);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* Status */
+        .status {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status.info {
+            background: rgba(99, 102, 241, 0.1);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            color: var(--primary);
+        }
+
+        .status.success {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .status.warning {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+
+        .status.error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+
+        /* Image Preview */
+        .image-preview {
+            background: var(--input-bg);
+            border: 2px dashed var(--border);
+            border-radius: 12px;
+            min-height: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .image-preview:hover {
+            border-color: var(--primary);
+        }
+
+        .image-preview img {
+            max-width: 100%;
+            max-height: 400px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        .image-preview img:hover {
+            transform: scale(1.02);
+            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+        }
+
+        .image-preview .image-info {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .image-preview:hover .image-info {
+            opacity: 1;
+        }
+
+        /* File Upload */
+        .file-upload {
+            position: relative;
+            display: inline-block;
+            cursor: pointer;
+            margin-bottom: 16px;
+        }
+
+        .file-upload input[type=file] {
+            position: absolute;
+            opacity: 0;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+
+        .file-upload-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            background: var(--input-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--light);
+            transition: all 0.3s ease;
+        }
+
+        .file-upload:hover .file-upload-label {
+            border-color: var(--primary);
+            background: rgba(99, 102, 241, 0.1);
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            padding: 12px 24px;
+            background: none;
+            border: none;
+            color: var(--gray);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.3s ease;
+        }
+
+        .tab.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+
+        .tab:hover {
+            color: var(--light);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Responsive */
+        @media (max-width: 1200px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 15px;
+            }
+            
+            .header-content {
+                flex-direction: column;
+                gap: 20px;
+            }
+            
+            .btn-group {
+                flex-direction: column;
+            }
+            
+            .metrics-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .fade-in {
+            animation: fadeIn 0.5s ease-out;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--input-bg);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--gray);
+        }
+
+        /* Loading */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(5px);
+        }
+
+        .modal-content {
+            background-color: var(--card-bg);
+            margin: 2% auto;
+            padding: 20px;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            width: 95%;
+            max-width: 90vw;
+            max-height: 95vh;
+            overflow-y: auto;
+            position: relative;
+        }
+
+        .modal-content img {
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+        }
+
+        .modal-controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--primary);
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .modal-btn {
+            padding: 8px 16px;
+            background: var(--input-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--light);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 14px;
+        }
+
+        .modal-btn:hover {
+            background: var(--primary);
+            border-color: var(--primary);
+        }
+
+        .close {
+            color: var(--gray);
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .close:hover {
+            color: var(--light);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-content">
+            <div class="logo">
+                <i class="fas fa-robot"></i>
+                AI Orchestrator
+                <span style="font-size: 14px; color: var(--gray); margin-left: 10px;">:8001</span>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-danger" id="reset">
+                    <i class="fas fa-trash"></i>
+                    Новый чат
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Performance Metrics -->
+        <div class="card fade-in">
+            <div class="card-header">
+                <h2><i class="fas fa-chart-line"></i> Метрики производительности</h2>
+            </div>
+            <div class="card-content">
+                <div class="metrics-grid" id="metricsGrid">
+                    <div class="metric-card">
+                        <div class="metric-value" id="avgResponseTime">0.00s</div>
+                        <div class="metric-label">Среднее время ответа</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="contextUsage">0</div>
+                        <div class="metric-label">Использование контекста</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="totalRequests">0</div>
+                        <div class="metric-label">Всего запросов</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value" id="lastResponseTime">0.00s</div>
+                        <div class="metric-label">Последний ответ</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-grid">
+            <!-- Main Chat Area -->
+            <div class="card fade-in">
+                <div class="card-header">
+                    <h2><i class="fas fa-comments"></i> Диалог с ИИ</h2>
+                </div>
+                <div class="card-content">
+                    <div class="input-group">
+                        <label for="message">Ваше сообщение</label>
+                        <textarea 
+                            id="message" 
+                            class="input-field" 
+                            placeholder="Опишите, что нужно сделать. Используйте ключевые слова 'сгенерируй', 'нарисуй' для создания изображений..."
+                        ></textarea>
+                    </div>
+
+                    <div class="btn-group">
+                        <button class="btn" id="send">
+                            <i class="fas fa-paper-plane"></i>
+                            Отправить
+                        </button>
+                        <button class="btn btn-success" id="voice">
+                            <i class="fas fa-microphone"></i>
+                            Голос
+                        </button>
+                        <button class="btn btn-secondary" id="continuousVoice">
+                            <i class="fas fa-microphone-alt"></i>
+                            Постоянная запись
+                        </button>
+                    </div>
+
+                    <div id="status" class="status info" style="display: none;">
+                        <i class="fas fa-info-circle"></i>
+                        <span id="statusText">Готов к работе</span>
+                    </div>
+
+                    <div class="input-group">
+                        <label>Ответ ИИ</label>
+                        <div id="final" class="input-field" style="background: var(--input-bg); min-height: 100px; white-space: pre-wrap;">
+                            Ожидаю вашего сообщения...
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sidebar -->
+            <div class="card fade-in">
+                <div class="card-header">
+                    <h2><i class="fas fa-cog"></i> Настройки и инструменты</h2>
+                </div>
+                <div class="card-content">
+                    <!-- Tabs -->
+                    <div class="tabs">
+                        <button class="tab active" data-tab="settings">Настройки</button>
+                        <button class="tab" data-tab="upload">Загрузка</button>
+                        <button class="tab" data-tab="performance">Производительность</button>
+                    </div>
+
+                    <!-- Settings Tab -->
+                    <div class="tab-content active" id="settings">
+                        <div class="input-group">
+                            <label for="brain">Модель мозга</label>
+                            <select id="brain" class="input-field"></select>
+                            <div id="currentBrainModelInfo" style="margin-top: 8px; padding: 8px; background: rgba(99, 102, 241, 0.1); border-radius: 6px; border: 1px solid var(--primary); font-size: 12px; color: var(--text);">
+                                <i class="fas fa-brain" style="color: var(--primary);"></i>
+                                <strong>Текущая модель:</strong> <span id="brainModelDisplay">Загрузка...</span>
+                            </div>
+                        </div>
+
+                        <div style="margin-top: 15px; padding: 10px; background: rgba(16, 185, 129, 0.1); border-radius: 8px; border: 1px solid var(--success);">
+                            <i class="fas fa-magic" style="color: var(--success);"></i>
+                            <strong>Автоматическое управление инструментами</strong><br>
+                            <small style="color: var(--gray);">Все инструменты (генерация изображений, vision, audio) теперь включаются автоматически по требованию и выключаются через 60 секунд для экономии ресурсов.</small>
+                        </div>
+
+                        <button class="btn btn-primary" id="apply">
+                            <i class="fas fa-save"></i>
+                            Применить
+                        </button>
+                        
+                        <div style="margin-top: 15px; padding: 10px; background: rgba(99, 102, 241, 0.1); border-radius: 8px; border: 1px solid var(--primary);">
+                            <i class="fas fa-info-circle" style="color: var(--primary);"></i>
+                            <strong>Веб-интерфейс доступен по адресу:</strong><br>
+                            <code style="background: rgba(0,0,0,0.3); padding: 4px 8px; border-radius: 4px; margin-top: 5px; display: inline-block;">http://127.0.0.1:8001/</code>
+                        </div>
+                        
+                        <div style="margin-top: 15px; padding: 10px; background: rgba(16, 185, 129, 0.1); border-radius: 8px; border: 1px solid var(--success);">
+                            <i class="fas fa-image" style="color: var(--success);"></i>
+                            <strong>Сгенерированные изображения</strong> будут отображаться в отдельной карточке ниже после генерации.<br>
+                            <small style="color: var(--gray);">Карточка появится автоматически при создании изображения</small>
+                        </div>
+                    </div>
+
+                    <!-- Upload Tab -->
+                    <div class="tab-content" id="upload">
+                        <div class="input-group">
+                            <label>Фото</label>
+                            <div class="file-upload">
+                                <input type="file" id="photoFile" accept="image/*">
+                                <label class="file-upload-label">
+                                    <i class="fas fa-image"></i>
+                                    Выбрать фото
+                                </label>
+                            </div>
+                            <input type="text" id="photoCtx" class="input-field" placeholder="Контекст для анализа">
+                            <button class="btn btn-success" id="uploadPhoto">
+                                <i class="fas fa-upload"></i>
+                                Загрузить фото
+                            </button>
+                        </div>
+
+                        <div class="input-group">
+                            <label>Аудио</label>
+                            <div class="file-upload">
+                                <input type="file" id="audioFile" accept="audio/*">
+                                <label class="file-upload-label">
+                                    <i class="fas fa-music"></i>
+                                    Выбрать аудио
+                                </label>
+                            </div>
+                            <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                                <input type="text" id="audioLang" class="input-field" placeholder="Язык" style="flex: 1;">
+                                <label style="display: flex; align-items: center; gap: 5px;">
+                                    <input type="checkbox" id="audioSep">
+                                    Separator
+                                </label>
+                            </div>
+                            <input type="text" id="audioCtx" class="input-field" placeholder="Контекст">
+                            <button class="btn btn-success" id="uploadAudio">
+                                <i class="fas fa-upload"></i>
+                                Загрузить аудио
+                            </button>
+                        </div>
+
+                        <div class="input-group">
+                            <label>Видео</label>
+                            <div class="file-upload">
+                                <input type="file" id="videoFile" accept="video/*">
+                                <label class="file-upload-label">
+                                    <i class="fas fa-video"></i>
+                                    Выбрать видео
+                                </label>
+                            </div>
+                            <input type="text" id="videoCtx" class="input-field" placeholder="Контекст">
+                            <button class="btn btn-success" id="uploadVideo">
+                                <i class="fas fa-upload"></i>
+                                Загрузить видео
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Performance Tab -->
+                    <div class="tab-content" id="performance">
+                        <div class="input-group">
+                            <label>Детальные метрики</label>
+                            <div id="detailedMetrics" style="background: var(--input-bg); padding: 16px; border-radius: 8px; font-size: 12px; max-height: 300px; overflow-y: auto;">
+                                Загрузка метрик...
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-secondary" id="refreshMetrics">
+                            <i class="fas fa-sync-alt"></i>
+                            Обновить метрики
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Image Preview -->
+        <div class="card fade-in" id="imageCard" style="display: none;">
+            <div class="card-header">
+                <h2><i class="fas fa-image"></i> Сгенерированное изображение</h2>
+            </div>
+            <div class="card-content">
+                <div class="image-preview" id="imgwrap">
+                    <span style="color: var(--gray);">Изображение загружается...</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Search Results -->
+        <div class="card fade-in" id="searchCard" style="display: none;">
+            <div class="card-header">
+                <h2><i class="fas fa-search"></i> Результаты поиска</h2>
+            </div>
+            <div class="card-content">
+                <div id="searchResults"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for Image -->
+    <div id="imageModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-controls">
+                <div class="modal-title">
+                    <i class="fas fa-image"></i> Сгенерированное изображение
+                </div>
+                <div class="modal-actions">
+                    <button class="modal-btn" id="downloadImage">
+                        <i class="fas fa-download"></i> Скачать
+                    </button>
+                    <button class="modal-btn" id="shareImage">
+                        <i class="fas fa-share"></i> Поделиться
+                    </button>
+                    <span class="close">&times;</span>
+                </div>
+            </div>
+            <img id="modalImage" alt="Сгенерированное изображение">
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let mediaRecorder, audioChunks = [], isRecording = false;
+        let continuousRecording = false;
+        let currentTab = 'settings';
+
+        // Utility functions
+        const $ = (selector) => document.querySelector(selector);
+        const $$ = (selector) => document.querySelectorAll(selector);
+
+        function showStatus(message, type = 'info') {
+            const status = $('#status');
+            const statusText = $('#statusText');
+            
+            status.className = `status ${type}`;
+            statusText.textContent = message;
+            status.style.display = 'flex';
+            
+            setTimeout(() => {
+                status.style.display = 'none';
+            }, 5000);
+        }
+
+        function updateMetrics(performance) {
+            if (performance) {
+                $('#lastResponseTime').textContent = `${performance.response_time.toFixed(2)}s`;
+                $('#contextUsage').textContent = performance.context_length.toLocaleString();
+            }
+        }
+
+        function updatePerformanceMetrics() {
+            fetch('/api/performance')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.summary && data.summary.brain_response) {
+                        const stats = data.summary.brain_response;
+                        $('#avgResponseTime').textContent = `${stats.avg_time.toFixed(2)}s`;
+                        $('#totalRequests').textContent = stats.count;
+                    }
+                    
+                    // Update detailed metrics
+                    if (data.metrics) {
+                        const detailedMetrics = $('#detailedMetrics');
+                        let html = '<div style="margin-bottom: 10px;"><strong>Последние 10 операций:</strong></div>';
+                        
+                        data.metrics.slice(-10).reverse().forEach(metric => {
+                            const time = new Date(metric.timestamp * 1000).toLocaleTimeString();
+                            html += `
+                                <div style="margin-bottom: 8px; padding: 8px; background: rgba(99, 102, 241, 0.1); border-radius: 4px;">
+                                    <strong>${metric.action}</strong><br>
+                                    Время: ${metric.response_time.toFixed(2)}s<br>
+                                    Контекст: ${metric.context_length.toLocaleString()}<br>
+                                    <small>${time}</small>
+                                </div>
+                            `;
+                        });
+                        
+                        detailedMetrics.innerHTML = html;
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching performance metrics:', error);
+                });
+        }
+
+        // Tab functionality
+        $$('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                // Remove active class from all tabs and contents
+                $$('.tab').forEach(t => t.classList.remove('active'));
+                $$('.tab-content').forEach(c => c.classList.remove('active'));
+                
+                // Add active class to clicked tab
+                tab.classList.add('active');
+                currentTab = tab.dataset.tab;
+                
+                // Show corresponding content
+                $(`#${currentTab}`).classList.add('active');
+            });
+        });
+
+        // Load state
+        async function loadState() {
+            try {
+                const response = await fetch('/api/state');
+                const state = await response.json();
+                
+                // Update UI elements
+                $('#final').textContent = state.last_final_response || 'Ожидаю вашего сообщения...';
+                
+                // Update brain model selector
+                const models = [
+                    'Qwen3-4B-Thinking-2507-Q4_K_M.gguf',
+                    'Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf'
+                ];
+                
+                // Get the current brain model from state
+                const currentBrainModel = state.brain_model || '';
+                
+                // Find the matching model in our list or use the current one
+                let selectedModel = models.find(m => currentBrainModel.includes(m)) || currentBrainModel;
+                
+                const brainSelect = $('#brain');
+                brainSelect.innerHTML = models.map(m => 
+                    `<option value="${m}" ${m === selectedModel ? 'selected' : ''}>${m}</option>`
+                ).join('');
+                
+                // If the current model is not in our predefined list, add it as an option
+                if (currentBrainModel && !models.includes(currentBrainModel)) {
+                    const customOption = document.createElement('option');
+                    customOption.value = currentBrainModel;
+                    customOption.text = currentBrainModel.split('/').pop() || currentBrainModel; // Show just filename
+                    customOption.selected = true;
+                    brainSelect.appendChild(customOption);
+                }
+                
+                // Update the brain model display
+                const brainModelDisplay = $('#brainModelDisplay');
+                if (currentBrainModel) {
+                    // Extract just the filename from the full path and make it more readable
+                    const modelName = currentBrainModel.split('/').pop() || currentBrainModel;
+                    // Clean up the model name for better display
+                    const cleanName = modelName
+                        .replace('.gguf', '')
+                        .replace(/\./g, ' ')
+                        .replace(/_/g, ' ')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                    brainModelDisplay.textContent = cleanName;
+                } else {
+                    brainModelDisplay.textContent = 'Не выбрана';
+                }
+                
+                // Update checkboxes from state or localStorage
+                const savedSettings = JSON.parse(localStorage.getItem('aiOrchestratorSettings') || '{}');
+                // Removed checkbox updates as they are now managed by the backend
+                
+                // Update performance metrics
+                if (state.performance) {
+                    updateMetrics(state.performance);
+                }
+                
+                // Show/hide image card
+                if (state.has_image) {
+                    $('#imageCard').style.display = 'block';
+                    loadLastImage();
+                } else {
+                    $('#imageCard').style.display = 'none';
+                }
+                
+            } catch (error) {
+                console.error('Error loading state:', error);
+                showStatus('Ошибка загрузки состояния', 'error');
+            }
+        }
+
+        // Load last generated image
+        async function loadLastImage() {
+            try {
+                const response = await fetch('/api/last-image');
+                const data = await response.json();
+                
+                if (data.data_url) {
+                    const imgwrap = $('#imgwrap');
+                    imgwrap.innerHTML = `
+                        <img src="${data.data_url}" alt="Сгенерированное изображение" onclick="showImageModal('${data.data_url}', '${data.description || ''}')">
+                        <div class="image-info">
+                            <i class="fas fa-info-circle"></i> 
+                            ${data.description || 'Сгенерированное изображение'} - 
+                            Нажмите для увеличения
+                        </div>
+                    `;
+                    
+                    // Show image card
+                    $('#imageCard').style.display = 'block';
+                }
+            } catch (error) {
+                console.error('Error loading last image:', error);
+            }
+        }
+
+        // Show image modal
+        function showImageModal(src, description = '') {
+            const modal = $('#imageModal');
+            const modalImg = $('#modalImage');
+            const modalTitle = $('#imageModal .modal-title');
+            
+            modalImg.src = src;
+            if (description) {
+                modalTitle.innerHTML = `<i class="fas fa-image"></i> ${description}`;
+            }
+            modal.style.display = 'block';
+            
+            // Store current image for download
+            window.currentImageData = { src, description };
+        }
+
+        // Close modal
+        $('.close').onclick = function() {
+            $('#imageModal').style.display = 'none';
+        }
+
+        // Close modal when clicking outside
+        window.onclick = function(event) {
+            const modal = $('#imageModal');
+            if (event.target === modal) {
+                modal.style.display = 'none';
+            }
+        }
+
+        // Download image functionality
+        $('#downloadImage').addEventListener('click', function() {
+            if (window.currentImageData && window.currentImageData.src) {
+                const link = document.createElement('a');
+                link.href = window.currentImageData.src;
+                link.download = `generated_image_${Date.now()}.png`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+        });
+
+        // Share image functionality
+        $('#shareImage').addEventListener('click', function() {
+            if (navigator.share && window.currentImageData) {
+                navigator.share({
+                    title: 'Сгенерированное изображение',
+                    text: window.currentImageData.description || 'Изображение, созданное ИИ',
+                    url: window.currentImageData.src
+                }).catch(console.error);
+            } else {
+                // Fallback: copy to clipboard
+                navigator.clipboard.writeText(window.currentImageData?.src || '').then(() => {
+                    showStatus('Ссылка на изображение скопирована в буфер обмена', 'success');
+                }).catch(() => {
+                    showStatus('Не удалось скопировать ссылку', 'error');
+                });
+            }
+        });
+
+        // Send message
+        $('#send').addEventListener('click', async () => {
+            const message = $('#message').value.trim();
+            if (!message) return;
+            
+            $('#send').disabled = true;
+            showStatus('Обрабатываю запрос...', 'info');
+            
+            try {
+                const response = await fetch('/api/ask', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        message: message
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.final) {
+                    $('#final').textContent = data.final;
+                }
+                
+                // Update performance metrics
+                if (data.performance) {
+                    updateMetrics(data.performance);
+                }
+                
+                // Reload state to get updated image and response
+                await loadState();
+                
+                // Clear input after successful send
+                $('#message').value = '';
+                
+                showStatus('Запрос обработан успешно', 'success');
+                
+            } catch (error) {
+                console.error('Error:', error);
+                showStatus('Ошибка обработки запроса', 'error');
+            } finally {
+                $('#send').disabled = false;
+            }
+        });
+
+        // Apply settings
+        $('#apply').addEventListener('click', async () => {
+            const settings = {
+                brain_model: $('#brain').value,
+                // Removed checkbox settings as they are now managed by the backend
+            };
+            
+            try {
+                await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(settings)
+                });
+                
+                // Save settings to localStorage
+                localStorage.setItem('aiOrchestratorSettings', JSON.stringify(settings));
+                
+                showStatus('Настройки применены и сохранены', 'success');
+                await loadState();
+            } catch (error) {
+                console.error('Error applying settings:', error);
+                showStatus('Ошибка применения настроек', 'error');
+            }
+        });
+
+        // Reset chat
+        $('#reset').addEventListener('click', async () => {
+            $('#reset').disabled = true;
+            try {
+                await fetch('/api/reset', {method: 'POST'});
+                $('#message').value = '';
+                $('#final').textContent = 'Ожидаю вашего сообщения...';
+                $('#imageCard').style.display = 'none';
+                
+                // Clear saved settings
+                localStorage.removeItem('aiOrchestratorSettings');
+                
+                showStatus('Чат сброшен, настройки очищены', 'success');
+                await loadState();
+            } catch (error) {
+                console.error('Error resetting:', error);
+                showStatus('Ошибка сброса', 'error');
+            } finally {
+                $('#reset').disabled = false;
+            }
+        });
+
+        // Voice recording
+        $('#voice').addEventListener('click', async () => {
+            if (!isRecording) {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    showStatus('Браузер не поддерживает запись аудио', 'error');
+                    return;
+                }
+                
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+                    
+                    mediaRecorder.ondataavailable = e => {
+                        if (e.data.size > 0) audioChunks.push(e.data);
+                    };
+                    
+                    mediaRecorder.onstop = async () => {
+                        const audioBlob = new Blob(audioChunks, {type: 'audio/webm'});
+                        const form = new FormData();
+                        form.append('file', audioBlob, 'voice.webm');
+                        form.append('lang', 'ru');
+                        form.append('use_separator', 'false');
+                        form.append('context', $('#message').value || '');
+                        
+                        showStatus('Распознаю голос...', 'info');
+                        
+                        try {
+                            const response = await fetch('/api/upload/audio', {method: 'POST', body: form});
+                            if (response.ok) {
+                                const data = await response.json();
+                                if (data.final) {
+                                    $('#final').textContent = data.final;
+                                }
+                                await loadState();
+                                showStatus('Голос распознан успешно', 'success');
+                            } else {
+                                throw new Error(`HTTP ${response.status}`);
+                            }
+                        } catch (error) {
+                            console.error('Error processing audio:', error);
+                            showStatus('Ошибка распознавания голоса', 'error');
+                        }
+                    };
+                    
+                    mediaRecorder.start();
+                    isRecording = true;
+                    $('#voice').innerHTML = '<i class="fas fa-stop"></i> Стоп';
+                    $('#voice').className = 'btn btn-danger';
+                    showStatus('Запись голоса...', 'info');
+                    
+                } catch (error) {
+                    showStatus(`Ошибка доступа к микрофону: ${error}`, 'error');
+                }
+            } else {
+                mediaRecorder.stop();
+                isRecording = false;
+                $('#voice').innerHTML = '<i class="fas fa-microphone"></i> Голос';
+                $('#voice').className = 'btn btn-success';
+            }
+        });
+
+        // File upload functions
+        async function uploadFile(url, formData) {
+            try {
+                const response = await fetch(url, {method: 'POST', body: formData});
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                const data = await response.json();
+                await loadState();
+                showStatus('Файл загружен успешно', 'success');
+                return data;
+            } catch (error) {
+                console.error('Upload error:', error);
+                showStatus(`Ошибка загрузки: ${error.message}`, 'error');
+            }
+        }
+
+        // Photo upload
+        $('#uploadPhoto').addEventListener('click', async () => {
+            const file = $('#photoFile').files[0];
+            if (!file) {
+                showStatus('Выберите фото', 'warning');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('context', $('#photoCtx').value || '');
+            
+            await uploadFile('/api/upload/photo', formData);
+        });
+
+        // Audio upload
+        $('#uploadAudio').addEventListener('click', async () => {
+            const file = $('#audioFile').files[0];
+            if (!file) {
+                showStatus('Выберите аудио', 'warning');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('lang', $('#audioLang').value || 'ru');
+            formData.append('use_separator', $('#audioSep').checked ? 'true' : 'false');
+            formData.append('context', $('#audioCtx').value || '');
+            
+            await uploadFile('/api/upload/audio', formData);
+        });
+
+        // Video upload
+        $('#uploadVideo').addEventListener('click', async () => {
+            const file = $('#videoFile').files[0];
+            if (!file) {
+                showStatus('Выберите видео', 'warning');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('context', $('#videoCtx').value || '');
+            
+            await uploadFile('/api/upload/video', formData);
+        });
+
+        // Refresh metrics
+        $('#refreshMetrics').addEventListener('click', () => {
+            updatePerformanceMetrics();
+            showStatus('Метрики обновлены', 'success');
+        });
+
+        // Drag and drop
+        const messageArea = $('#message');
+        messageArea.addEventListener('dragover', e => {
+            e.preventDefault();
+            messageArea.style.border = '2px dashed var(--primary)';
+        });
+        
+        messageArea.addEventListener('dragleave', e => {
+            e.preventDefault();
+            messageArea.style.border = '';
+        });
+        
+        messageArea.addEventListener('drop', async e => {
+            e.preventDefault();
+            messageArea.style.border = '';
+            
+            const files = [...e.dataTransfer.files];
+            if (!files.length) return;
+            
+            const context = messageArea.value.trim();
+            messageArea.value = '';
+            
+            for (const file of files) {
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('context', context);
+                
+                if (file.type.startsWith('image/')) {
+                    await uploadFile('/api/upload/photo', formData);
+                } else if (file.type.startsWith('audio/')) {
+                    formData.append('lang', 'ru');
+                    formData.append('use_separator', 'false');
+                    await uploadFile('/api/upload/audio', formData);
+                } else if (file.type.startsWith('video/')) {
+                    await uploadFile('/api/upload/video', formData);
+                } else {
+                    showStatus(`Неподдерживаемый тип файла: ${file.type}`, 'warning');
+                }
+            }
+        });
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            // Load saved settings first
+            const savedSettings = JSON.parse(localStorage.getItem('aiOrchestratorSettings') || '{}');
+            if (Object.keys(savedSettings).length > 0) {
+                // Apply saved settings to UI
+                // Removed checkbox updates as they are now managed by the backend
+            }
+            
+            loadState();
+            updatePerformanceMetrics();
+            
+            // Update metrics every 30 seconds
+            setInterval(updatePerformanceMetrics, 30000);
+        });
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key === 'Enter') {
+                $('#send').click();
+            }
+            // Enter для отправки сообщения
+            if (e.key === 'Enter' && !e.shiftKey && e.target.id === 'message') {
+                e.preventDefault();
+                $('#send').click();
+            }
+        });
+    </script>
+</body>
+</html>
