@@ -87,7 +87,7 @@ p.s. **abliterated** по причине того, что она будет ме
 
 - **novaAnime_v20**: [CivitAI](https://civitai.com/models/328365) (~4GB VRAM)
 - **Альтернативная улучшенная**: [CivitAI](https://civitai.com/models/827184) (~8GB VRAM)
-- **LoRA для улучшения пальцев**: (https://civitai.com/models/58390) (настройки: strength=2)
+- **LoRA для улучшения пальцев**: [Detail Tweaker LoRA](https://civitai.com/models/58390) (настройки: strength=2)
 
 
 ### 2. Настройка переменных окружения
