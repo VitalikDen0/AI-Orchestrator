@@ -1,0 +1,4482 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+AI PowerShell Orchestrator with Google Search Integration
+Интегрирует LM Studio, PowerShell команды и поиск Google
+
+ОБНОВЛЕНО: Теперь использует прямую интеграцию со Stable Diffusion для генерации изображений
+
+ТРЕБУЕМЫЕ БИБЛИОТЕКИ:
+pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors
+
+Для postоянной голосовой записи также потребуется веб-интерфейс с поддержкой MediaRecorder API.
+"""
+
+import requests
+import subprocess
+import json
+import time
+import sys as _sys
+import os
+import base64
+import io
+import re
+import threading
+import tempfile
+import shutil
+import math
+import pyautogui
+import mss
+import queue
+import logging
+import argparse
+from typing import Dict, Any, List, Union, Optional
+import urllib.parse
+from PIL import Image
+from io import BytesIO
+from collections import defaultdict
+import asyncio
+import telegram
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
+
+# Загружаем переменные окружения из .env файла
+load_dotenv()
+
+# Настройка логирования в файл
+log_file = "ai_orchestrator.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, mode='w', encoding='utf-8'),  # Перезаписываем файл
+        logging.StreamHandler()  # И выводим в консоль
+    ]
+)
+logger = logging.getLogger(__name__)
+
+### НОВОЕ: Функция для сжатия изображений ###
+def image_to_base64_balanced(image_path: str, max_size=(500, 500), palette_colors=12) -> str:
+    """
+    Конвертирует изображение в PNG base64 без ч/б и quantize, только ресайз (если нужно).
+    """
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        logger.error(f"Ошибка кодирования (balanced) {image_path}: {e}")
+        return ""
+
+class AIOrchestrator:
+    def extract_video_frames(self, video_path: str, fps: int = 1) -> list:
+        """
+        Извлекает по одному кадру на каждую секунду видео (fps=1).
+        Возвращает список кортежей (таймкод, base64 PNG).
+        """
+        frames = []
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # Получаем длительность видео через ffprobe
+            cmd = [
+                'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1', video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            duration = float(result.stdout.strip()) if result.returncode == 0 else 0
+            if duration == 0:
+                return []
+            # Извлекаем кадры с помощью ffmpeg
+            # -vf fps=1: по одному кадру в секунду
+            frame_pattern = os.path.join(temp_dir, 'frame_%05d.png')
+            cmd = [
+                'ffmpeg', '-i', video_path, '-vf', f'fps={fps}', '-q:v', '2', frame_pattern, '-hide_banner', '-loglevel', 'error'
+            ]
+            subprocess.run(cmd, check=True)
+            # Собираем кадры и таймкоды
+            total_frames = int(math.ceil(duration))
+            for i in range(1, total_frames + 1):
+                frame_path = os.path.join(temp_dir, f'frame_{i:05d}.png')
+                if not os.path.exists(frame_path):
+                    continue
+                # Таймкод в формате [HH:MM:SS]
+                sec = i - 1
+                h = sec // 3600
+                m = (sec % 3600) // 60
+                s = sec % 60
+                timecode = f"[{h:02}:{m:02}:{s:02}]"
+                # base64 через существующую функцию
+                b64 = image_to_base64_balanced(frame_path)
+                frames.append((timecode, b64))
+            return frames
+        except Exception as e:
+            logger.error(f"Ошибка извлечения кадров: {e}")
+            return []
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    def download_youtube_video(self, url: str, out_dir: Optional[str] = None) -> str:
+        """
+        Скачивает видео с YouTube по ссылке (использует yt-dlp)
+        Возвращает путь к mp4-файлу или пустую строку
+        """
+        if out_dir is None:
+            out_dir = os.path.join(os.path.dirname(__file__), "Video")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "yt_video.%(ext)s")
+        
+        # Проверяем наличие cookies
+        cookies_path = self.get_youtube_cookies_path()
+        use_cookies = False
+        
+        if cookies_path and self.check_cookies_validity(cookies_path):
+            use_cookies = True
+            logger.info("🍪 Использую cookies для аутентификации YouTube")
+        else:
+            logger.info("ℹ️ Cookies не найдены или невалидны, использую базовые параметры")
+            if not cookies_path:
+                self.suggest_cookies_update()
+        
+        # Базовые параметры для yt-dlp
+        base_cmd = [
+            "yt-dlp",
+            "--force-ipv4",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--extractor-args", "youtube:player_client=android",  # Используем Android клиент
+            "--no-check-certificate",  # Игнорируем SSL ошибки
+            "--prefer-insecure",  # Предпочитаем HTTP
+            "--geo-bypass",  # Обход геоблокировки
+            "--geo-bypass-country", "US",  # Страна для обхода
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4/best[ext=mp4]/best",
+            "-o", out_path
+        ]
+        
+        # Добавляем cookies если доступны
+        if use_cookies:
+            base_cmd.extend(["--cookies", cookies_path])
+        
+        # Добавляем URL в конец
+        cmd = base_cmd + [url]
+        
+        try:
+            logger.info(f"Скачиваю видео с YouTube: {url}")
+            # Логируем команду в одну строку для избежания обрезания
+            cmd_str = " ".join(cmd)
+            logger.info(f"Команда: {cmd_str}")
+            
+            # Запускаем с таймаутом
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+            
+            if result.stdout:
+                logger.info(f"yt-dlp stdout: {result.stdout}")
+            if result.stderr:
+                logger.warning(f"yt-dlp stderr: {result.stderr}")
+            
+            # Найти скачанный файл
+            for fname in os.listdir(out_dir):
+                if fname.startswith("yt_video") and fname.endswith('.mp4'):
+                    logger.info(f"✅ Видео успешно скачано: {fname}")
+                    return os.path.join(out_dir, fname)
+            
+            logger.warning("⚠️ Файл не найден после скачивания")
+            return ""
+            
+        except subprocess.TimeoutExpired:
+            logger.error("❌ Таймаут скачивания видео (5 минут)")
+            return ""
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Ошибка yt-dlp: {e}")
+            if e.stderr:
+                logger.error(f"stderr: {e.stderr}")
+            return ""
+        except Exception as e:
+            logger.error(f"❌ Неожиданная ошибка скачивания видео: {e}")
+            
+            # Пробуем альтернативный метод с другими параметрами
+            logger.info("🔄 Пробую альтернативный метод скачивания...")
+            try:
+                alt_cmd = [
+                    "yt-dlp",
+                    "--force-ipv4",
+                    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "--extractor-args", "youtube:player_client=web",
+                    "--no-check-certificate",
+                    "--geo-bypass",
+                    "--geo-bypass-country", "US",
+                    "-f", "best[ext=mp4]/best",
+                    "-o", out_path
+                ]
+                
+                # Добавляем cookies если доступны
+                if use_cookies:
+                    alt_cmd.extend(["--cookies", cookies_path])
+                
+                alt_cmd.append(url)
+                
+                # Логируем команду в одну строку
+                alt_cmd_str = " ".join(alt_cmd)
+                logger.info(f"Альтернативная команда: {alt_cmd_str}")
+                result = subprocess.run(alt_cmd, check=True, capture_output=True, text=True, timeout=300)
+                
+                # Найти скачанный файл
+                for fname in os.listdir(out_dir):
+                    if fname.startswith("yt_video") and fname.endswith('.mp4'):
+                        logger.info(f"✅ Видео успешно скачано альтернативным методом: {fname}")
+                        return os.path.join(out_dir, fname)
+                        
+            except Exception as alt_e:
+                logger.error(f"❌ Альтернативный метод также не сработал: {alt_e}")
+                
+                # Пробуем третий метод с максимально простыми параметрами
+                logger.info("🔄 Пробую третий метод (минимальные параметры)...")
+                try:
+                    simple_cmd = [
+                        "yt-dlp",
+                        "--force-ipv4",
+                        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "--no-check-certificate",
+                        "-f", "best",
+                        "-o", out_path
+                    ]
+                    
+                    # Добавляем cookies если доступны
+                    if use_cookies:
+                        simple_cmd.extend(["--cookies", cookies_path])
+                    
+                    simple_cmd.append(url)
+                    
+                    # Логируем команду в одну строку
+                    simple_cmd_str = " ".join(simple_cmd)
+                    logger.info(f"Третий метод: {simple_cmd_str}")
+                    result = subprocess.run(simple_cmd, check=True, capture_output=True, text=True, timeout=300)
+                    
+                    # Найти скачанный файл
+                    for fname in os.listdir(out_dir):
+                        if fname.startswith("yt_video") and fname.endswith('.mp4'):
+                            logger.info(f"✅ Видео успешно скачано третьим методом: {fname}")
+                            return os.path.join(out_dir, fname)
+                            
+                except Exception as simple_e:
+                    logger.error(f"❌ Третий метод также не сработал: {simple_e}")
+            
+            return ""
+    
+    def check_vpn_status(self) -> bool:
+        """
+        Проверяет статус VPN соединения
+        """
+        try:
+            import requests
+            # Пробуем получить IP адрес
+            response = requests.get("https://ifconfig.me", timeout=10)
+            if response.status_code == 200:
+                ip = response.text.strip()
+                logger.info(f"🌐 Текущий IP адрес: {ip}")
+                
+                # Проверяем, не из РФ ли IP
+                ru_ips = ["185.", "31.", "46.", "37.", "95.", "178.", "79.", "5.", "176.", "195."]
+                if any(ip.startswith(prefix) for prefix in ru_ips):
+                    logger.warning("⚠️ IP адрес похож на российский. VPN может не работать корректно.")
+                    return False
+                else:
+                    logger.info("✅ IP адрес не из РФ. VPN работает.")
+                    return True
+            else:
+                logger.warning(f"⚠️ Не удалось проверить IP: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки VPN: {e}")
+            return False
+
+    def get_youtube_info(self, url: str) -> dict:
+        """
+        Получает информацию о YouTube видео без скачивания
+        """
+        try:
+            # Проверяем наличие cookies
+            cookies_path = self.get_youtube_cookies_path()
+            use_cookies = False
+            
+            if cookies_path and self.check_cookies_validity(cookies_path):
+                use_cookies = True
+                logger.info("🍪 Использую cookies для получения информации о видео")
+            
+            # Базовые параметры для yt-dlp
+            base_cmd = [
+                "yt-dlp",
+                "--force-ipv4",
+                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--extractor-args", "youtube:player_client=android",
+                "--no-check-certificate",
+                "--geo-bypass",
+                "--dump-json"
+            ]
+            
+            # Добавляем cookies если доступны
+            if use_cookies:
+                base_cmd.extend(["--cookies", cookies_path])
+            
+            # Добавляем URL в конец
+            cmd = base_cmd + [url]
+            
+            logger.info("📋 Получаю информацию о YouTube видео...")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode == 0 and result.stdout:
+                try:
+                    import json
+                    info = json.loads(result.stdout)
+                    title = info.get('title', 'Неизвестное видео')
+                    duration = info.get('duration', 0)
+                    uploader = info.get('uploader', 'Неизвестный автор')
+                    
+                    logger.info(f"✅ Информация получена: {title} ({duration}с) от {uploader}")
+                    return {
+                        'title': title,
+                        'duration': duration,
+                        'uploader': uploader,
+                        'success': True
+                    }
+                except json.JSONDecodeError:
+                    logger.error("❌ Ошибка парсинга JSON информации о видео")
+                    return {'success': False, 'error': 'JSON parse error'}
+            else:
+                logger.error(f"❌ Не удалось получить информацию: {result.stderr}")
+                
+                # Пробуем альтернативный метод без Android клиента
+                logger.info("🔄 Пробую альтернативный метод получения информации...")
+                try:
+                    alt_cmd = [
+                        "yt-dlp",
+                        "--force-ipv4",
+                        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "--extractor-args", "youtube:player_client=web",
+                        "--no-check-certificate",
+                        "--geo-bypass",
+                        "--dump-json"
+                    ]
+                    
+                    # Добавляем cookies если доступны
+                    if use_cookies:
+                        alt_cmd.extend(["--cookies", cookies_path])
+                    
+                    alt_cmd.append(url)
+                    
+                    logger.info("🔄 Альтернативная команда для получения информации...")
+                    alt_result = subprocess.run(alt_cmd, capture_output=True, text=True, timeout=60)
+                    
+                    if alt_result.returncode == 0 and alt_result.stdout:
+                        try:
+                            import json
+                            info = json.loads(alt_result.stdout)
+                            title = info.get('title', 'Неизвестное видео')
+                            duration = info.get('duration', 0)
+                            uploader = info.get('uploader', 'Неизвестный автор')
+                            
+                            logger.info(f"✅ Информация получена альтернативным методом: {title} ({duration}с) от {uploader}")
+                            return {
+                                'title': title,
+                                'duration': duration,
+                                'uploader': uploader,
+                                'success': True
+                            }
+                        except json.JSONDecodeError:
+                            logger.error("❌ Ошибка парсинга JSON альтернативным методом")
+                            return {'success': False, 'error': 'JSON parse error (alt method)'}
+                    else:
+                        logger.error(f"❌ Альтернативный метод также не сработал: {alt_result.stderr}")
+                        return {'success': False, 'error': result.stderr}
+                        
+                except Exception as alt_e:
+                    logger.error(f"❌ Ошибка альтернативного метода: {alt_e}")
+                    return {'success': False, 'error': result.stderr}
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о видео: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def check_youtube_accessibility(self, url: str) -> bool:
+        """
+        Проверяет доступность YouTube ссылки различными методами
+        """
+        try:
+            # Проверяем наличие cookies
+            cookies_path = self.get_youtube_cookies_path()
+            use_cookies = False
+            
+            if cookies_path and self.check_cookies_validity(cookies_path):
+                use_cookies = True
+                logger.info("🍪 Использую cookies для проверки доступности")
+            
+            # Базовые параметры для yt-dlp
+            base_cmd = [
+                "yt-dlp",
+                "--force-ipv4",
+                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--extractor-args", "youtube:player_client=android",
+                "--no-check-certificate",
+                "--geo-bypass",
+                "--list-formats"
+            ]
+            
+            # Добавляем cookies если доступны
+            if use_cookies:
+                base_cmd.extend(["--cookies", cookies_path])
+            
+            # Добавляем URL в конец
+            test_cmd = base_cmd + [url]
+            
+            logger.info("🔍 Проверяю доступность YouTube ссылки...")
+            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode == 0:
+                logger.info("✅ YouTube ссылка доступна")
+                return True
+            else:
+                logger.warning(f"⚠️ YouTube ссылка недоступна: {result.stderr}")
+                
+                # Пробуем альтернативный метод с web клиентом
+                logger.info("🔄 Пробую альтернативный метод проверки...")
+                try:
+                    alt_test_cmd = [
+                        "yt-dlp",
+                        "--force-ipv4",
+                        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "--extractor-args", "youtube:player_client=web",
+                        "--no-check-certificate",
+                        "--geo-bypass",
+                        "--list-formats"
+                    ]
+                    
+                    # Добавляем cookies если доступны
+                    if use_cookies:
+                        alt_test_cmd.extend(["--cookies", cookies_path])
+                    
+                    alt_test_cmd.append(url)
+                    
+                    alt_result = subprocess.run(alt_test_cmd, capture_output=True, text=True, timeout=60)
+                    
+                    if alt_result.returncode == 0:
+                        logger.info("✅ YouTube ссылка доступна через альтернативный метод")
+                        return True
+                    else:
+                        logger.warning(f"⚠️ YouTube ссылка недоступна и через альтернативный метод: {alt_result.stderr}")
+                        return False
+                        
+                except Exception as alt_e:
+                    logger.error(f"❌ Ошибка альтернативной проверки: {alt_e}")
+                    return False
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки доступности YouTube: {e}")
+            return False
+
+    def _auto_load_brain_model(self):
+        """Автоматически загружает модель мозга при инициализации"""
+        try:
+            # Проверяем, запущена ли модель через прямой запрос к API
+            try:
+                resp = requests.get(f"{self.lm_studio_url}/v1/models", timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    model_loaded = False
+                    for m in data.get("data", []):
+                        if self.brain_model in m.get("id", "") and m.get("isLoaded", False):
+                            model_loaded = True
+                            # Сохраняем короткий ID модели для API вызовов
+                            self.brain_model_id = m.get("id")
+                            logger.info(f"✅ Модель мозга уже загружена: {os.path.basename(self.brain_model)} (ID: {self.brain_model_id})")
+                            return
+                else:
+                    logger.warning(f"⚠️ Не удалось проверить статус моделей: {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка проверки статуса моделей: {e}")
+            
+            # Если модель не загружена, пытаемся загрузить
+            logger.info(f"🧠 Автоматически загружаю модель мозга: {os.path.basename(self.brain_model)}")
+            
+            # Пытаемся загрузить модель через API
+            payload = {
+                "model": self.brain_model,
+                "load": True
+            }
+            
+            try:
+                resp = requests.post(f"{self.lm_studio_url}/v1/models/load", json=payload, timeout=30)
+                if resp.status_code == 200:
+                    logger.info("✅ Модель мозга успешно загружена через API")
+                    # Получаем короткий ID модели после загрузки
+                    self._update_brain_model_id()
+                else:
+                    logger.warning(f"⚠️ Не удалось загрузить модель через API: {resp.status_code}")
+                    # Пробуем запустить через LM Studio
+                    self.launch_model(self.brain_model)
+                    logger.info("🔄 Запускаю модель через LM Studio...")
+                    # Пытаемся получить ID модели после запуска
+                    self._update_brain_model_id()
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка API загрузки модели: {e}")
+                # Пробуем запустить через LM Studio
+                self.launch_model(self.brain_model)
+                logger.info("🔄 Запускаю модель через LM Studio...")
+                # Пытаемся получить ID модели после запуска
+                self._update_brain_model_id()
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка автозагрузки модели мозга: {e}")
+    
+    def _update_brain_model_id(self):
+        """Обновляет короткий ID модели мозга из API"""
+        try:
+            resp = requests.get(f"{self.lm_studio_url}/v1/models", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for m in data.get("data", []):
+                    if self.brain_model in m.get("id", "") and m.get("isLoaded", False):
+                        self.brain_model_id = m.get("id")
+                        logger.info(f"✅ Обновлен ID модели мозга: {self.brain_model_id}")
+                        return
+                logger.warning("⚠️ Не удалось найти загруженную модель для получения ID")
+            else:
+                logger.warning(f"⚠️ Не удалось получить список моделей для обновления ID: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка обновления ID модели мозга: {e}")
+    
+    def _check_ffmpeg(self):
+        """Проверяет наличие ffmpeg в системе для конвертации аудио"""
+        try:
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                logger.info("✅ ffmpeg найден в системе")
+            else:
+                logger.warning("⚠️ ffmpeg найден, но не может быть запущен")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.warning("⚠️ ffmpeg не найден в системе. Установите ffmpeg для конвертации аудио.")
+            logger.info("💡 Скачайте с https://ffmpeg.org/download.html")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка проверки ffmpeg: {e}")
+    
+    def is_model_running(self, model_name: str) -> bool:
+        """
+        Проверяет, запущена ли модель в LM Studio через /v1/models
+        """
+        try:
+            resp = requests.get(f"{self.lm_studio_url}/v1/models")
+            if resp.status_code == 200:
+                data = resp.json()
+                for m in data.get("data", []):
+                    if model_name in m.get("id", "") and m.get("isLoaded", False):
+                        return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка проверки модели {model_name}: {e}")
+            return False
+
+    def get_model_context_info(self) -> Dict[str, int]:
+        """
+        Получает информацию о максимальном контексте модели из LM Studio API
+        Возвращает словарь с max_context и safe_context
+        """
+        try:
+            resp = requests.get(f"{self.lm_studio_url}/v1/models", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                
+                # Ищем нашу модель по ключевым словам
+                target_model = None
+                search_terms = ["huihui-qwen3-4b-thinking", "qwen3-4b", "thinking"]
+                
+                for m in data.get("data", []):
+                    model_id = m.get("id", "").lower()
+                    for term in search_terms:
+                        if term.lower() in model_id:
+                            target_model = m
+                            logger.info(f"🎯 Найдена модель: {m.get('id')}")
+                            break
+                    if target_model:
+                        break
+                
+                if target_model:
+                    # Пытаемся получить информацию через запрос к модели
+                    context_info = self._get_context_info_via_chat(target_model.get("id"))
+                    if context_info:
+                        return context_info
+                    
+                    # Если не удалось получить через чат, сохраняем ID модели для использования
+                    if not hasattr(self, 'brain_model_id') or not self.brain_model_id:
+                        self.brain_model_id = target_model.get("id")
+                        logger.info(f"✅ Сохранен ID модели мозга: {self.brain_model_id}")
+                
+            # Если не удалось получить информацию, используем значения по умолчанию
+            logger.warning("⚠️ Не удалось получить информацию о контексте модели, используем значения по умолчанию")
+            return {
+                "max_context": 262144,
+                "safe_context": 32768
+            }
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка получения информации о контексте модели: {e}")
+            return {
+                "max_context": 262144,
+                "safe_context": 32768
+            }
+
+    def _get_context_info_via_chat(self, model_id: str) -> Optional[Dict[str, int]]:
+        """
+        Пытается получить информацию о контексте через запрос к модели
+        """
+        try:
+            # Простой запрос для получения информации о модели
+            payload = {
+                "model": model_id,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 1,
+                "temperature": 0
+            }
+            
+            resp = requests.post(f"{self.lm_studio_url}/v1/chat/completions", json=payload, timeout=10)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                
+                # Проверяем поле stats
+                stats = data.get("stats", {})
+                if stats:
+                    # Ищем информацию о контексте в stats
+                    context_length = None
+                    if "context_length" in stats:
+                        context_length = stats["context_length"]
+                    elif "max_context" in stats:
+                        context_length = stats["max_context"]
+                    elif "max_tokens" in stats:
+                        context_length = stats["max_tokens"]
+                    
+                    if context_length:
+                        safe_context = max(context_length // 8, 32768)
+                        logger.info(f"✅ Найден context_length в stats: {context_length}")
+                        return {
+                            "max_context": context_length,
+                            "safe_context": safe_context
+                        }
+                
+                # Проверяем другие поля на предмет информации о контексте
+                for key, value in data.items():
+                    if isinstance(value, dict) and ("context" in key.lower() or "token" in key.lower()):
+                        logger.debug(f"🔍 Проверяем поле {key}: {value}")
+                
+                logger.debug("❌ Информация о контексте не найдена в ответе модели")
+                return None
+            else:
+                logger.warning(f"❌ Ошибка запроса к модели: {resp.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"❌ Ошибка получения информации через чат: {e}")
+            return None
+
+    def _trim_context_if_needed(self, total_length: int):
+        """
+        Обрезает контекст если он превышает безопасные лимиты
+        """
+        if total_length > self.max_context_length:
+            # Критический лимит - агрессивная обрезка
+            self.conversation_history = self.conversation_history[-2:]  # Оставляем только 2 последних сообщения
+            logger.warning(f"Критическое превышение контекста ({total_length:,} > {self.max_context_length:,}) - агрессивная обрезка истории")
+        elif total_length > self.safe_context_length:
+            # Превышение безопасного лимита - аккуратная обрезка
+            self.conversation_history = self.conversation_history[-5:]  # Оставляем только 5 последних сообщений
+            logger.warning(f"Превышение безопасного контекста ({total_length:,} > {self.safe_context_length:,}) - аккуратная обрезка истории")
+        elif total_length > self.safe_context_length * 0.8:
+            # Приближение к безопасному лимиту - профилактическая обрезка
+            self.conversation_history = self.conversation_history[-10:]  # Оставляем только 10 последних сообщений
+            logger.info(f"Приближение к безопасному лимиту ({total_length:,} > {self.safe_context_length * 0.8:,}) - профилактическая обрезка истории")
+
+    def _initialize_dynamic_context(self):
+        """
+        Инициализирует динамические параметры контекста на основе информации о модели
+        """
+        try:
+            context_info = self.get_model_context_info()
+            self.max_context_length = context_info["max_context"]
+            self.safe_context_length = context_info["safe_context"]
+            logger.info(f"📊 Контекст инициализирован: максимум {self.max_context_length:,}, безопасный {self.safe_context_length:,}")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка инициализации динамического контекста: {e}")
+            # Оставляем значения по умолчанию
+            self.max_context_length = 262144
+            self.safe_context_length = 32768
+
+    def launch_model(self, model_path: str):
+        """
+        Запускает модель через LM Studio (локально, subprocess)
+        """
+        try:
+            # threading уже импортирован в начале файла
+            lmstudio_exe = os.getenv("LMSTUDIO_EXE", r"C:\Program Files\LM Studio\LM Studio.exe")
+            logger.info(f"Запускаю модель: {model_path}")
+            threading.Thread(target=lambda: os.system(f'"{lmstudio_exe}" --model "{model_path}"'), daemon=True).start()
+        except Exception as e:
+            logger.error(f"Ошибка запуска модели: {e}")
+
+    def ask_qwen(self, question: str) -> Optional[str]:
+        """Запрос к Qwen для генерации промтов изображений
+        Использует основной мозг для генерации промтов
+        """
+        # Используем основной мозг для генерации промтов
+        image_model = self.brain_model_id if hasattr(self, 'brain_model_id') and self.brain_model_id else self.brain_model
+        payload = {
+            "model": image_model,
+            "messages": [
+                {"role": "system", "content": "Ты — ассистент для генерации идеальных промтов для Stable Diffusion. Твоя задача — создать идеальный промт для генерации изображения на основе запроса пользователя. ВАЖНО: prompt и negative_prompt должны быть ТОЛЬКО на английском языке, иначе будет ошибка! Формируй промт и настройки строго в формате JSON: {\"prompt\":..., \"negative_prompt\":..., \"params\":{...}}. Не добавляй ничего лишнего!"},
+                {"role": "user", "content": f"Вопрос: {question}\n\nВАЖНО: prompt и negative_prompt должны быть ТОЛЬКО на английском языке! Если они не на английском — это ошибка!"}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 1024,
+            "stream": False
+        }
+        try:
+            resp = requests.post(f"{self.lm_studio_url}/v1/chat/completions", json=payload, headers={"Content-Type": "application/json"})
+            if resp.status_code == 200:
+                result = resp.json()
+                return result["choices"][0]["message"]["content"].strip()
+            else:
+                logger.error(f"Ошибка Qwen: {resp.status_code} - {resp.text}")
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка запроса к Qwen: {e}")
+            return None
+
+    def get_youtube_cookies_path(self) -> Optional[str]:
+        """
+        Получает путь к файлу cookies для YouTube
+        Возвращает путь к файлу или None если файл не найден
+        """
+        cookies_file = "youtube_cookies.txt"
+        
+        # Сначала ищем в текущей рабочей директории
+        cookies_path = os.path.join(os.getcwd(), cookies_file)
+        if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+            logger.info(f"🍪 Найден файл cookies в рабочей директории: {cookies_file}")
+            return cookies_path
+        
+        # Затем ищем в директории скрипта
+        cookies_path = os.path.join(os.path.dirname(__file__), cookies_file)
+        if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+            logger.info(f"🍪 Найден файл cookies в директории скрипта: {cookies_file}")
+            return cookies_path
+        
+        # Если файл не найден нигде
+        logger.info(f"ℹ️ Файл cookies не найден: {cookies_file}")
+        return None
+
+    def check_cookies_validity(self, cookies_path: str) -> bool:
+        """
+        Проверяет валидность файла cookies
+        """
+        try:
+            with open(cookies_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # Проверяем базовую структуру
+            if not content.strip():
+                return False
+                
+            # Проверяем наличие YouTube доменов
+            youtube_domains = ['youtube.com', '.youtube.com', 'google.com', '.google.com']
+            has_youtube = any(domain in content for domain in youtube_domains)
+            
+            if not has_youtube:
+                logger.warning("⚠️ В файле cookies не найдены домены YouTube")
+                return False
+                
+            # Проверяем формат (должен содержать табуляции)
+            if '\t' not in content:
+                logger.warning("⚠️ Неверный формат файла cookies (отсутствуют табуляции)")
+                return False
+                
+            logger.info("✅ Файл cookies валиден")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки cookies: {e}")
+            return False
+
+    def suggest_cookies_update(self):
+        """
+        Предлагает пользователю обновить cookies
+        """
+        logger.info("💡 Для улучшения работы с YouTube рекомендуется:")
+        logger.info("   1. Запустить: python extract_chrome_cookies.py")
+        logger.info("   2. Закрыть Chrome перед извлечением")
+        logger.info("   3. Войти в YouTube через VPN")
+        logger.info("   4. Cookies обновляются каждые 2-3 месяца")
+
+    def generate_image_stable_diffusion(self, prompt: str, negative_prompt: str, params: dict) -> Optional[str]:
+        """Генерация изображения через прямую интеграцию со Stable Diffusion"""
+        start_time = time.time()
+        
+        # Автоматически включаем генерацию изображений при необходимости
+        if not getattr(self, 'use_image_generation', False):
+            logger.info("🔧 Автоматически включаю генерацию изображений")
+            self.use_image_generation = True
+            # Запускаем таймер автоматического выключения
+            self.auto_disable_tools("image_generation")
+        
+        # Параметры по умолчанию
+        default_params = {
+            "seed": -1,
+            "steps": 30,
+            "width": 1024,
+            "height": 1024,
+            "cfg": 7.0,
+            "sampler_name": "dpmpp_2m",
+            "scheduler": "karras"
+        }
+        
+        # Обновляем параметры пользовательскими значениями
+        gen_params = default_params.copy()
+        gen_params.update(params)
+        
+        # Исправляем seed если он -1
+        if gen_params["seed"] == -1:
+            import random
+            gen_params["seed"] = random.randint(0, 2**32 - 1)
+            logger.info(f"🎲 Сгенерирован случайный seed: {gen_params['seed']}")
+        
+        logger.info(f"🔧 Параметры генерации: {gen_params}")
+        
+        try:
+            # Устанавливаем необходимые зависимости
+            self._install_diffusers_dependencies()
+            
+            # Импортируем необходимые библиотеки
+            from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+            import torch
+            
+            # Путь к модели
+            model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH", "J:\\ComfyUI\\models\\checkpoints\\novaAnime_v20.safetensors")
+            
+            # Проверяем существование модели
+            if not os.path.exists(model_path):
+                logger.error(f"❌ Модель не найдена: {model_path}")
+                return None
+            
+            logger.info(f"📦 Загружаю модель: {model_path}")
+            
+            # Загружаем pipeline
+            pipe = StableDiffusionPipeline.from_single_file(
+                model_path,
+                torch_dtype=torch.float16,
+                use_safetensors=True
+            )
+            
+            # Перемещаем на GPU если доступен
+            if torch.cuda.is_available():
+                pipe = pipe.to("cuda")
+                logger.info("🚀 Модель перемещена на GPU")
+            else:
+                logger.warning("⚠️ GPU недоступен, использую CPU")
+            
+            # Настраиваем scheduler
+            if gen_params["sampler_name"] == "dpmpp_2m":
+                pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+                logger.info("⚙️ Использую DPMSolverMultistepScheduler")
+            
+            # Генерируем изображение
+            logger.info(f"🎨 Генерирую изображение: {prompt[:50]}...")
+            
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=gen_params["steps"],
+                guidance_scale=gen_params["cfg"],
+                width=gen_params["width"],
+                height=gen_params["height"],
+                generator=torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(gen_params["seed"])
+            )
+            
+            # Получаем изображение
+            image = result.images[0]
+            
+            # Сохраняем изображение
+            output_dir = os.path.join(os.path.dirname(__file__), "Images", "generated")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            filename = f"ConsoleTest_{gen_params['seed']}.png"
+            output_path = os.path.join(output_dir, filename)
+            
+            image.save(output_path)
+            logger.info(f"💾 Изображение сохранено: {output_path}")
+            
+            # Автоматически открываем изображение
+            try:
+                subprocess.run(["start", output_path], shell=True, check=True)
+                logger.info("🖼️ Изображение автоматически открыто")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось открыть изображение: {e}")
+            
+            # Конвертируем в base64
+            buf = BytesIO()
+            image.save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            
+            return img_b64
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка генерации изображения: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        finally:
+            # Записываем метрику производительности
+            response_time = time.time() - start_time
+            self.add_performance_metric("image_generation", response_time)
+            logger.info(f"🎨 Изображение сгенерировано за {response_time:.2f} сек")
+
+    def generate_video_stable_diffusion(self, prompt: str, negative_prompt: str, params: dict) -> Optional[str]:
+        """Генерация видео через прямую интеграцию со Stable Diffusion"""
+        start_time = time.time()
+        
+        # Автоматически включаем генерацию изображений при необходимости
+        if not getattr(self, 'use_image_generation', False):
+            logger.info("🔧 Автоматически включаю генерацию изображений")
+            self.use_image_generation = True
+            # Запускаем таймер автоматического выключения
+            self.auto_disable_tools("image_generation")
+        
+        # Параметры по умолчанию для видео
+        default_params = {
+            "seed": -1,
+            "steps": 20,
+            "width": 512,
+            "height": 512,
+            "cfg": 7.0,
+            "num_frames": 24,
+            "fps": 8,
+            "key_frames": 4
+        }
+        
+        # Обновляем параметры пользовательскими значениями
+        gen_params = default_params.copy()
+        gen_params.update(params)
+        
+        # Исправляем seed если он -1
+        if gen_params["seed"] == -1:
+            import random
+            gen_params["seed"] = random.randint(0, 2**32 - 1)
+            logger.info(f"🎲 Сгенерирован случайный seed: {gen_params['seed']}")
+        
+        logger.info(f"🔧 Параметры генерации видео: {gen_params}")
+        
+        try:
+            # Устанавливаем необходимые зависимости
+            self._install_diffusers_dependencies()
+            
+            # Импортируем необходимые библиотеки
+            from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+            import torch
+            from PIL import Image
+            import numpy as np
+            import imageio
+            
+            # Путь к модели
+            model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH", "J:\\ComfyUI\\models\\checkpoints\\novaAnime_v20.safetensors")
+            
+            # Проверяем существование модели
+            if not os.path.exists(model_path):
+                logger.error(f"❌ Модель не найдена: {model_path}")
+                return None
+            
+            logger.info(f"📦 Загружаю модель: {model_path}")
+            
+            # Загружаем pipeline
+            pipe = StableDiffusionPipeline.from_single_file(
+                model_path,
+                torch_dtype=torch.float16,
+                use_safetensors=True
+            )
+            
+            # Перемещаем на GPU если доступен
+            if torch.cuda.is_available():
+                pipe = pipe.to("cuda")
+                logger.info("🚀 Модель перемещена на GPU")
+            else:
+                logger.warning("⚠️ GPU недоступен, использую CPU")
+            
+            # Настраиваем scheduler
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+            logger.info("⚙️ Использую DPMSolverMultistepScheduler")
+            
+            # Параметры генерации
+            generation_config = {
+                "width": gen_params["width"],
+                "height": gen_params["height"],
+                "num_inference_steps": gen_params["steps"],
+                "guidance_scale": gen_params["cfg"],
+                "num_images_per_prompt": 1
+            }
+            
+            logger.info(f"🎬 Генерирую {gen_params['num_frames']} кадров для видео...")
+            
+            frames = []
+            key_frames = gen_params["key_frames"]
+            
+            # Создаем вариации промпта для ключевых кадров
+            key_prompts = [
+                prompt,
+                self._add_dynamic_elements(prompt, 1, key_frames),
+                self._add_dynamic_elements(prompt, 2, key_frames),
+                self._add_dynamic_elements(prompt, 3, key_frames)
+            ]
+            
+            # Генерируем ключевые кадры
+            for i in range(key_frames):
+                seed = gen_params["seed"] + i * 50  # Разные seed'ы
+                generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(seed)
+                
+                with torch.no_grad():
+                    result = pipe(
+                        prompt=key_prompts[i],
+                        negative_prompt=negative_prompt,
+                        generator=generator,
+                        **generation_config
+                    )
+                
+                frames.append(result.images[0])
+                logger.info(f"  ✅ Ключевой кадр {i+1} готов")
+            
+            # Создаем интерполированные кадры между ключевыми кадрами
+            frames_per_segment = gen_params["num_frames"] // (key_frames - 1)
+            
+            for segment in range(key_frames - 1):
+                img1 = np.array(frames[segment])
+                img2 = np.array(frames[segment + 1])
+                
+                for i in range(frames_per_segment):
+                    # Вычисляем коэффициент интерполяции
+                    t = i / frames_per_segment
+                    
+                    # Используем более плавную интерполяцию (ease-in-out)
+                    t_smooth = 3 * t * t - 2 * t * t * t
+                    
+                    # Интерполяция между двумя изображениями
+                    interpolated_array = img1 * (1 - t_smooth) + img2 * t_smooth
+                    
+                    # Конвертируем обратно в PIL Image
+                    interpolated_image = Image.fromarray(interpolated_array.astype(np.uint8))
+                    frames.append(interpolated_image)
+                    
+                    frame_num = segment * frames_per_segment + i + 1
+                    logger.info(f"  ✅ Кадр {frame_num}/{gen_params['num_frames']} готов (сегмент {segment+1}, интерполяция: {t_smooth:.2f})")
+            
+            # Добавляем последний ключевой кадр если нужно
+            if len(frames) < gen_params["num_frames"]:
+                frames.append(frames[-1])
+                logger.info(f"  ✅ Добавлен финальный кадр")
+            
+            frames = frames[:gen_params["num_frames"]]  # Убеждаемся, что возвращаем нужное количество кадров
+            
+            # Создаем папку для выходных файлов
+            output_dir = os.path.join(os.path.dirname(__file__), "Videos", "generated")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Сохраняем кадры
+            logger.info("💾 Сохраняю кадры...")
+            for i, frame in enumerate(frames):
+                frame_path = os.path.join(output_dir, f"video_frame_{i:03d}.png")
+                frame.save(frame_path)
+                logger.info(f"  💾 Кадр {i+1} сохранен: {frame_path}")
+            
+            # Создаем видео
+            video_path = os.path.join(output_dir, f"ConsoleVideo_{gen_params['seed']}.mp4")
+            logger.info(f"🎬 Создаю видео: {video_path}")
+            
+            # Конвертируем PIL изображения в numpy массивы
+            video_frames = []
+            for frame in frames:
+                frame_array = np.array(frame)
+                video_frames.append(frame_array)
+            
+            # Создаем видео с высоким качеством
+            imageio.mimsave(video_path, video_frames, fps=gen_params["fps"], quality=8)
+            
+            logger.info(f"✅ Видео создано: {video_path}")
+            
+            # Автоматически открываем видео
+            try:
+                subprocess.run(["start", video_path], shell=True, check=True)
+                logger.info("🎬 Видео автоматически открыто")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось открыть видео: {e}")
+            
+            return video_path
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка генерации видео: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        finally:
+            # Записываем метрику производительности
+            response_time = time.time() - start_time
+            self.add_performance_metric("video_generation", response_time)
+            logger.info(f"🎬 Видео сгенерировано за {response_time:.2f} сек")
+
+    def _add_dynamic_elements(self, prompt, frame_index, total_frames):
+        """Добавляет динамические элементы к промпту в зависимости от номера кадра"""
+        
+        # Базовые динамические элементы для разных типов промптов
+        dynamic_elements = {
+            "pose": [
+                "slight head turn", "head turning", "looking to the side", "looking up", "looking down",
+                "slight body movement", "body turning", "arm movement", "hand gesture", "finger movement",
+                "eye movement", "blinking", "mouth movement", "smile change", "expression change"
+            ],
+            "lighting": [
+                "slight lighting change", "light shift", "shadow movement", "highlight change",
+                "ambient light variation", "light intensity change", "color temperature shift"
+            ],
+            "camera": [
+                "slight camera movement", "camera angle change", "zoom effect", "perspective shift",
+                "depth change", "focus adjustment", "blur variation"
+            ],
+            "motion": [
+                "motion blur", "movement lines", "wind effect", "hair movement", "clothing movement",
+                "particle effects", "energy flow", "magical effects", "sparkle effects"
+            ]
+        }
+        
+        # Определяем тип промпта
+        prompt_lower = prompt.lower()
+        
+        # Выбираем подходящие динамические элементы
+        if any(word in prompt_lower for word in ["anime", "girl", "boy", "character", "person"]):
+            # Для персонажей добавляем движения и выражения
+            elements = dynamic_elements["pose"] + dynamic_elements["motion"]
+        elif any(word in prompt_lower for word in ["landscape", "nature", "scenery", "background"]):
+            # Для пейзажей добавляем изменения освещения и камеры
+            elements = dynamic_elements["lighting"] + dynamic_elements["camera"]
+        else:
+            # Для остальных используем все элементы
+            elements = dynamic_elements["pose"] + dynamic_elements["lighting"] + dynamic_elements["camera"] + dynamic_elements["motion"]
+        
+        # Выбираем элемент в зависимости от номера кадра
+        if elements:
+            # Равномерно распределяем элементы по кадрам
+            element_index = int((frame_index / total_frames) * len(elements))
+            selected_element = elements[element_index % len(elements)]
+            
+            # Добавляем элемент к промпту
+            enhanced_prompt = f"{prompt}, {selected_element}"
+            
+            # Добавляем интенсивность изменения в зависимости от прогресса
+            progress = frame_index / total_frames
+            if progress > 0.5:
+                enhanced_prompt += ", subtle animation"
+            
+            return enhanced_prompt
+        
+        return prompt
+    
+    def _install_diffusers_dependencies(self):
+        """Устанавливает необходимые зависимости для diffusers"""
+        try:
+            import diffusers
+            import torch
+            logger.info("✅ diffusers и torch уже установлены")
+            return
+        except ImportError:
+            logger.info("📦 Устанавливаю зависимости для diffusers...")
+            
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "diffusers", "transformers", "torch", "torchvision", "accelerate", "safetensors"], 
+                             check=True, capture_output=True)
+                logger.info("✅ Зависимости установлены успешно")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ Ошибка установки зависимостей: {e}")
+                raise
+
+    def show_image_base64_temp(self, b64img: str):
+        """Показать изображение из base64 на 5 секунд"""
+        try:
+            # В веб-режиме отключаем всплывающее окно показа
+            if not getattr(self, 'show_images_locally', True):
+                return
+            img = Image.open(BytesIO(base64.b64decode(b64img)))
+            img.show()
+            time.sleep(5)
+            img.close()
+        except Exception as e:
+            logger.error(f"Ошибка показа изображения: {e}")
+    def find_new_audio(self) -> str:
+        """Находит новый аудиофайл для обработки"""
+        audio_extensions = ['.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac']
+        
+        # Ищем в папке Audio
+        audio_dir = os.path.join(self.base_dir, 'Audio')
+        if os.path.exists(audio_dir):
+            for file in os.listdir(audio_dir):
+                if any(file.lower().endswith(ext) for ext in audio_extensions):
+                    # Проверяем, что файл не помечен как обработанный
+                    if '.used' not in file and not file.endswith('.used'):
+                        file_path = os.path.join(audio_dir, file)
+                        # Проверяем, что файл действительно существует и не пустой
+                        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                            return file_path
+        
+        return ""
+
+    def mark_audio_used(self, audio_path: str):
+        """Удаляет аудиофайл после обработки"""
+        try:
+            if os.path.exists(audio_path):
+                # Удаляем файл полностью
+                os.remove(audio_path)
+                self.logger.info(f"✅ Аудиофайл удален после обработки: {os.path.basename(audio_path)}")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка при удалении аудиофайла: {e}")
+
+    def transcribe_audio_whisper(self, audio_path: str, lang: str = "ru", use_separator: bool = True) -> str:
+        """
+        Распознаёт аудио через whisper-cli. Если use_separator=True, предварительно выделяет вокал через audio-separator.
+        Возвращает текст транскрипта (выводит только один раз при получении).
+        """
+        start_time = time.time()
+        
+        # Автоматически включаем audio модель при необходимости
+        if not getattr(self, 'use_audio', False):
+            logger.info("🔧 Автоматически включаю audio модель")
+            self.use_audio = True
+            # Запускаем таймер автоматического выключения
+            self.auto_disable_tools("audio")
+        
+        # Проверяем и загружаем whisper модель если нужно
+        if not self.check_whisper_setup():
+            return "[Whisper error] Проблемы с настройкой Whisper. Проверьте наличие whisper-cli.exe и модели."
+        
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            exe_path = os.path.join(base_dir, "Release", "whisper-cli.exe")
+            model_path = os.path.join(base_dir, "models", "whisper-large-v3-q8_0.gguf")
+            
+            # Проверяем существование whisper-cli.exe
+            if not os.path.exists(exe_path):
+                return "[Whisper error] Не найден whisper-cli.exe в папке Release"
+            
+            # Проверяем существование модели
+            if not os.path.exists(model_path):
+                return "[Whisper error] Не найдена модель whisper в папке models"
+            
+            audio_for_whisper = audio_path
+            
+            # Используем audio separator если включен
+            if use_separator:
+                try:
+                    from audio_separator.separator import Separator
+                    logger.info("🎵 Использую audio-separator для выделения вокала...")
+                    out_dir = os.path.join(base_dir, "separated")
+                    os.makedirs(out_dir, exist_ok=True)
+                    separator = Separator(output_dir=out_dir)
+                    separator.load_model(model_filename='htdemucs_ft.yaml')
+                    output_files = separator.separate(audio_path)
+                    vocals_path = None
+                    for file_path in output_files:
+                        if '(Vocals)' in os.path.basename(file_path):
+                            vocals_path = file_path  # audio-separator возвращает полный путь
+                            logger.info(f"[SUCCESS] Вокал найден: {vocals_path}")
+                            break
+                    if not vocals_path:
+                        logger.warning("⚠️ Не удалось найти файл с голосом после разделения дорожек, использую оригинал")
+                    else:
+                        audio_for_whisper = vocals_path
+                except ImportError:
+                    logger.warning("⚠️ Не установлена библиотека audio-separator. Пытаюсь установить автоматически...")
+                    try:
+                        import subprocess
+                        subprocess.run([_sys.executable, "-m", "pip", "install", "audio-separator"], 
+                                     capture_output=True, check=True)
+                        logger.info("✅ audio-separator успешно установлен")
+                        # Повторно пытаемся импортировать
+                        from audio_separator.separator import Separator
+                        logger.info("🎵 Использую audio-separator для выделения вокала...")
+                        out_dir = os.path.join(base_dir, "separated")
+                        os.makedirs(out_dir, exist_ok=True)
+                        separator = Separator(output_dir=out_dir)
+                        separator.load_model(model_filename='htdemucs_ft.yaml')
+                        output_files = separator.separate(audio_path)
+                        vocals_path = None
+                        for file_path in output_files:
+                            if '(Vocals)' in os.path.basename(file_path):
+                                vocals_path = file_path  # audio-separator возвращает полный путь
+                                logger.info(f"[SUCCESS] Вокал найден: {vocals_path}")
+                                break
+                        if not vocals_path:
+                            logger.warning("⚠️ Не удалось найти файл с голосом после разделения дорожек, использую оригинал")
+                        else:
+                            audio_for_whisper = vocals_path
+                    except Exception as install_error:
+                        logger.warning(f"⚠️ Не удалось установить audio-separator: {install_error}")
+                        logger.info("ℹ️ Продолжаю без разделения дорожек")
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка audio-separator: {e}, использую оригинал")
+            
+            # Конвертируем аудио в WAV формат для Whisper (если это не уже WAV)
+            if not audio_for_whisper.lower().endswith('.wav'):
+                wav_path = self.convert_audio_to_wav(audio_for_whisper)
+                if wav_path:
+                    audio_for_whisper = wav_path
+                    logger.info(f"✅ Аудио конвертировано в WAV: {os.path.basename(wav_path)}")
+                else:
+                    logger.warning("⚠️ Не удалось конвертировать в WAV, использую оригинал")
+            else:
+                logger.info("✅ Аудио уже в WAV формате")
+            
+            # Переименовать используемый файл в .used.расширение
+            base_used, ext_used = os.path.splitext(audio_for_whisper)
+            used_path = base_used + ".used" + ext_used
+            try:
+                if os.path.exists(audio_for_whisper):
+                    os.rename(audio_for_whisper, used_path)
+                    logger.info(f"✅ Аудиофайл переименован в: {os.path.basename(used_path)}")
+                else:
+                    logger.warning(f"⚠️ Аудиофайл не найден для переименования: {audio_for_whisper}")
+                    used_path = audio_for_whisper
+            except Exception as e:
+                logger.error(f"Ошибка переименования аудио после whisper: {e}")
+                # Если не удалось переименовать, используем оригинальный файл
+                used_path = audio_for_whisper
+            
+            # Теперь используем used_path для whisper
+            cmd = [exe_path, "--model", model_path]
+            if lang:
+                cmd += ["--language", lang]
+            cmd.append(used_path)
+            logger.info(f"[INFO] Запуск Whisper: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, encoding="utf-8", errors="replace")
+            transcript = result.stdout.strip() if result.stdout else ""
+            if transcript:
+                logger.info("\n=== ТРАНСКРИПТ АУДИО ===\n" + transcript)
+                return transcript
+            
+            # Очистка временных файлов если был separator
+            if use_separator and 'separated' in audio_for_whisper:
+                try:
+                    separated_dir = os.path.dirname(audio_for_whisper)
+                    if os.path.exists(separated_dir):
+                        shutil.rmtree(separated_dir)
+                        logger.info("🧹 Временные файлы audio-separator очищены")
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось очистить временные файлы: {e}")
+            
+            err = result.stderr.strip() if result.stderr else ""
+            return f"[Whisper error] Не удалось получить транскрипт. STDERR: {err}"
+        except Exception as e:
+            error_msg = f"Исключение whisper-cli: {str(e)}"
+            logger.error(error_msg)
+            return f"[Whisper error] {error_msg}"
+        finally:
+            # Записываем метрику производительности
+            response_time = time.time() - start_time
+            self.add_performance_metric("whisper_transcription", response_time)
+            logger.info(f"🎤 Whisper обработал за {response_time:.2f} сек")
+
+    def convert_audio_to_wav(self, audio_path: str) -> str:
+        """
+        Конвертирует аудиофайл в WAV формат для Whisper.
+        Возвращает путь к WAV файлу или None при ошибке.
+        """
+        try:
+            if not audio_path or not os.path.exists(audio_path):
+                return None
+            
+            # Если уже WAV, не конвертируем
+            if audio_path.lower().endswith('.wav'):
+                return audio_path
+            
+            # Проверяем наличие ffmpeg
+            try:
+                subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                logger.warning("⚠️ ffmpeg не найден в системе. Установите ffmpeg для конвертации аудио.")
+                return None
+            
+            # Создаем временную папку для конвертации
+            temp_dir = os.path.join(os.path.dirname(audio_path), "temp_convert")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Имя выходного WAV файла
+            base_name = os.path.splitext(os.path.basename(audio_path))[0]
+            wav_path = os.path.join(temp_dir, f"{base_name}.wav")
+            
+            # Команда для конвертации через ffmpeg
+            cmd = [
+                'ffmpeg', '-i', audio_path,
+                '-acodec', 'pcm_s16le',  # 16-bit PCM
+                '-ar', '16000',          # 16kHz sample rate (оптимально для Whisper)
+                '-ac', '1',              # моно
+                '-y',                    # перезаписать существующий файл
+                wav_path
+            ]
+            
+            logger.info(f"🔄 Конвертирую аудио в WAV: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode == 0 and os.path.exists(wav_path):
+                logger.info(f"✅ Конвертация успешна: {os.path.basename(wav_path)}")
+                return wav_path
+            else:
+                logger.error(f"❌ Ошибка конвертации: {result.stderr}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка конвертации аудио в WAV: {e}")
+            return None
+
+    def check_whisper_setup(self) -> bool:
+        """
+        Проверяет настройку Whisper: наличие whisper-cli.exe и модели.
+        Возвращает True если всё готово, False если есть проблемы.
+        """
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            exe_path = os.path.join(base_dir, "Release", "whisper-cli.exe")
+            model_path = os.path.join(base_dir, "models", "whisper-large-v3-q8_0.gguf")
+            
+            # Проверяем whisper-cli.exe
+            if not os.path.exists(exe_path):
+                logger.error(f"❌ Не найден whisper-cli.exe в папке Release: {exe_path}")
+                logger.info("💡 Скачайте whisper.cpp с https://github.com/ggerganov/whisper.cpp")
+                return False
+            
+            # Проверяем модель
+            if not os.path.exists(model_path):
+                logger.warning(f"⚠️ Не найдена модель whisper в папке models: {model_path}")
+                logger.info("🔄 Пытаюсь автоматически скачать модель...")
+                if self.download_whisper_model():
+                    logger.info("✅ Модель whisper успешно загружена")
+                else:
+                    logger.error("❌ Не удалось загрузить модель whisper")
+                    logger.info("💡 Скачайте модель whisper-large-v3-q8_0.gguf вручную")
+                    return False
+            
+            # Проверяем права на выполнение
+            try:
+                result = subprocess.run([exe_path, "--help"], capture_output=True, text=True, timeout=10)
+                if result.returncode != 0:
+                    logger.warning("⚠️ whisper-cli.exe не может быть запущен")
+                    return False
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка запуска whisper-cli.exe: {e}")
+                return False
+            
+            logger.info("✅ Whisper настройка проверена успешно")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки настройки Whisper: {e}")
+            return False
+
+    def download_whisper_model(self) -> bool:
+        """
+        Автоматически скачивает модель whisper-large-v3-q8_0.gguf.
+        Возвращает True если успешно, False если ошибка.
+        """
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            models_dir = os.path.join(base_dir, "models")
+            os.makedirs(models_dir, exist_ok=True)
+            
+            model_name = "whisper-large-v3-q8_0.gguf"
+            model_path = os.path.join(models_dir, model_name)
+            
+            # URL для скачивания модели (используем Hugging Face)
+            model_url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q8_0.bin"
+            
+            logger.info(f"📥 Скачиваю модель whisper: {model_name}")
+            logger.info(f"🔗 URL: {model_url}")
+            
+            # Скачиваем модель
+            response = requests.get(model_url, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(model_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            percent = (downloaded / total_size) * 100
+                            logger.info(f"📊 Прогресс: {percent:.1f}% ({downloaded}/{total_size} байт)")
+            
+            logger.info(f"✅ Модель скачана: {model_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка скачивания модели whisper: {e}")
+            return False
+
+    def text_to_speech(self, text: str, voice: str = "male", language: str = "ru") -> str:
+        """
+        Озвучивает текст с помощью gTTS (Google Text-to-Speech)
+        
+        Args:
+            text: Текст для озвучки
+            voice: Тип голоса ("male" или "female") - пока не используется в gTTS
+            language: Язык текста ("ru", "en", etc.)
+            
+        Returns:
+            Путь к созданному аудиофайлу или пустая строка при ошибке
+        """
+        try:
+            from gtts import gTTS
+            
+            # Создаем папку для сгенерированной речи
+            output_dir = os.path.join(os.path.dirname(__file__), "Audio", "generated_speech")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Генерируем уникальное имя файла
+            timestamp = int(time.time())
+            filename = f"tts_{voice}_{language}_{timestamp}.mp3"
+            output_path = os.path.join(output_dir, filename)
+            
+            logger.info(f"🎤 Озвучиваю текст: {text[:100]}...")
+            logger.info(f"🔊 Голос: {voice}, Язык: {language}")
+            
+            # Создаем TTS объект
+            tts = gTTS(text=text, lang=language, slow=False)
+            
+            # Сохраняем аудиофайл
+            tts.save(output_path)
+            
+            logger.info(f"✅ Аудиофайл сохранен: {output_path}")
+            return output_path
+            
+        except ImportError:
+            logger.error("❌ gTTS не установлен. Установите: pip install gTTS")
+            return ""
+        except Exception as e:
+            logger.error(f"❌ Ошибка озвучки текста: {e}")
+            return ""
+
+    def download_youtube_audio(self, url: str, out_dir: Optional[str] = None) -> str:
+        """
+        Скачивает аудиодорожку с YouTube по ссылке (использует yt-dlp)
+        Возвращает путь к аудиофайлу или пустую строку
+        """
+        # subprocess уже импортирован в начале файла
+        if out_dir is None:
+            out_dir = os.path.join(os.path.dirname(__file__), "Audio")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "yt_audio.%(ext)s")
+        # Проверяем наличие cookies
+        cookies_path = self.get_youtube_cookies_path()
+        use_cookies = False
+        
+        if cookies_path and self.check_cookies_validity(cookies_path):
+            use_cookies = True
+            logger.info("🍪 Использую cookies для аутентификации YouTube")
+        else:
+            logger.info("ℹ️ Cookies не найдены или невалидны, использую базовые параметры")
+        
+        # Базовые параметры для yt-dlp
+        base_cmd = [
+            "yt-dlp",
+            "--force-ipv4",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--extractor-args", "youtube:player_client=android",  # Используем Android клиент
+            "--no-check-certificate",  # Игнорируем SSL ошибки
+            "--prefer-insecure",  # Предпочитаем HTTP
+            "--geo-bypass",  # Обход геоблокировки
+            "--geo-bypass-country", "US",  # Страна для обхода
+            "-f", "bestaudio[ext=m4a]/bestaudio/best",
+            "--extract-audio", "--audio-format", "wav",  # Сразу в WAV для Whisper
+            "-o", out_path
+        ]
+        
+        # Добавляем cookies если доступны
+        if use_cookies:
+            base_cmd.extend(["--cookies", cookies_path])
+        
+        # Добавляем URL в конец
+        cmd = base_cmd + [url]
+        
+        try:
+            logger.info(f"Скачиваю аудио с YouTube: {url}")
+            # Логируем команду в одну строку для избежания обрезания
+            cmd_str = " ".join(cmd)
+            logger.info(f"Команда: {cmd_str}")
+            
+            # Запускаем с таймаутом
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+            
+            if result.stdout:
+                logger.info(f"yt-dlp stdout: {result.stdout}")
+            if result.stderr:
+                logger.warning(f"yt-dlp stderr: {result.stderr}")
+            
+            # Найти скачанный файл
+            for fname in os.listdir(out_dir):
+                if fname.startswith("yt_audio") and fname.endswith(('.wav', '.m4a', '.mp3', '.ogg', '.flac')):
+                    logger.info(f"✅ Аудио успешно скачано: {fname}")
+                    return os.path.join(out_dir, fname)
+            
+            logger.warning("⚠️ Аудиофайл не найден после скачивания")
+            return ""
+            
+        except subprocess.TimeoutExpired:
+            logger.error("❌ Таймаут скачивания аудио (5 минут)")
+            return ""
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Ошибка yt-dlp: {e}")
+            if e.stderr:
+                logger.error(f"stderr: {e.stderr}")
+            return ""
+        except Exception as e:
+            logger.error(f"❌ Неожиданная ошибка скачивания аудио: {e}")
+            
+            # Пробуем альтернативный метод с другими параметрами
+            logger.info("🔄 Пробую альтернативный метод скачивания...")
+            try:
+                alt_cmd = [
+                    "yt-dlp",
+                    "--force-ipv4",
+                    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "--extractor-args", "youtube:player_client=web",
+                    "--no-check-certificate",
+                    "--geo-bypass",
+                    "--geo-bypass-country", "US",
+                    "-f", "bestaudio",
+                    "--extract-audio", "--audio-format", "wav",  # Сразу в WAV для Whisper
+                    "-o", out_path
+                ]
+                
+                # Добавляем cookies если доступны
+                if use_cookies:
+                    alt_cmd.extend(["--cookies", cookies_path])
+                
+                alt_cmd.append(url)
+                
+                # Логируем команду в одну строку
+                alt_cmd_str = " ".join(alt_cmd)
+                logger.info(f"Альтернативная команда: {alt_cmd_str}")
+                result = subprocess.run(alt_cmd, check=True, capture_output=True, text=True, timeout=300)
+                
+                # Найти скачанный файл
+                for fname in os.listdir(out_dir):
+                    if fname.startswith("yt_audio") and fname.endswith(('.wav', '.m4a', '.mp3', '.ogg', '.flac')):
+                        logger.info(f"✅ Аудио успешно скачано альтернативным методом: {fname}")
+                        return os.path.join(out_dir, fname)
+                        
+            except Exception as alt_e:
+                logger.error(f"❌ Альтернативный метод также не сработал: {alt_e}")
+                
+                # Пробуем третий метод с максимально простыми параметрами
+                logger.info("🔄 Пробую третий метод (минимальные параметры)...")
+                try:
+                    simple_cmd = [
+                        "yt-dlp",
+                        "--force-ipv4",
+                        "--user-agent", "Mozilla/0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "--no-check-certificate",
+                        "-f", "bestaudio",
+                        "--extract-audio", "--audio-format", "mp3",
+                        "-o", out_path
+                    ]
+                    
+                    # Добавляем cookies если доступны
+                    if use_cookies:
+                        simple_cmd.extend(["--cookies", cookies_path])
+                    
+                    simple_cmd.append(url)
+                    
+                    logger.info(f"Третий метод: {' '.join(simple_cmd)}")
+                    result = subprocess.run(simple_cmd, check=True, capture_output=True, text=True, timeout=300)
+                    
+                    # Найти скачанный файл
+                    for fname in os.listdir(out_dir):
+                        if fname.startswith("yt_audio") and fname.endswith(('.m4a', '.mp3', '.wav', '.ogg', '.flac')):
+                            logger.info(f"✅ Аудио успешно скачано третьим методом: {fname}")
+                            return os.path.join(out_dir, fname)
+                            
+                except Exception as simple_e:
+                    logger.error(f"❌ Третий метод также не сработал: {simple_e}")
+            
+            return ""
+    def find_new_image(self) -> str:
+        """
+        Находит первое новое изображение (png или jpg) в папке Photos, игнорируя файлы с .used перед расширением
+        """
+        photos_dir = os.path.join(os.path.dirname(__file__), "Photos")
+        if not os.path.exists(photos_dir):
+            return ""
+        for fname in os.listdir(photos_dir):
+            lower = fname.lower()
+            if lower.endswith(('.png', '.jpg', '.jpeg')) and '.used' not in os.path.splitext(lower)[0]:
+                return os.path.join(photos_dir, fname)
+        return ""
+
+    def mark_image_used(self, image_path: str):
+        """
+        Переименовывает изображение, чтобы нейросеть его больше не использовала
+        """
+        if not image_path:
+            return
+        base, ext = os.path.splitext(image_path)
+        new_path = base + ".used" + ext
+        try:
+            os.rename(image_path, new_path)
+        except Exception as e:
+            logger.error(f"Ошибка переименования изображения: {e}")
+    def extract_first_json(self, text: str) -> str:
+        """
+        Извлекает первый корректный JSON-блок из текста, поддерживая модуль <think>.
+        Если не найдено, возвращает исходный текст.
+        """
+        # re уже импортирован в начале файла
+        
+        # Сначала ищем JSON внутри модуля <think>
+        think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+        if think_match:
+            think_content = think_match.group(1).strip()
+            # Ищем JSON в содержимом think
+            json_in_think = self._extract_json_from_text(think_content)
+            if json_in_think:
+                return json_in_think
+        
+        # Если в think нет JSON, ищем в основном тексте
+        json_in_main = self._extract_json_from_text(text)
+        if json_in_main:
+            return json_in_main
+        
+        return text  # если не найдено, вернуть исходное
+    
+    def _extract_json_from_text(self, text: str) -> str:
+        """
+        Вспомогательная функция для извлечения JSON из текста
+        """
+        # re уже импортирован в начале файла
+        stack = []
+        start = None
+        
+        for i, c in enumerate(text):
+            if c == '{':
+                if not stack:
+                    start = i
+                stack.append('{')
+            elif c == '}':
+                if stack:
+                    stack.pop()
+                    if not stack and start is not None:
+                        return text[start:i+1]
+        
+        return ""
+    def __init__(self, lm_studio_url: str = "http://localhost:1234", 
+                 google_api_key: str = "", google_cse_id: str = ""):
+        """
+        Инициализация оркестратора
+        
+        Args:
+            lm_studio_url: URL сервера LM Studio
+            google_api_key: API ключ Google Custom Search
+            google_cse_id: ID поисковой системы Google CSE
+        """
+        self.lm_studio_url = lm_studio_url.rstrip("/")
+        self.google_api_key = google_api_key
+        self.google_cse_id = google_cse_id
+        self.conversation_history: List[Dict[str, Any]] = []
+        self.brain_model = "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
+        self.brain_model_id = None  # Короткий ID модели для API вызовов
+        self.use_separator = True  # По умолчанию True, чтобы убрать предупреждение Pylance
+        self.use_image_generation = False  # По умолчанию отключена генерация изображений
+        # Тумблеры функционала (визуал и аудио)
+        self.use_vision = False
+        self.use_audio = False
+        # Управление локальным показом изображений (для веб-режима можно отключить)
+        self.show_images_locally = True
+        # Хранилище последнего сгенерированного изображения (base64) и ответа
+        self.last_generated_image_b64 = None
+        self.last_final_response = ""
+        
+        # Динамическое управление контекстом
+        self.max_context_length = 262144  # Максимальный контекст (временно)
+        self.safe_context_length = 32768   # Безопасный контекст (временно)
+        self.current_context_length = 0    # Текущий размер контекста
+        
+        # Метрики производительности
+        self.performance_metrics = []  # Список метрик производительности
+        
+        # Счетчик попыток для предотвращения зацикливания
+        self.retry_count = 0
+        self.max_retries = 3
+        
+        # Постоянная голосовая запись
+        self.continuous_recording = False
+        self.audio_queue = queue.Queue()
+        self.recording_thread = None
+        
+        # Таймеры для автоматического выключения инструментов
+        self.tool_timers = {}
+        self.auto_disable_delay = 300  # Выключать инструменты через 5 минут после использования
+        
+        # Автоматически запускаем модель мозга при инициализации
+        self._auto_load_brain_model()
+        
+        # Инициализируем динамические параметры контекста после загрузки модели
+        self._initialize_dynamic_context()
+        
+        # Инициализируем базовую директорию
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Проверяем наличие ffmpeg для конвертации аудио
+        self._check_ffmpeg()
+        
+        # Telegram Bot настройки
+        self.telegram_bot_token = ""
+        self.telegram_allowed_user_id = ""
+        
+
+        # Универсальный системный промпт для оркестратора
+        self.system_prompt = """
+ИНФОРМАЦИЯ О ГЕНЕРАЦИИ ИЗОБРАЖЕНИЙ:
+
+Категории и теги для генерации изображений (каждый тег подписан, обязательные отмечены [!]):
+
+[Универсальные] — базовые теги, почти всегда нужны для высокого качества:
+- masterpiece [!] — всегда использовать для лучшего качества
+- best quality [!] — всегда использовать для лучшего качества
+- extremely detailed [!] — всегда использовать для детализации
+- high quality [!] — всегда использовать для качества
+- 4k / 8k / 16k resolution — высокое разрешение (опционально)
+- dynamic pose — динамичная поза (опционально)
+- random pose — случайная поза (опционально)
+- various pose — разные позы (опционально)
+- random composition — случайная композиция (опционально)
+- random clothes — случайная одежда (опционально)
+- no specific character — без конкретного персонажа (опционально)
+- solo — один персонаж (опционально)
+- multiple characters / group — группа персонажей (опционально)
+- close-up — крупный план (опционально)
+- full body — полный рост (опционально)
+- upper body — по пояс (опционально)
+- cropped to knees / cropped tight / half body — обрезка кадра (опционально)
+- view from below / bird's eye view / side view / front view / back view — ракурс (опционально)
+- floating / levitating — парящий (опционально)
+- random background / abstract background / surreal background — фон (опционально)
+- soft lighting / dramatic lighting / natural lighting — освещение (опционально)
+- cinematic lighting — кинематографичное освещение (опционально)
+- beautifully lit — красиво освещено (опционально)
+- natural colors / vibrant colors / muted colors — цвета (опционально)
+- atmospheric — атмосферно (опционально)
+- detailed background — детализированный фон (опционально)
+- intricately detailed — сложная детализация (опционально)
+- ornate — украшения (опционально)
+- simple background — минималистичный фон (опционально)
+- medium breasts / small breasts / large breasts — размер груди (опционально)
+- wide hips / slim hips / athletic build / petite — тип фигуры (опционально)
+- cute face / beautiful eyes / expressive eyes / smile / neutral expression / serious expression — выражение лица (опционально)
+
+[NSFW] — для откровенных сцен, использовать только если требуется:
+- nude — обнажённая натура
+- lewd — пошлость
+- explicit — откровенность
+- uncensored — без цензуры
+- cleavage — декольте
+- nipples visible — видны соски
+- medium breasts / large breasts / small breasts — размер груди
+- wide hips — широкие бёдра
+- ass visible — видна попа
+- sexy pose — сексуальная поза
+- dynamic pose / random pose — динамика
+- legs cropped to knees — акцент на ногах
+- solo — один персонаж
+- 1girl / 1boy / 1person — один персонаж без имени
+- multiple girls / multiple boys — группа
+- erotic / sensual / seductive pose — эротика
+- bed scene / erotic setting / dim lighting — постельная сцена
+- soft skin / smooth skin — мягкая кожа
+- skin exposed — открытая кожа
+- no clothes / minimal clothes / random clothes — одежда
+- random background — случайный фон
+- random hair color / natural hair color — цвет волос
+- messy hair / flowing hair — растрёпанные волосы
+- natural lighting / moody lighting / warm lighting — освещение
+
+[NSFW - negative prompt] — всегда добавлять для фильтрации багов:
+- worst quality [!]
+- low quality [!]
+- blurry [!]
+- jpeg artifacts [!]
+- watermark [!]
+- signature [!]
+- disfigured [!]
+- malformed limbs [!]
+- bad anatomy [!]
+- poorly drawn face [!]
+- extra limbs [!]
+- missing limbs [!]
+- out of frame [!]
+- mutilated [!]
+- mutated hands [!]
+- extra fingers [!]
+- text [!]
+- error [!]
+- cropped [!]
+- duplicate [!]
+- lowres [!]
+- bad proportions [!]
+- squint [!]
+- grainy [!]
+- ugly [!]
+
+[SFW] — для безопасных сцен, без NSFW:
+- sfw [!]
+- clothed — одет(а)
+- random clothes — случайная одежда
+- casual clothes / elegant clothes / formal clothes — стиль одежды
+- dynamic pose / random pose — динамика
+- walking / sitting / standing / running / jumping — поза/движение
+- smiling / happy expression / neutral expression — выражение лица
+- cute face / beautiful eyes / expressive eyes — лицо
+- solo / group — количество персонажей
+- wide shot / medium shot / close-up — план
+- background: natural / city / forest / abstract / random background — фон
+- bright lighting / natural lighting / studio lighting — освещение
+- scenic view — пейзаж
+- colorful / vibrant colors / pastel colors — цвета
+- hair color random / natural hair colors / random hairstyle — волосы
+- standing on grass / street / indoors / outdoors — окружение
+- hands visible / face visible — видимость частей тела
+- wearing hat / scarf / jacket / dress — аксессуары
+- full body / half body / cropped — кадрирование
+
+[SFW - negative prompt] — всегда добавлять для фильтрации артефактов и NSFW:
+- nude [!]
+- nsfw [!]
+- lewd [!]
+- explicit [!]
+- uncleared skin [!]
+- cleavage [!]
+- nipples [!]
+- bad anatomy [!]
+- malformed [!]
+- low quality [!]
+- jpeg artifacts [!]
+- watermark [!]
+- signature [!]
+- text [!]
+- blurry [!]
+- distorted [!]
+- out of frame [!]
+- duplicate [!]
+- extra limbs [!]
+- missing limbs [!]
+- mutated [!]
+- squint [!]
+- grainy [!]
+- ugly [!]
+
+[Дополнительные теги] — для случайности и вариативности:
+- random hair color — случайный цвет волос
+- random eye color — случайный цвет глаз
+- random skin tone — случайный тон кожи
+- random background — случайный фон
+- random lighting — случайное освещение
+- dynamic lighting — динамичное освещение
+- soft shadows — мягкие тени
+- motion blur — эффект движения
+- motion lines — линии движения
+- floating — парящий
+- wind blowing hair / wind effect — ветер
+- glowing elements / magical atmosphere — магия
+- surreal / abstract shapes — сюрреализм
+- random accessories — случайные аксессуары
+- random pose transitions — смена поз
+- random facial expression — выражение лица
+- random angle — угол
+- random camera position — позиция камеры
+- asymmetrical design — асимметрия
+- broken pattern — нарушенный паттерн
+- glitch effect — глитч-эффект
+- pastel colors / neon colors / monochrome — цветовые схемы
+
+---
+
+Тебя зовут Нейро. Ты — интеллектуальный программный оркестратор, который может выполнять команды PowerShell, управлять мышью и клавиатурой, создавать и читать файлы, искать информацию в интернете, анализировать изображения и видео, а также генерировать изображения.
+
+ТЫ ОСОБЕННО ХОРОШ В:
+- Анализе и понимании сложных задач
+- Разбиении задач на логические шаги
+- Использовании инструментов для достижения цели
+- Адаптации к изменениям и исправлению ошибок
+- Объяснении своих действий и решений
+
+СТРОГО СОБЛЮДАЙ СЛЕДУЮЩИЕ ПРАВИЛА:
+
+1. ИСПОЛЬЗУЙ МОДУЛЬ <think> для размышлений:
+   - Если нужно подумать о задаче, используй <think>содержимое размышлений</think>
+   - В think можешь анализировать, планировать, оценивать варианты
+   - После think ВСЕГДА давай конкретное действие или ответ
+
+2. ВСЕГДА отвечай в формате JSON с одним из следующих действий:
+   - "powershell" — для выполнения команд PowerShell
+   - "search" — для поиска в интернете
+   - "generate_image" — для генерации изображения (только если включена генерация изображений)
+   - "speak" — для озвучки важного текста (только самое важное, что нужно сразу услышать)
+   - "response" — для финального ответа пользователю
+   - "move_mouse" — переместить мышь (x, y)
+   - "left_click" — клик левой кнопкой мыши (x, y)
+   - "right_click" — клик правой кнопкой мыши (x, y)
+   - "scroll_up" — прокрутка вверх (pixels)
+   - "scroll_down" — прокрутка вниз (pixels)
+   - "mouse_down" — зажать левую кнопку мыши (x, y)
+   - "mouse_up" — отпустить левую кнопку мыши (x, y)
+   - "drag_and_drop" — перетащить мышью (x1, y1, x2, y2)
+   - "type_text" — ввести текст (text)
+   - "take_screenshot" — сделать скриншот экрана для анализа
+
+3. ПРАВИЛО ОЗВУЧКИ: Используй действие "speak" только для самого важного текста, который нужно сразу услышать. 
+   Остальной текст (объяснения, детали, дополнительная информация) помещай в обычный ответ "response".
+   Например, если пользователь спрашивает "сколько 2+2", озвучь только "Будет 4", а объяснения и детали 
+   помести в обычный текстовый ответ.
+
+4. Формат JSON для управления мышью:
+{
+  "action": "move_mouse",
+  "x": 123,
+  "y": 456,
+  "description": "Переместить мышь на кнопку 'ОК'"
+}
+{
+  "action": "left_click",
+  "x": 123,
+  "y": 456,
+  "description": "Кликнуть по кнопке 'ОК'"
+}
+{
+  "action": "right_click",
+  "x": 123,
+  "y": 456,
+  "description": "ПКМ по объекту"
+}
+{
+  "action": "scroll_up",
+  "pixels": 100,
+  "description": "Прокрутить вверх"
+}
+{
+  "action": "scroll_down",
+  "pixels": 100,
+  "description": "Прокрутить вниз"
+}
+{
+  "action": "mouse_down",
+  "x": 100,
+  "y": 200,
+  "description": "Зажать ЛКМ для выделения"
+}
+{
+  "action": "mouse_up",
+  "x": 200,
+  "y": 200,
+  "description": "Отпустить ЛКМ после выделения"
+}
+{
+  "action": "drag_and_drop",
+  "x1": 100,
+  "y1": 200,
+  "x2": 300,
+  "y2": 400,
+  "description": "Перетащить объект"
+}
+{
+  "action": "type_text",
+  "text": "пример текста",
+  "description": "Ввести текст"
+}
+{
+  "action": "take_screenshot",
+  "description": "Сделать скриншот для анализа"
+}
+
+ПРИМЕР ИСПОЛЬЗОВАНИЯ ОЗВУЧКИ:
+{
+  "action": "speak",
+  "text": "Важный текст для озвучки",
+  "voice": "male",
+  "language": "ru",
+  "description": "Озвучить важную информацию"
+}
+
+ПРИМЕР ГЕНЕРАЦИИ ИЗОБРАЖЕНИЙ:
+{
+  "action": "generate_image",
+  "text": "masterpiece, best quality, extremely detailed, anime girl, full body, detailed face, bright colors, standing pose",
+  "negative_prompt": "(worst quality, low quality, normal quality:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy",
+  "description": "Генерирую изображение аниме девочки"
+}
+
+5. ОБРАБОТКА ЗАПРОСОВ:
+   - На простые приветствия ("привет", "hello", "как дела") отвечай дружелюбно действием "response"
+   - Для команд управления ПК (клик, движение мыши, команды) используй соответствующие действия
+   - Если запрос неясен, переспроси пользователя действием "response"
+   - ДЛЯ ГЕНЕРАЦИИ ИЗОБРАЖЕНИЙ: используй действие "generate_image" с полем "text" содержащим промпт на английском языке
+
+6. ФОРМАТ JSON ДЛЯ ГЕНЕРАЦИИ ИЗОБРАЖЕНИЙ:
+   ОБЯЗАТЕЛЬНО используй точно такой формат:
+   {
+     "action": "generate_image",
+     "text": "промпт на английском языке с тегами",
+     "negative_prompt": "негативный промпт (опционально)",
+     "description": "краткое описание что генерируешь"
+   }
+   
+   Поле "text" должно содержать основной промпт для Stable Diffusion на английском языке.
+   Поле "negative_prompt" содержит негативный промпт (что НЕ должно быть на изображении).
+   НИКОГДА не используй теги <think> или другие форматы - только чистый JSON!
+
+7. РАБОТА СО СКРИНШОТАМИ:
+   - При получении команды, связанной с управлением ПК (клик, движение мыши), сначала сделай скриншот для анализа текущего состояния экрана.
+   - Vision-модель опишет содержимое экрана, включая расположение объектов.
+   - На основе описания принимай решения о координатах для действий.
+   - После выполнения действия можно сделать новый скриншот для проверки результата.
+
+8. ОБРАТНАЯ СВЯЗЬ И АДАПТАЦИЯ:
+   - Если результат действия — изображение (скриншот после действия), укажи что это изображение после выполнения команды.
+   - Анализируй изменения на экране после действий и сообщай об успехе/неудаче.
+   - При ошибках предлагай альтернативные решения.
+   - Учись на своих действиях и улучшай стратегию.
+
+9. СТРАТЕГИЧЕСКОЕ МЫШЛЕНИЕ:
+   - Всегда планируй несколько шагов вперед
+   - Учитывай возможные ошибки и альтернативы
+   - Если задача сложная — разбивай на подзадачи
+   - Проверяй результаты каждого шага перед следующим
+
+10. НИКОГДА не пиши обычный текст вне JSON!
+
+ПРИМЕРЫ ОТВЕТОВ:
+
+Простое приветствие:
+{
+  "action": "response",
+  "content": "Привет! Я Нейро, ваш AI-помощник. Чем могу помочь?"
+}
+
+Задача с размышлениями:
+<think>
+Пользователь просит создать папку на рабочем столе. Сначала нужно проверить, существует ли уже такая папка, 
+затем создать её через PowerShell команду. Также стоит убедиться, что у нас есть права на создание папок.
+</think>
+{
+  "action": "powershell",
+  "command": "New-Item -Path 'C:\\\\Users\\\\vital\\\\Desktop\\\\НоваяПапка' -ItemType Directory -Force",
+  "description": "Создаю папку 'НоваяПапка' на рабочем столе"
+}
+
+Задача с озвучкой:
+<think>
+Пользователь спрашивает сколько 2+2. Нужно озвучить только самое важное - результат, а объяснения дать в тексте.
+</think>
+{
+  "action": "speak",
+  "text": "Будет 4",
+  "voice": "male",
+  "language": "ru",
+  "description": "Озвучиваю результат математического вычисления"
+}
+{
+  "action": "response",
+  "content": "Результат: 2 + 2 = 4. Это базовое математическое действие сложения, где мы объединяем две единицы с двумя единицами и получаем четыре единицы."
+}
+
+11. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ: Если пользователь использует слова "сгенерируй", "нарисуй", "создай изображение", "покажи как выглядит", "визуализируй", "изобрази" или подобные по смыслу, И генерация изображений включена, используй действие "generate_image" с подробным описанием. ВАЖНО: После успешной генерации изображения система автоматически завершит диалог - НЕ пытайся генерировать повторно!
+12. Если задача требует несколько шагов (например, поиск + создание файла), всегда строй цепочку действий: сначала "search", затем обработай результат и только потом "powershell" для создания/записи файла, и только после этого — "response".
+13. После каждого шага жди результат и только потом предлагай следующий JSON-действие.
+14. Если пользователь просит сохранить или обработать результат поиска, обязательно сгенерируй команду для создания/записи файла через PowerShell.
+15. Для файлов с русским текстом всегда используй кодировку utf-8 (encoding='utf-8' или 65001) и явно указывай это в PowerShell-команде (например, параметр -Encoding UTF8).
+16. В JSON-ответах ВСЕ обратные слэши (\\) должны быть экранированы (\\\\), особенно в путях файлов и строках PowerShell.
+17. Поисковые запросы делай максимально краткими и точными.
+18. Если результат команды или поиска очень большой, проси пользователя уточнить или обрезай вывод до 2000 символов.
+19. Если задача полностью решена, обязательно заверши цепочку действием "response".
+20. Не повторяй одни и те же действия без необходимости.
+21. Если не уверен, уточни у пользователя.
+22. Директория Desktop: C:\\Users\\vital\\Desktop
+
+НОВЫЕ ПРАВИЛА ДЛЯ РАБОТЫ С ИЗОБРАЖЕНИЯМИ И ВИДЕО:
+23. Если тебе предоставлено изображение, детально опиши его содержимое в начале ответа.
+24. При анализе изображений уделяй внимание тексту, цифрам, диаграммам и другим данным.
+25. Если на изображении есть текст, перепиши его точно и полностью.
+26. При наличии изображения и пользовательского запроса, сначала анализируй изображение, затем выполняй запрос.
+27. Если в запросе присутствует секция [Покадровое описание видео]: ... — это хронологическая последовательность описаний кадров видео с таймкодами. Используй эти описания для анализа происходящего в видео, связывай объекты и события по времени.
+28. Если есть секция [Текст из аудио]: ... с таймкодами, это синхронизированный текст аудиодорожки. Используй таймкоды для сопоставления текста и визуального ряда.
+29. При анализе видео учитывай, что каждый таймкод соответствует определённому моменту времени. Можно делать выводы о развитии событий, появлении/исчезновении объектов, действиях и т.д.
+30. Если есть и аудио, и покадровое описание — старайся анализировать их совместно, чтобы дать максимально точный и информативный ответ.
+31. Если несколько подряд идущих кадров имеют одинаковое описание — объединяй их в диапазон таймкодов [start-end]: описание. Если одинаковые, но не подряд — собирай список таймкодов [t1, t2, t3]: описание.
+
+ПОМНИ: Ты не просто исполнитель команд, а интеллектуальный помощник, который думает, планирует и адаптируется!
+"""
+
+    def auto_disable_tools(self, tool_name: str = None):
+        """Автоматически выключает инструмент через заданное время после использования"""
+        import threading
+        import time
+        
+        def disable_tool(tool_name):
+            time.sleep(self.auto_disable_delay)
+            if tool_name == 'image_generation':
+                if hasattr(self, 'use_image_generation'):
+                    self.use_image_generation = False
+                    logger.info(f"🔧 Автоматически выключил {tool_name}")
+            elif tool_name == 'vision':
+                if hasattr(self, 'use_vision'):
+                    self.use_vision = False
+                    logger.info(f"🔧 Автоматически выключил {tool_name}")
+            elif tool_name == 'audio':
+                if hasattr(self, 'use_audio'):
+                    self.use_audio = False
+                    logger.info(f"🔧 Автоматически выключил {tool_name}")
+        
+        # Если указан конкретный инструмент, запускаем таймер только для него
+        if tool_name:
+            if tool_name not in self.tool_timers or not self.tool_timers[tool_name].is_alive():
+                timer = threading.Thread(target=disable_tool, args=(tool_name,), daemon=True)
+                self.tool_timers[tool_name] = timer
+                timer.start()
+                logger.info(f"⏰ Запустил таймер автоматического выключения для {tool_name}")
+        else:
+            # Запускаем таймеры для всех активных инструментов
+            for tool_name in ['image_generation', 'vision', 'audio']:
+                if tool_name not in self.tool_timers or not self.tool_timers[tool_name].is_alive():
+                    timer = threading.Thread(target=disable_tool, args=(tool_name,), daemon=True)
+                    self.tool_timers[tool_name] = timer
+                    timer.start()
+                    logger.info(f"⏰ Запустил таймер автоматического выключения для {tool_name}")
+                
+    def _log(self, message: str, level: str = "INFO"):
+        """Логирование с временной меткой в файл и консоль"""
+        timestamp = time.strftime("%H:%M:%S")
+        formatted_message = f"[{timestamp}] {level}: {message}"
+        
+        # Логируем в файл
+        if level == "ERROR":
+            logger.error(message)
+        elif level == "WARNING":
+            logger.warning(message)
+        else:
+            logger.info(message)
+        
+        # Выводим в консоль
+        print(formatted_message)
+    
+    def get_context_info(self) -> str:
+        """Возвращает информацию о текущем использовании контекста"""
+        return f"Контекст: {self.current_context_length:,} / {self.safe_context_length:,} (безопасный) / {self.max_context_length:,} (максимум)"
+
+    def add_performance_metric(self, action: str, response_time: float, context_length: int = 0):
+        """Добавляет метрику производительности"""
+        metric = {
+            "timestamp": time.time(),
+            "action": action,
+            "response_time": response_time,
+            "context_length": context_length
+        }
+        self.performance_metrics.append(metric)
+        
+        # Ограничиваем количество метрик
+        if len(self.performance_metrics) > 100:
+            self.performance_metrics.pop(0)
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Возвращает статистику производительности"""
+        if not self.performance_metrics:
+            return {"total_actions": 0, "avg_response_time": 0, "recent_metrics": []}
+        
+        total_actions = len(self.performance_metrics)
+        avg_response_time = sum(m["response_time"] for m in self.performance_metrics) / total_actions
+        recent_metrics = self.performance_metrics[-10:]  # Последние 10 метрик
+        
+        return {
+            "total_actions": total_actions,
+            "avg_response_time": round(avg_response_time, 3),
+            "recent_metrics": recent_metrics
+        }
+
+    def take_screenshot(self) -> str:
+        """
+        Делает скриншот основного монитора и возвращает base64
+        """
+        try:
+            # mss уже импортирован в начале файла
+            with mss.mss() as sct:
+                # Скриншот основного монитора
+                monitor = sct.monitors[1]  # 0 - все мониторы, 1 - основной
+                screenshot = sct.grab(monitor)
+                # Конвертируем в PIL Image
+                img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
+                # Сжимаем для экономии места
+                img.thumbnail((1280, 720), Image.Resampling.LANCZOS)
+                # Конвертируем в base64
+                buf = BytesIO()
+                img.save(buf, format="PNG", optimize=True)
+                return base64.b64encode(buf.getvalue()).decode("ascii")
+        except ImportError:
+            logger.warning("mss не установлен, используем pyautogui")
+            try:
+                # pyautogui уже импортирован в начале файла
+                screenshot = pyautogui.screenshot()
+                screenshot.thumbnail((1280, 720), Image.Resampling.LANCZOS)
+                buf = BytesIO()
+                screenshot.save(buf, format="PNG", optimize=True)
+                return base64.b64encode(buf.getvalue()).decode("ascii")
+            except ImportError:
+                logger.error("pyautogui не установлен")
+                return ""
+        except Exception as e:
+            logger.error(f"Ошибка создания скриншота: {e}")
+            return ""
+
+    def move_mouse(self, x: int, y: int) -> Dict[str, Any]:
+        """Перемещение мыши в координаты (x, y)"""
+        try:
+            # pyautogui уже импортирован в начале файла
+            pyautogui.moveTo(x, y, duration=0.2)
+            return {"success": True, "message": f"Мышь перемещена в ({x}, {y})"}
+        except ImportError:
+            return {"success": False, "error": "pyautogui не установлен"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def left_click(self, x: int, y: int) -> Dict[str, Any]:
+        """Клик левой кнопкой мыши по координатам (x, y)"""
+        try:
+            # pyautogui уже импортирован в начале файла
+            pyautogui.click(x, y)
+            return {"success": True, "message": f"ЛКМ клик в ({x}, {y})"}
+        except ImportError:
+            return {"success": False, "error": "pyautogui не установлен"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def right_click(self, x: int, y: int) -> Dict[str, Any]:
+        """Клик правой кнопкой мыши по координатам (x, y)"""
+        try:
+            # pyautogui уже импортирован в начале файла
+            pyautogui.rightClick(x, y)
+            return {"success": True, "message": f"ПКМ клик в ({x}, {y})"}
+        except ImportError:
+            return {"success": False, "error": "pyautogui не установлен"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def scroll(self, pixels: int) -> Dict[str, Any]:
+        """Прокрутка колесиком мыши. Положительные значения - вверх, отрицательные - вниз"""
+        try:
+            # pyautogui уже импортирован в начале файла
+            pyautogui.scroll(pixels)
+            direction = "вверх" if pixels > 0 else "вниз"
+            return {"success": True, "message": f"Прокрутка {direction} на {abs(pixels)} пикселей"}
+        except ImportError:
+            return {"success": False, "error": "pyautogui не установлен"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def mouse_down(self, x: int, y: int) -> Dict[str, Any]:
+        """Зажать левую кнопку мыши в координатах (x, y)"""
+        try:
+            # pyautogui уже импортирован в начале файла
+            pyautogui.moveTo(x, y)
+            pyautogui.mouseDown(button='left')
+            return {"success": True, "message": f"ЛКМ зажата в ({x}, {y})"}
+        except ImportError:
+            return {"success": False, "error": "pyautogui не установлен"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def mouse_up(self, x: int, y: int) -> Dict[str, Any]:
+        """Отпустить левую кнопку мыши в координатах (x, y)"""
+        try:
+            # pyautogui уже импортирован в начале файле
+            pyautogui.moveTo(x, y)
+            pyautogui.mouseUp(button='left')
+            return {"success": True, "message": f"ЛКМ отпущена в ({x}, {y})"}
+        except ImportError:
+            return {"success": False, "error": "pyautogui не установлен"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def drag_and_drop(self, x1: int, y1: int, x2: int, y2: int) -> Dict[str, Any]:
+        """Перетащить мышью из (x1, y1) в (x2, y2)"""
+        try:
+            import pyautogui
+            pyautogui.dragTo(x2, y2, duration=0.5, button='left')
+            return {"success": True, "message": f"Перетаскивание из ({x1}, {y1}) в ({x2}, {y2})"}
+        except ImportError:
+            return {"success": False, "error": "pyautogui не установлен"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def type_text(self, text: str) -> Dict[str, Any]:
+        """Ввести текст"""
+        try:
+            import pyautogui
+            pyautogui.typewrite(text, interval=0.05)
+            return {"success": True, "message": f"Введён текст: {text}"}
+        except ImportError:
+            return {"success": False, "error": "pyautogui не установлен"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def start_continuous_recording(self):
+        """Запуск постоянной голосовой записи"""
+        if self.continuous_recording:
+            return
+        
+        self.continuous_recording = True
+        self.recording_thread = threading.Thread(target=self._continuous_recording_worker, daemon=True)
+        self.recording_thread.start()
+        logger.info("Постоянная голосовая запись запущена")
+
+    def stop_continuous_recording(self):
+        """Остановка постоянной голосовой записи"""
+        self.continuous_recording = False
+        if self.recording_thread:
+            self.recording_thread.join(timeout=2)
+        logger.info("Постоянная голосовая запись остановлена")
+
+    def _continuous_recording_worker(self):
+        """Воркер для постоянной голосовой записи (заглушка - нужна реализация через веб-интерфейс)"""
+        # Эта функция будет вызываться из веб-интерфейса через API
+        while self.continuous_recording:
+            try:
+                # Проверяем очередь на наличие аудиочанков
+                if not self.audio_queue.empty():
+                    audio_data = self.audio_queue.get_nowait()
+                    # Обрабатываем аудио
+                    self._process_audio_chunk(audio_data)
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Ошибка в continuous recording worker: {e}")
+
+    def _process_audio_chunk(self, audio_data: bytes):
+        """Обработка чанка аудио из постоянной записи"""
+        try:
+            # Сохраняем чанк во временный файл
+            temp_dir = os.path.join(os.path.dirname(__file__), "temp_audio")
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file = os.path.join(temp_dir, f"chunk_{int(time.time())}.wav")
+            
+            with open(temp_file, 'wb') as f:
+                f.write(audio_data)
+            
+            # Распознаём аудио
+            transcript = self.transcribe_audio_whisper(temp_file, use_separator=False)
+            
+            if transcript and not transcript.startswith("[Whisper error]"):
+                # Проверяем, содержит ли текст команду или имя "Алиса"
+                if self._is_valid_command(transcript):
+                    logger.info(f"Получена команда из голоса: {transcript}")
+                    # Делаем скриншот для контекста
+                    screenshot_b64 = self.take_screenshot()
+                    vision_desc = ""
+                    if screenshot_b64:
+                        vision_desc = self.call_vision_model(screenshot_b64)
+                    
+                    # Формируем запрос для мозга
+                    brain_input = f"[Скриншот экрана]: {vision_desc}\n\nГолосовая команда: {transcript}"
+                    
+                    # Отправляем в мозг
+                    ai_response = self.call_brain_model(brain_input)
+                    self.process_ai_response(ai_response)
+                else:
+                    # Игнорируем бессмысленные фразы
+                    pass
+            
+            # Удаляем временный файл
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+                
+        except Exception as e:
+            logger.error(f"Ошибка обработки аудиочанка: {e}")
+
+    def _is_valid_command(self, text: str) -> bool:
+        """Всегда возвращает True — фильтрация отключена, все команды проходят к нейросети"""
+        return True
+
+    def call_vision_model(self, image_base64: str) -> str:
+        """
+        Отправка изображения только в vision-модель ("глаза")
+        Возвращает описание изображения (текст).
+        """
+        start_time = time.time()
+        
+        # Автоматически включаем vision модель при необходимости
+        if not getattr(self, 'use_vision', False):
+            logger.info("🔧 Автоматически включаю vision модель")
+            self.use_vision = True
+            # Запускаем таймер автоматического выключения
+            self.auto_disable_tools("vision")
+        
+        try:
+            payload = {
+                "model": "moondream2-llamafile",
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
+                    ]}
+                ],
+                "temperature": 0.0,
+                "max_tokens": 2048,
+                "stream": False
+            }
+            logger.info("Отправляю изображение в vision-модель (глаза)")
+            response = requests.post(
+                f"{self.lm_studio_url}/v1/chat/completions",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            if response.status_code == 200:
+                result = response.json()
+                return result["choices"][0]["message"]["content"].strip()
+            else:
+                error_msg = f"Ошибка vision-модели: {response.status_code} - {response.text}"
+                logger.error(error_msg)
+                return f"[Vision error] {error_msg}"
+        except Exception as e:
+            error_msg = f"Исключение vision: {str(e)}"
+            logger.error(error_msg)
+            return f"[Vision error] {error_msg}"
+        finally:
+            # Записываем метрику производительности
+            response_time = time.time() - start_time
+            self.add_performance_metric("vision_processing", response_time)
+            logger.info(f"👁️ Vision обработал за {response_time:.2f} сек")
+
+    def call_brain_model(self, user_message: str, vision_desc: str = "") -> str:
+        """
+        Отправка текстового запроса (и опционально описания изображения) в "мозг" (текстовая модель)
+        """
+        start_time = time.time()
+        try:
+            messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": self.system_prompt}
+            ]
+            
+            # Добавляем историю разговора с управлением контекстом
+            messages.extend(self.conversation_history)
+            
+            # Добавляем описание изображения, если есть
+            if vision_desc:
+                messages.append({"role": "user", "content": vision_desc})
+            # Добавляем основной запрос пользователя
+            messages.append({"role": "user", "content": user_message})
+            
+            # Динамическое управление контекстом - подсчитываем длину
+            total_length = sum(len(str(msg.get("content", ""))) for msg in messages)
+            self.current_context_length = total_length
+            
+            # Обрезаем контекст если необходимо
+            self._trim_context_if_needed(total_length)
+            
+            # Пересобираем сообщения после обрезки
+            messages = [{"role": "system", "content": self.system_prompt}]
+            messages.extend(self.conversation_history)
+            if vision_desc:
+                messages.append({"role": "user", "content": vision_desc})
+            messages.append({"role": "user", "content": user_message})
+            
+            payload = {
+                "model": self.brain_model_id if hasattr(self, 'brain_model_id') and self.brain_model_id else self.brain_model,
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": 32767,
+                "stream": False
+            }
+            logger.info(f"Отправляю запрос в мозг: {user_message[:100]}...")
+            response = requests.post(
+                f"{self.lm_studio_url}/v1/chat/completions",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            if response.status_code == 200:
+                result = response.json()
+                ai_response = result["choices"][0]["message"]["content"].strip()
+                
+                # Добавляем в историю разговора (если ответ не пустой)
+                if ai_response and ai_response != "{}":
+                    self.conversation_history.append({"role": "user", "content": user_message})
+                    self.conversation_history.append({"role": "assistant", "content": ai_response})
+                
+                return ai_response
+            else:
+                error_msg = f"Ошибка brain-модели: {response.status_code} - {response.text}"
+                logger.error(error_msg)
+                return f"[Brain error] {error_msg}"
+        except Exception as e:
+            error_msg = f"Исключение brain: {str(e)}"
+            logger.error(error_msg)
+            return f"[Brain error] {error_msg}"
+        finally:
+            # Записываем метрику производительности
+            response_time = time.time() - start_time
+            self.add_performance_metric("brain_response", response_time, self.current_context_length)
+            logger.info(f"🧠 Мозг ответил за {response_time:.2f} сек")
+
+    def execute_powershell(self, command: str) -> Dict[str, Any]:
+        """
+        Выполнение PowerShell команды
+        
+        Args:
+            command: PowerShell команда
+        
+        Returns:
+            Словарь с результатом выполнения
+        """
+        try:
+            orig_command = command
+            # Автоисправление: заменяем '&&' на PowerShell-совместимый синтаксис
+            if '&&' in command:
+                parts = [p.strip() for p in command.split('&&')]
+                # Если первая часть cd, делаем push-location, затем вторую команду
+                if parts[0].lower().startswith('cd '):
+                    dir_path = parts[0][3:].strip().strip('"\'')
+                    command = f"Push-Location '{dir_path}'; {parts[1]} ; Pop-Location"
+                else:
+                    # Просто объединяем через ';'
+                    command = ' ; '.join(parts)
+                logger.info(f"PowerShell: автоисправлен '&&' -> ';' или Push-Location: {command}")
+            logger.info(f"Выполняю PowerShell: {command}")
+            # Выполняем команду PowerShell с декодированием cp1251 и защитой
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                capture_output=True,
+                text=True,
+                encoding='cp1251',
+                errors='replace',
+                timeout=60
+            )
+            success = result.returncode == 0
+            # Защита от None
+            output = (result.stdout if success else result.stderr) or ""
+            logger.info(f"PowerShell результат (код: {result.returncode}): {output[:200]}...")
+            return {
+                "success": success,
+                "returncode": result.returncode,
+                "output": output,
+                "error": (result.stderr or "") if not success else ""
+            }
+        except subprocess.TimeoutExpired:
+            error_msg = "Команда превысила лимит времени выполнения (60 сек)"
+            logger.error(error_msg)
+            return {"success": False, "returncode": -1, "output": "", "error": error_msg}
+        except Exception as e:
+            error_msg = f"Ошибка выполнения PowerShell: {str(e)}"
+            logger.error(error_msg)
+            return {"success": False, "returncode": -1, "output": "", "error": error_msg}
+
+    def google_search(self, query: str, num_results: int = 10) -> List[Dict[str, str]]:
+        """
+        Поиск в Google Custom Search API
+        
+        Args:
+            query: Поисковый запрос
+            num_results: Количество результатов для парсинга (по умолчанию 10)
+            
+        Returns:
+            Список результатов поиска
+        """
+        try:
+            if not self.google_api_key or not self.google_cse_id:
+                return [{"error": "Google API ключ или CSE ID не настроены"}]
+            
+            logger.info(f"Выполняю поиск Google: {query}")
+            
+            # Кодируем запрос для URL
+            encoded_query = urllib.parse.quote(query)
+            
+            # Формируем URL для Google Custom Search API (максимум 10 результатов)
+            url = f"https://www.googleapis.com/customsearch/v1?key={self.google_api_key}&cx={self.google_cse_id}&q={encoded_query}&num=10"
+            
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if "items" not in data:
+                    return [{"error": "Результаты не найдены"}]
+                
+                # Берем первые num_results результатов для парсинга (максимум 10)
+                actual_results = min(num_results, 10)
+                search_results = []
+                for i, item in enumerate(data["items"][:actual_results]):
+                    result = {
+                        "title": item.get("title", ""),
+                        "url": item.get("link", ""),
+                        "snippet": item.get("snippet", "")
+                    }
+                    
+                    # Пытаемся получить содержимое страницы
+                    try:
+                        page_response = requests.get(result["url"], timeout=5, headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        })
+                        if page_response.status_code == 200:
+                            # Берем первые 2000 символов текста для полного анализа
+                            content = page_response.text[:2000]
+                            result["content"] = content
+                        else:
+                            result["content"] = "Не удалось получить содержимое страницы"
+                    except:
+                        result["content"] = "Ошибка при получении содержимого страницы"
+                    
+                    search_results.append(result)
+                    logger.info(f"Получен результат {i+1}: {result['title']}")
+                
+                logger.info(f"Поиск завершен: найдено {len(search_results)} результатов")
+                return search_results
+            else:
+                error_msg = f"Ошибка Google Search API: {response.status_code}"
+                logger.error(error_msg)
+                return [{"error": error_msg}]
+                
+        except Exception as e:
+            error_msg = f"Ошибка поиска Google: {str(e)}"
+            logger.error(error_msg)
+            return [{"error": error_msg}]
+
+    def process_ai_response(self, ai_response: str) -> bool:
+        """
+        Обработка ответа AI и выполнение соответствующих действий
+        
+        Args:
+            ai_response: JSON ответ от AI
+            
+        Returns:
+            True если нужно продолжать диалог, False если завершить
+        """
+        try:
+            # Извлекаем первый JSON-блок из ответа
+            json_str = self.extract_first_json(ai_response)
+            
+            # Проверяем, есть ли JSON в ответе
+            if not json_str or json_str == ai_response:
+                logger.info("💬 Модель вернула текстовый ответ без JSON")
+                # Если это простой ответ (например, на приветствие), используем его
+                if len(ai_response.strip()) > 5 and not ai_response.strip().startswith('{'):
+                    logger.info("💬 Использую текстовый ответ как финальный")
+                    self.last_final_response = ai_response.strip()
+                    return False  # Завершаем диалог
+                else:
+                    # Если ответ слишком короткий или содержит JSON-подобные символы, просим уточнить
+                    feedback = "Модель вернула неполный ответ. Пожалуйста, сформулируй полный ответ или действие."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+            
+            # Умный парсер JSON с автоисправлением и поддержкой <think>
+            def smart_json_parse(s):
+                # json и re уже импортированы в начале файла
+                
+                # Логируем исходный текст для отладки
+                logger.info(f"🔍 Парсинг JSON: {s[:200]}...")
+                
+                # 1. Попытка обычного парсинга
+                try:
+                    return json.loads(s), []
+                except Exception as e:
+                    fixes = [f"Первый парсинг не удался: {e}"]
+                
+                # 2. Попытка закрыть скобки
+                open_braces = s.count('{')
+                close_braces = s.count('}')
+                if open_braces > close_braces:
+                    s += '}' * (open_braces - close_braces)
+                    fixes.append(f"Добавлено {open_braces - close_braces} }} для баланса скобок")
+                elif close_braces > open_braces:
+                    # Удаляем лишние закрывающие скобки
+                    s = re.sub(r'}+$', '', s)
+                    fixes.append(f"Удалены лишние закрывающие скобки")
+                
+                # 3. Попытка заменить одинарные кавычки на двойные (осторожно)
+                if "'" in s and '"' not in s:
+                    s2 = s.replace("'", '"')
+                    try:
+                        return json.loads(s2), fixes+["Заменены одинарные кавычки на двойные"]
+                    except Exception:
+                        pass
+                
+                # 4. Попытка удалить лишние запятые перед закрывающей скобкой
+                s3 = re.sub(r',\s*([}\]])', r'\1', s)
+                try:
+                    return json.loads(s3), fixes+["Удалены лишние запятые"]
+                except Exception:
+                    pass
+                
+                # 5. Попытка обернуть ключи в кавычки (грубый способ)
+                s4 = re.sub(r'([,{]\s*)([a-zA-Z0-9_]+)\s*:', r'\1"\2":', s3)
+                try:
+                    return json.loads(s4), fixes+["Добавлены кавычки к ключам"]
+                except Exception:
+                    pass
+                
+                # 6. Попытка исправить незакрытые строки
+                s5 = re.sub(r'([^"])\s*$', r'\1"', s4)
+                try:
+                    return json.loads(s5), fixes+["Исправлены незакрытые строки"]
+                except Exception:
+                    pass
+                
+                # 7. Финальная попытка с очисткой от лишних символов
+                s6 = re.sub(r'[^\x20-\x7E]', '', s5)  # Убираем непечатаемые символы
+                try:
+                    return json.loads(s6), fixes+["Очищены непечатаемые символы"]
+                except Exception as e2:
+                    fixes.append(f"Не удалось распарсить даже после исправлений: {e2}")
+                
+                return None, fixes
+
+            action_data, fixes = smart_json_parse(json_str)
+            if fixes:
+                logger.warning(f"⚠️ Исправления JSON: {'; '.join(fixes)}")
+            if not action_data:
+                logger.error(f"❌ Не удалось распарсить JSON даже после исправлений:\n{json_str}")
+                
+                # Проверяем счетчик попыток, чтобы избежать зацикливания
+                self.retry_count += 1
+                if self.retry_count > self.max_retries:
+                    logger.warning(f"🔄 Достигнут лимит попыток ({self.max_retries}), завершаю диалог")
+                    self.retry_count = 0  # Сбрасываем счетчик
+                    self.last_final_response = "Извините, возникла проблема с обработкой запроса. Попробуйте переформулировать вопрос."
+                    return False  # Завершаем диалог
+                
+                # Проверяем, есть ли модуль <think> в ответе
+                if '<think>' in ai_response:
+                    logger.info("💭 Обнаружен модуль <think> - модель размышляет, но не генерирует действие")
+                    # Извлекаем содержимое think для анализа
+                    think_match = re.search(r'<think>(.*?)</think>', ai_response, re.DOTALL)
+                    if think_match:
+                        think_content = think_match.group(1).strip()
+                        logger.info(f"💭 Содержимое think: {think_content[:200]}...")
+                        
+                        # Если в think есть полезная информация и это простое приветствие, используем как ответ
+                        if len(think_content) > 20 and any(word in think_content.lower() for word in ['привет', 'hello', 'здравствуй']):
+                            logger.info("💭 Обнаружено приветствие в think, завершаю диалог")
+                            self.retry_count = 0  # Сбрасываем счетчик
+                            self.last_final_response = "Привет! Я Нейро, ваш AI-помощник. Чем могу помочь?"
+                            return False  # Завершаем диалог
+                        
+                        # Если модель зацикливается на правилах, принудительно завершаем
+                        if self.retry_count >= 2 and 'правил' in think_content.lower():
+                            logger.info("💭 Модель зацикливается на правилах, принудительно завершаю")
+                            self.retry_count = 0  # Сбрасываем счетчик
+                            self.last_final_response = "Привет! Как дела? Чем могу помочь?"
+                            return False  # Завершаем диалог
+                        
+                        feedback = "Пожалуйста, дай простой дружелюбный ответ или конкретное действие. Не анализируй правила."
+                    else:
+                        feedback = "Пожалуйста, дай простой ответ или конкретное действие."
+                else:
+                    feedback = "Пожалуйста, дай простой ответ или конкретное действие."
+                
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+            
+            # Гарантируем наличие ключей action/command/query/description если action известно
+            if 'action' not in action_data:
+                logger.warning("⚠️ В JSON отсутствует ключ 'action', добавляю action: 'unknown'")
+                action_data['action'] = 'unknown'
+            
+            # Проверяем на пустой JSON (модель может размышлять)
+            if action_data == {} or (len(action_data) == 1 and 'action' in action_data and action_data['action'] == 'unknown'):
+                logger.info("💭 Модель вернула пустой JSON - возможно, она размышляет")
+                if '<think>' in ai_response:
+                    think_match = re.search(r'<think>(.*?)</think>', ai_response, re.DOTALL)
+                    if think_match:
+                        think_content = think_match.group(1).strip()
+                        logger.info(f"💭 Содержимое think: {think_content[:200]}...")
+                        # Если есть полезное содержимое в think, используем его как ответ
+                        if len(think_content) > 20:
+                            logger.info("💭 Использую содержимое think как ответ")
+                            self.last_final_response = think_content
+                            return False  # Завершаем диалог
+                
+                # Если нет think или он пустой, просим модель сформулировать ответ
+                feedback = "Модель вернула пустой JSON. Пожалуйста, сформулируй конкретный ответ или действие."
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+            
+            action = action_data.get("action")
+            
+            # Сбрасываем счетчик попыток при успешном получении действия
+            self.retry_count = 0
+            
+            if action == "powershell":
+                # Выполняем PowerShell команду
+                command = action_data.get("command", "")
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🔧 ВЫПОЛНЕНИЕ КОМАНДЫ: {description}")
+                logger.info(f"📝 Команда: {command}")
+                
+                result = self.execute_powershell(command)
+                
+                if result["success"]:
+                    logger.info("✅ Команда выполнена успешно")
+                    logger.info(f"📤 Результат: {result['output']}")
+                    feedback = f"Команда '{command}' выполнена успешно. Результат: {result['output']}"
+                else:
+                    logger.error("❌ Ошибка выполнения команды")
+                    logger.error(f"💥 Ошибка: {result['error']}")
+                    feedback = f"Команда '{command}' завершилась с ошибкой: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "search":
+                # Выполняем поиск в Google
+                query = action_data.get("query", "")
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🔍 ПОИСК В ИНТЕРНЕТЕ: {description}")
+                logger.info(f"🔎 Запрос: {query}")
+                
+                search_results = self.google_search(query)
+                
+                # Формируем результаты для AI
+                results_text = "Результаты поиска:\n"
+                for i, result in enumerate(search_results, 1):
+                    if "error" in result:
+                        results_text += f"{i}. Ошибка: {result['error']}\n"
+                    else:
+                        results_text += f"{i}. {result['title']}\n"
+                        results_text += f"   URL: {result['url']}\n"
+                        results_text += f"   Описание: {result['snippet']}\n"
+                        results_text += f"   Содержимое: {result.get('content', '')}\n\n"
+                
+                logger.info("✅ Поиск завершен")
+                logger.info(f"📊 Найдено результатов: {len(search_results)}")
+                
+                # Отправляем результаты поиска AI
+                follow_up = self.call_brain_model(f"Результаты поиска по запросу '{query}': {results_text}")
+                return self.process_ai_response(follow_up)
+                
+            elif action == "take_screenshot":
+                # Делаем скриншот
+                logger.info(f"\n📸 СОЗДАНИЕ СКРИНШОТА")
+                
+                # Автоматически включаем vision модель при необходимости
+                if not getattr(self, 'use_vision', False):
+                    logger.info("🔧 Автоматически включаю vision модель")
+                    self.use_vision = True
+                    # Запускаем таймер автоматического выключения
+                    self.auto_disable_tools("vision")
+                
+                screenshot_b64 = self.take_screenshot()
+                if screenshot_b64:
+                    # Отправляем скриншот в vision-модель для анализа
+                    vision_desc = self.call_vision_model(screenshot_b64)
+                    logger.info("✅ Скриншот создан и проанализирован")
+                    feedback = f"Скриншот экрана получен. Описание от vision-модели: {vision_desc}"
+                else:
+                    feedback = "Не удалось создать скриншот"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "move_mouse":
+                # Перемещение мыши
+                x = action_data.get("x", 0)
+                y = action_data.get("y", 0)
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🖱️ ПЕРЕМЕЩЕНИЕ МЫШИ: {description}")
+                logger.info(f"📍 Координаты: ({x}, {y})")
+                
+                result = self.move_mouse(x, y)
+                
+                if result["success"]:
+                    logger.info("✅ Мышь перемещена успешно")
+                    feedback = f"Мышь перемещена в координаты ({x}, {y})"
+                else:
+                    logger.error(f"❌ Ошибка перемещения мыши: {result['error']}")
+                    feedback = f"Ошибка перемещения мыши: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "left_click":
+                # Клик левой кнопкой мыши
+                x = action_data.get("x", 0)
+                y = action_data.get("y", 0)
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🖱️ КЛИК ЛКМ: {description}")
+                logger.info(f"📍 Координаты: ({x}, {y})")
+                
+                result = self.left_click(x, y)
+                
+                if result["success"]:
+                    logger.info("✅ Клик выполнен успешно")
+                    feedback = f"Клик ЛКМ выполнен в координатах ({x}, {y})"
+                else:
+                    logger.error(f"❌ Ошибка клика: {result['error']}")
+                    feedback = f"Ошибка клика: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "right_click":
+                # Клик правой кнопкой мыши
+                x = action_data.get("x", 0)
+                y = action_data.get("y", 0)
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🖱️ КЛИК ПКМ: {description}")
+                logger.info(f"📍 Координаты: ({x}, {y})")
+                
+                result = self.right_click(x, y)
+                
+                if result["success"]:
+                    logger.info("✅ Клик ПКМ выполнен успешно")
+                    feedback = f"Клик ПКМ выполнен в координатах ({x}, {y})"
+                else:
+                    logger.error(f"❌ Ошибка клика ПКМ: {result['error']}")
+                    feedback = f"Ошибка клика ПКМ: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action in ["scroll_up", "scroll_down"]:
+                # Прокрутка
+                pixels = action_data.get("pixels", 100)
+                if action == "scroll_down":
+                    pixels = -pixels
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🖱️ ПРОКРУТКА: {description}")
+                logger.info(f"📏 Пиксели: {pixels}")
+                
+                result = self.scroll(pixels)
+                
+                if result["success"]:
+                    logger.info("✅ Прокрутка выполнена успешно")
+                    feedback = f"Прокрутка выполнена: {result['message']}"
+                else:
+                    logger.error(f"❌ Ошибка прокрутки: {result['error']}")
+                    feedback = f"Ошибка прокрутки: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "mouse_down":
+                # Зажать ЛКМ
+                x = action_data.get("x", 0)
+                y = action_data.get("y", 0)
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🖱️ ЗАЖАТЬ ЛКМ: {description}")
+                logger.info(f"📍 Координаты: ({x}, {y})")
+                
+                result = self.mouse_down(x, y)
+                
+                if result["success"]:
+                    logger.info("✅ ЛКМ зажата успешно")
+                    feedback = f"ЛКМ зажата в координатах ({x}, {y})"
+                else:
+                    logger.error(f"❌ Ошибка зажатия ЛКМ: {result['error']}")
+                    feedback = f"Ошибка зажатия ЛКМ: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "mouse_up":
+                # Отпустить ЛКМ
+                x = action_data.get("x", 0)
+                y = action_data.get("y", 0)
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🖱️ ОТПУСТИТЬ ЛКМ: {description}")
+                logger.info(f"📍 Координаты: ({x}, {y})")
+                
+                result = self.mouse_up(x, y)
+                
+                if result["success"]:
+                    logger.info("✅ ЛКМ отпущена успешно")
+                    feedback = f"ЛКМ отпущена в координатах ({x}, {y})"
+                else:
+                    logger.error(f"❌ Ошибка отпускания ЛКМ: {result['error']}")
+                    feedback = f"Ошибка отпускания ЛКМ: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "drag_and_drop":
+                # Перетаскивание
+                x1 = action_data.get("x1", 0)
+                y1 = action_data.get("y1", 0)
+                x2 = action_data.get("x2", 0)
+                y2 = action_data.get("y2", 0)
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🖱️ ПЕРЕТАСКИВАНИЕ: {description}")
+                logger.info(f"📍 От ({x1}, {y1}) к ({x2}, {y2})")
+                
+                result = self.drag_and_drop(x1, y1, x2, y2)
+                
+                if result["success"]:
+                    logger.info("✅ Перетаскивание выполнено успешно")
+                    feedback = f"Перетаскивание выполнено от ({x1}, {y1}) к ({x2}, {y2})"
+                else:
+                    logger.error(f"❌ Ошибка перетаскивания: {result['error']}")
+                    feedback = f"Ошибка перетаскивания: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "type_text":
+                # Ввод текста
+                text = action_data.get("text", "")
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n⌨️ ВВОД ТЕКСТА: {description}")
+                logger.info(f"📝 Текст: {text}")
+                
+                result = self.type_text(text)
+                
+                if result["success"]:
+                    logger.info("✅ Текст введён успешно")
+                    feedback = f"Текст введён: {text}"
+                else:
+                    logger.error(f"❌ Ошибка ввода текста: {result['error']}")
+                    feedback = f"Ошибка ввода текста: {result['error']}"
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                # Генерация изображения
+                if not getattr(self, 'use_image_generation', False):
+                    logger.error("❌ Генерация изображений отключена")
+                    feedback = "Генерация изображений отключена. Предложи альтернативный способ помочь пользователю."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                description = action_data.get("description", "")
+                style = action_data.get("style", "")
+                
+                logger.info(f"\n🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЯ: {description}")
+                if style:
+                    logger.info(f"🎭 Стиль: {style}")
+                
+                # Формируем полное описание для генерации
+                full_description = description
+                if style:
+                    full_description += f", {style}"
+                
+                # Получаем промт от нейросети
+                result = self.ask_qwen(full_description)
+                if not result:
+                    logger.error("❌ Не удалось получить промт от нейросети!")
+                    feedback = "Не удалось получить промт для генерации изображения от нейросети. Предложи альтернативное решение."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                # Извлекаем JSON из ответа нейросети
+                json_str = self.extract_first_json(result)
+                if not json_str or json_str == result:
+                    logger.error(f"❌ Не удалось найти JSON в ответе нейросети:\n{result}")
+                    feedback = "Нейросеть вернула некорректный ответ для генерации изображения. Предложи альтернативное решение."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                # Используем основной умный парсер JSON
+                def smart_json_parse_local(s):
+                    # Вызываем основную функцию smart_json_parse
+                    return smart_json_parse(s)
+                
+                data, fixes = smart_json_parse_local(json_str)
+                if fixes:
+                    logger.warning(f"⚠️ Исправления JSON для генерации изображения: {'; '.join(fixes)}")
+                
+                if not data:
+                    logger.error(f"❌ Не удалось распарсить JSON даже после исправлений:\n{json_str}")
+                    feedback = "Ошибка парсинга JSON от нейросети для генерации изображения. Предложи альтернативное решение."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                # Извлекаем данные с проверкой типов
+                prompt = str(data.get("prompt", "")).strip()
+                neg = str(data.get("negative_prompt", "")).strip()
+                params = data.get("params", {})
+                
+                # Проверяем, что params - словарь
+                if not isinstance(params, dict):
+                    logger.warning("⚠️ Параметры не являются словарем, используем значения по умолчанию")
+                    params = {}
+                
+                # Проверяем, что prompt не пустой
+                if not prompt:
+                    logger.error("❌ Пустой prompt от нейросети!")
+                    feedback = "Нейросеть вернула пустой промт для генерации изображения. Попроси её создать описание."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                # Проверяем, что prompt на английском
+                def is_english_simple(s: str) -> bool:
+                    """Проверяет, что строка содержит преимущественно английские символы"""
+                    if not s: 
+                        return False
+                    
+                    # Оптимизированная проверка без strip() и множественных итераций
+                    allowed_chars = 0
+                    total_chars = len(s)
+                    
+                    for c in s:
+                        if (c.isascii() and (c.isalpha() or c.isdigit()) or 
+                            c in '.,;:-_=+!@#$%^&*()[]{}<>?/\\|`~\'\" ' or 
+                            c.isspace()):
+                            allowed_chars += 1
+                    
+                    return allowed_chars / total_chars > 0.85
+                
+                if not is_english_simple(prompt):
+                    logger.warning(f"❌ PROMPT не на английском!\n{prompt}")
+                    feedback = f"Нейросеть вернула промт не на английском языке: {prompt}. Попроси её создать промт на английском."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                fallback_negative = "(worst quality, low quality, normal quality:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy, wrong anatomy, extra limb, missing limb, floating limbs, (mutated hands and fingers:1.4), disconnected limbs, mutation, mutated, ugly, disgusting, blurry, amputation, text, watermark, signature, censor, censored, bar."
+                
+                if not is_english_simple(neg):
+                    logger.warning("⚠️ negative_prompt заменён на запасной вариант.")
+                    neg = fallback_negative
+                
+                # Параметры по умолчанию
+                default_params = {
+                    "seed": -1, 
+                    "steps": 20, 
+                    "width": 1024, 
+                    "height": 1024, 
+                    "cfg_scale": 6
+                }
+                gen_params = default_params.copy()
+                
+                # Валидация и обновление параметров
+                for key, value in params.items():
+                    if key in default_params:
+                        try:
+                            # Приводим к нужному типу
+                            if key in ["seed", "steps", "width", "height"]:
+                                gen_params[key] = int(value)
+                            elif key == "cfg_scale":
+                                gen_params[key] = float(value)
+                            else:
+                                gen_params[key] = value
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"⚠️ Неверный параметр {key}={value}, используется значение по умолчанию: {e}")
+                    else:
+                        logger.warning(f"⚠️ Неизвестный параметр {key}={value} игнорируется")
+                
+                # Дополнительная валидация
+                if gen_params["steps"] < 1 or gen_params["steps"] > 100:
+                    logger.warning(f"⚠️ Некорректное количество шагов {gen_params['steps']}, используется 20")
+                    gen_params["steps"] = 20
+                
+                if gen_params["width"] < 64 or gen_params["width"] > 2048:
+                    logger.warning(f"⚠️ Некорректная ширина {gen_params['width']}, используется 1024")
+                    gen_params["width"] = 1024
+                
+                if gen_params["height"] < 64 or gen_params["height"] > 2048:
+                    logger.warning(f"⚠️ Некорректная высота {gen_params['height']}, используется 1024")
+                    gen_params["height"] = 1024
+                
+                logger.info("\n===== 🎨 ПАРАМЕТРЫ ГЕНЕРАЦИИ =====")
+                logger.info(f"PROMPT:\n{prompt}\n")
+                logger.info(f"NEGATIVE:\n{neg}\n")
+                logger.info(f"PARAMS: {gen_params}\n")
+                
+                # Генерируем изображение
+                img_b64 = self.generate_image_stable_diffusion(prompt, neg, gen_params)
+                if img_b64:
+                    logger.info("✅ Изображение сгенерировано! Показываю на 5 секунд...")
+                    # Сохраняем для веб-UI
+                    self.last_generated_image_b64 = img_b64
+                    self.show_image_base64_temp(img_b64)
+                    
+                    # Финальный ответ пользователю - НЕ ОТПРАВЛЯЕМ ОБРАТНО В AI!
+                    logger.info(f"\n🤖 ФИНАЛЬНЫЙ ОТВЕТ:")
+                    final_msg = f"✅ Изображение успешно сгенерировано по вашему описанию: {description}\n🎨 Использованный промт: {prompt}"
+                    logger.info(final_msg)
+                    # Сохраняем текст финального ответа для веб-UI
+                    self.last_final_response = final_msg
+                    return False  # Завершаем диалог
+                else:
+                    logger.error("❌ Не удалось сгенерировать изображение!")
+                    feedback = f"Не удалось сгенерировать изображение по описанию: {description}. Возможно, модель не найдена или недоступна."
+                    
+                    # Отправляем результат обратно AI только в случае ошибки
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+            elif action == "generate_image":
+                # Генерация изображения
+                # Автоматически включаем генерацию изображений при необходимости
+                if not getattr(self, 'use_image_generation', False):
+                    logger.info("🔧 Автоматически включаю генерацию изображений")
+                    self.use_image_generation = True
+                    # Запускаем таймер автоматического выключения
+                    self.auto_disable_tools("image_generation")
+                
+                if not getattr(self, 'use_image_generation', False):
+                    logger.error("❌ Генерация изображений отключена")
+                    feedback = "Генерация изображений отключена. Предложи альтернативный способ помочь пользователю."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                description = action_data.get("description", "")
+                text = action_data.get("text", "")
+                style = action_data.get("style", "")
+                negative_prompt = action_data.get("negative_prompt", "")
+                
+                logger.info(f"\n🎨 ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЯ: {description}")
+                if style:
+                    logger.info(f"🎭 Стиль: {style}")
+                
+                # Используем промпт напрямую из JSON действия
+                prompt = text.strip() if text else ""
+                neg = negative_prompt.strip() if negative_prompt else ""
+                
+                # Если промпт пустой, используем описание
+                if not prompt:
+                    prompt = description or ""
+                
+                # Добавляем стиль к промпту если есть
+                if style and prompt:
+                    prompt += f", {style}"
+                
+                # Параметры по умолчанию (пустой словарь, будут заполнены далее)
+                params = {}
+                
+                # Проверяем, что params - словарь
+                if not isinstance(params, dict):
+                    logger.warning("⚠️ Параметры не являются словарем, используем значения по умолчанию")
+                    params = {}
+                
+                # Проверяем, что prompt не пустой
+                if not prompt:
+                    logger.error("❌ Пустой prompt от нейросети!")
+                    feedback = "Нейросеть вернула пустой промт для генерации изображения. Попроси её создать описание."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                # Проверяем, что prompt на английском
+                def is_english_simple(s: str) -> bool:
+                    """Проверяет, что строка содержит преимущественно английские символы"""
+                    if not s: 
+                        return False
+                    
+                    # Оптимизированная проверка без strip() и множественных итераций
+                    allowed_chars = 0
+                    total_chars = len(s)
+                    
+                    for c in s:
+                        if (c.isascii() and (c.isalpha() or c.isdigit()) or 
+                            c in '.,;:-_=+!@#$%^&*()[]{}<>?/\\|`~\'\" ' or 
+                            c.isspace()):
+                            allowed_chars += 1
+                    
+                    return allowed_chars / total_chars > 0.85
+                
+                if not is_english_simple(prompt):
+                    logger.warning(f"❌ PROMPT не на английском!\n{prompt}")
+                    feedback = f"Нейросеть вернула промт не на английском языке: {prompt}. Попроси её создать промт на английском."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                fallback_negative = "(worst quality, low quality, normal quality:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy, wrong anatomy, extra limb, missing limb, floating limbs, (mutated hands and fingers:1.4), disconnected limbs, mutation, mutated, ugly, disgusting, blurry, amputation, text, watermark, signature, censor, censored, bar."
+                
+                # Если negative prompt пустой или не на английском, используем fallback
+                if not neg or not is_english_simple(neg):
+                    if neg:
+                        logger.warning("⚠️ negative_prompt заменён на запасной вариант (не на английском).")
+                    else:
+                        logger.info("ℹ️ Используется стандартный negative_prompt.")
+                    neg = fallback_negative
+                
+                # Параметры по умолчанию
+                default_params = {
+                    "seed": -1, 
+                    "steps": 30, 
+                    "width": 1024, 
+                    "height": 1024, 
+                    "cfg": 4
+                }
+                gen_params = default_params.copy()
+                
+                # Валидация и обновление параметров
+                for key, value in params.items():
+                    if key in default_params:
+                        try:
+                            # Приводим к нужному типу
+                            if key in ["seed", "steps", "width", "height"]:
+                                gen_params[key] = int(value)
+                            elif key == "cfg":
+                                gen_params[key] = float(value)
+                            else:
+                                gen_params[key] = value
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"⚠️ Неверный параметр {key}={value}, используется значение по умолчанию: {e}")
+                    else:
+                        logger.warning(f"⚠️ Неизвестный параметр {key}={value} игнорируется")
+                
+                # Дополнительная валидация
+                if gen_params["steps"] < 1 or gen_params["steps"] > 100:
+                    logger.warning(f"⚠️ Некорректное количество шагов {gen_params['steps']}, используется 30")
+                    gen_params["steps"] = 30
+                
+                if gen_params["width"] < 64 or gen_params["width"] > 2048:
+                    logger.warning(f"⚠️ Некорректная ширина {gen_params['width']}, используется 1024")
+                    gen_params["width"] = 1024
+                
+                if gen_params["height"] < 64 or gen_params["height"] > 2048:
+                    logger.warning(f"⚠️ Некорректная высота {gen_params['height']}, используется 1024")
+                    gen_params["height"] = 1024
+                
+                logger.info("\n===== 🎨 ПАРАМЕТРЫ ГЕНЕРАЦИИ =====")
+                logger.info(f"PROMPT:\n{prompt}\n")
+                logger.info(f"NEGATIVE:\n{neg}\n")
+                logger.info(f"PARAMS: {gen_params}\n")
+                
+                # Генерируем изображение
+                img_b64 = self.generate_image_stable_diffusion(prompt, neg, gen_params)
+                if img_b64:
+                    logger.info("✅ Изображение сгенерировано! Показываю на 5 секунд...")
+                    # Сохраняем для веб-UI
+                    self.last_generated_image_b64 = img_b64
+                    self.show_image_base64_temp(img_b64)
+                    
+                    # Финальный ответ пользователю - НЕ ОТПРАВЛЯЕМ ОБРАТНО В AI!
+                    logger.info(f"\n🤖 ФИНАЛЬНЫЙ ОТВЕТ:")
+                    final_msg = f"✅ Изображение успешно сгенерировано по вашему описанию: {description}\n🎨 Использованный промт: {prompt}"
+                    logger.info(final_msg)
+                    # Сохраняем текст финального ответа для веб-UI
+                    self.last_final_response = final_msg
+                    return False  # Завершаем диалог
+                else:
+                    logger.error("❌ Не удалось сгенерировать изображение!")
+                    feedback = f"Не удалось сгенерировать изображение по описанию: {description}. Возможно, модель не найдена или недоступна."
+                    
+                    # Отправляем результат обратно AI только в случае ошибки
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+            elif action == "generate_video":
+                # Генерация видео
+                # Автоматически включаем генерацию изображений при необходимости
+                if not getattr(self, 'use_image_generation', False):
+                    logger.info("🔧 Автоматически включаю генерацию изображений")
+                    self.use_image_generation = True
+                    # Запускаем таймер автоматического выключения
+                    self.auto_disable_tools("image_generation")
+                
+                if not getattr(self, 'use_image_generation', False):
+                    logger.error("❌ Генерация изображений отключена")
+                    feedback = "Генерация изображений отключена. Предложи альтернативный способ помочь пользователю."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                description = action_data.get("description", "")
+                text = action_data.get("text", "")
+                style = action_data.get("style", "")
+                negative_prompt = action_data.get("negative_prompt", "")
+                
+                logger.info(f"\n🎬 ГЕНЕРАЦИЯ ВИДЕО: {description}")
+                if style:
+                    logger.info(f"🎭 Стиль: {style}")
+                
+                # Используем промпт напрямую из JSON действия
+                prompt = text.strip() if text else ""
+                neg = negative_prompt.strip() if negative_prompt else ""
+                
+                # Если промпт пустой, используем описание
+                if not prompt:
+                    prompt = description or ""
+                
+                # Добавляем стиль к промпту если есть
+                if style and prompt:
+                    prompt += f", {style}"
+                
+                # Параметры по умолчанию для видео
+                params = {}
+                
+                # Проверяем, что params - словарь
+                if not isinstance(params, dict):
+                    logger.warning("⚠️ Параметры не являются словарем, используем значения по умолчанию")
+                    params = {}
+                
+                # Проверяем, что prompt не пустой
+                if not prompt:
+                    logger.error("❌ Пустой prompt от нейросети!")
+                    feedback = "Нейросеть вернула пустой промт для генерации видео. Попроси её создать описание."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                # Проверяем, что prompt на английском
+                def is_english_simple(s: str) -> bool:
+                    """Проверяет, что строка содержит преимущественно английские символы"""
+                    if not s: 
+                        return False
+                    
+                    # Оптимизированная проверка без strip() и множественных итераций
+                    allowed_chars = 0
+                    total_chars = len(s)
+                    
+                    for c in s:
+                        if (c.isascii() and (c.isalpha() or c.isdigit()) or 
+                            c in '.,;:-_=+!@#$%^&*()[]{}<>?/\\|`~\'\" ' or 
+                            c.isspace()):
+                            allowed_chars += 1
+                    
+                    return allowed_chars / total_chars > 0.85
+                
+                if not is_english_simple(prompt):
+                    logger.warning(f"❌ PROMPT не на английском!\n{prompt}")
+                    feedback = f"Нейросеть вернула промт не на английском языке: {prompt}. Попроси её создать промт на английском."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                fallback_negative = "(worst quality, low quality, normal quality:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy, wrong anatomy, extra limb, missing limb, floating limbs, (mutated hands and fingers:1.4), disconnected limbs, mutation, mutated, ugly, disgusting, blurry, amputation, text, watermark, signature, censor, censored, bar."
+                
+                # Если negative prompt пустой или не на английском, используем fallback
+                if not neg or not is_english_simple(neg):
+                    if neg:
+                        logger.warning("⚠️ negative_prompt заменён на запасной вариант (не на английском).")
+                    else:
+                        logger.info("ℹ️ Используется стандартный negative_prompt.")
+                    neg = fallback_negative
+                
+                # Параметры по умолчанию для видео
+                default_params = {
+                    "seed": -1, 
+                    "steps": 20, 
+                    "width": 512, 
+                    "height": 512, 
+                    "cfg": 7.0,
+                    "num_frames": 24,
+                    "fps": 8,
+                    "key_frames": 4
+                }
+                gen_params = default_params.copy()
+                
+                # Валидация и обновление параметров
+                for key, value in params.items():
+                    if key in default_params:
+                        try:
+                            # Приводим к нужному типу
+                            if key in ["seed", "steps", "width", "height", "num_frames", "fps", "key_frames"]:
+                                gen_params[key] = int(value)
+                            elif key == "cfg":
+                                gen_params[key] = float(value)
+                            else:
+                                gen_params[key] = value
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"⚠️ Неверный параметр {key}={value}, используется значение по умолчанию: {e}")
+                    else:
+                        logger.warning(f"⚠️ Неизвестный параметр {key}={value} игнорируется")
+                
+                # Дополнительная валидация
+                if gen_params["steps"] < 1 or gen_params["steps"] > 100:
+                    logger.warning(f"⚠️ Некорректное количество шагов {gen_params['steps']}, используется 20")
+                    gen_params["steps"] = 20
+                
+                if gen_params["width"] < 64 or gen_params["width"] > 2048:
+                    logger.warning(f"⚠️ Некорректная ширина {gen_params['width']}, используется 512")
+                    gen_params["width"] = 512
+                
+                if gen_params["height"] < 64 or gen_params["height"] > 2048:
+                    logger.warning(f"⚠️ Некорректная высота {gen_params['height']}, используется 512")
+                    gen_params["height"] = 512
+                
+                if gen_params["num_frames"] < 8 or gen_params["num_frames"] > 100:
+                    logger.warning(f"⚠️ Некорректное количество кадров {gen_params['num_frames']}, используется 24")
+                    gen_params["num_frames"] = 24
+                
+                if gen_params["fps"] < 1 or gen_params["fps"] > 60:
+                    logger.warning(f"⚠️ Некорректный FPS {gen_params['fps']}, используется 8")
+                    gen_params["fps"] = 8
+                
+                logger.info("\n===== 🎬 ПАРАМЕТРЫ ГЕНЕРАЦИИ ВИДЕО =====")
+                logger.info(f"PROMPT:\n{prompt}\n")
+                logger.info(f"NEGATIVE:\n{neg}\n")
+                logger.info(f"PARAMS: {gen_params}\n")
+                
+                # Генерируем видео
+                video_path = self.generate_video_stable_diffusion(prompt, neg, gen_params)
+                if video_path:
+                    logger.info("✅ Видео сгенерировано!")
+                    
+                    # Финальный ответ пользователю - НЕ ОТПРАВЛЯЕМ ОБРАТНО В AI!
+                    logger.info(f"\n🤖 ФИНАЛЬНЫЙ ОТВЕТ:")
+                    final_msg = f"✅ Видео успешно сгенерировано по вашему описанию: {description}\n🎬 Использованный промт: {prompt}\n📁 Путь к видео: {video_path}"
+                    logger.info(final_msg)
+                    # Сохраняем текст финального ответа для веб-UI
+                    self.last_final_response = final_msg
+                    return False  # Завершаем диалог
+                else:
+                    logger.error("❌ Не удалось сгенерировать видео!")
+                    feedback = f"Не удалось сгенерировать видео по описанию: {description}. Возможно, модель не найдена или недоступна."
+                    
+                    # Отправляем результат обратно AI только в случае ошибки
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+            elif action == "speak":
+                # Озвучка текста
+                text_to_speak = action_data.get("text", "")
+                voice = action_data.get("voice", "male")
+                language = action_data.get("language", "ru")
+                description = action_data.get("description", "")
+                
+                logger.info(f"\n🎤 ОЗВУЧКА ТЕКСТА: {description}")
+                logger.info(f"📝 Текст: {text_to_speak}")
+                logger.info(f"🔊 Голос: {voice}, Язык: {language}")
+                
+                if not text_to_speak:
+                    logger.error("❌ Пустой текст для озвучки")
+                    feedback = "Текст для озвучки пустой. Укажите текст в поле 'text'."
+                    follow_up = self.call_brain_model(feedback)
+                    return self.process_ai_response(follow_up)
+                
+                # Озвучиваем текст
+                audio_path = self.text_to_speech(text_to_speak, voice, language)
+                
+                if audio_path:
+                    logger.info("✅ Текст озвучен успешно")
+                    feedback = f"Текст успешно озвучен: {text_to_speak}. Аудиофайл сохранен: {os.path.basename(audio_path)}"
+                else:
+                    logger.error("❌ Ошибка озвучки текста")
+                    feedback = f"Не удалось озвучить текст: {text_to_speak}. Проверьте подключение к интернету и доступность TTS сервиса."
+                
+                # Отправляем результат обратно AI
+                follow_up = self.call_brain_model(feedback)
+                return self.process_ai_response(follow_up)
+                
+            elif action == "response":
+                # Финальный ответ пользователю
+                content = action_data.get("content", "")
+                # Сохраняем для веб-интерфейса
+                self.last_final_response = content
+                logger.info(f"\n🤖 ФИНАЛЬНЫЙ ОТВЕТ:")
+                logger.info(content)
+                return False  # Завершаем диалог
+                
+            else:
+                logger.warning(f"❓ Неизвестное действие: {action}")
+                return False
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Ошибка парсинга JSON ответа AI: {e}")
+            logger.info(f"📝 Ответ AI: {ai_response}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки ответа AI: {str(e)}")
+            return False
+
+    def run_interactive(self):
+        """Запуск интерактивного режима (глаза, аудио, мозг)"""
+        # Показываем сообщения только в консольном режиме
+        if getattr(self, 'show_images_locally', True):
+            logger.info("🚀 AI PowerShell Оркестратор запущен!")
+            logger.info("💡 Если в папке Photos есть изображение или в Audio есть аудиофайл, сначала будет анализ глазами/ушами, затем вы сможете задать вопрос для мозга.")
+            logger.info(f"🧠 Модель: {os.path.basename(self.brain_model)}")
+            logger.info(f"📊 {self.get_context_info()}")
+            logger.info("💻 Доступные команды: 'stats' (метрики), 'reset' (сброс), 'logs' (логи), 'export' (экспорт), 'exit' (выход)")
+            logger.info("="*60)
+
+        vision_desc = ""
+        audio_text = ""
+        while True:
+            try:
+                # 1. Проверяем наличие нового изображения
+                image_path = self.find_new_image()
+                image_base64 = ""
+                if image_path:
+                    # Показываем сообщения только в консольном режиме
+                    if getattr(self, 'show_images_locally', True):
+                        logger.info(f"📸 Найдено изображение: {os.path.basename(image_path)}")
+                    image_base64 = image_to_base64_balanced(image_path)
+                    if image_base64:
+                        if getattr(self, 'show_images_locally', True):
+                            logger.info(f"✅ Изображение обработано (размер: {len(image_base64)} символов)")
+                        # Сохраняем копию base64-изображения в корень проекта
+                        try:
+                            # base64 и io уже импортированы в начале файла
+                            img_bytes = base64.b64decode(image_base64)
+                            with open(os.path.join(os.path.dirname(__file__), "last_sent_image.png"), "wb") as f:
+                                f.write(img_bytes)
+                            if getattr(self, 'show_images_locally', True):
+                                logger.info("🖼️ Сжатое изображение сохранено как last_sent_image.png")
+                        except Exception as e:
+                            if getattr(self, 'show_images_locally', True):
+                                logger.warning(f"⚠️ Не удалось сохранить last_sent_image.png: {e}")
+                        # Отправляем изображение в vision-модель
+                        vision_desc = self.call_vision_model(image_base64)
+                        if getattr(self, 'show_images_locally', True):
+                            logger.info("\n👁️ Описание изображения (глаза):\n" + vision_desc)
+                        self.mark_image_used(image_path)
+                    else:
+                        if getattr(self, 'show_images_locally', True):
+                            logger.error("❌ Ошибка обработки изображения")
+                else:
+                    vision_desc = ""
+
+                audio_path = self.find_new_audio()
+                if audio_path:
+                    # Показываем сообщения только в консольном режиме
+                    if getattr(self, 'show_images_locally', True):
+                        logger.info(f"🔊 Найден аудиофайл: {os.path.basename(audio_path)}")
+                        # Запросить язык у пользователя
+                        lang = input("�� Введите язык аудиофайла (например, ru, en, etc..) или Enter для ru: ").strip() or "ru"
+                    else:
+                        # В веб-режиме используем русский по умолчанию
+                        lang = "ru"
+                    audio_text = self.transcribe_audio_whisper(audio_path, lang=lang, use_separator=getattr(self, 'use_separator', True))
+                    # Транскрипт уже выведен внутри transcribe_audio_whisper, не дублируем
+                else:
+                    audio_text = ""
+
+                # 3. Запрашиваем у пользователя текстовый вопрос
+                try:
+                    if getattr(self, 'show_images_locally', True):
+                        user_input = input("\n👤 Ваш вопрос (или Enter для пропуска, либо вставьте ссылку на YouTube): ").strip()
+                    else:
+                        # В веб-режиме не запрашиваем ввод
+                        user_input = ""
+                except EOFError:
+                    # Если ввод из файла/pipe, используем пустую строку
+                    user_input = ""
+                    if getattr(self, 'show_images_locally', True):
+                        logger.info("📝 Ввод из файла/pipe, продолжаю...")
+                if user_input.lower() in ['exit', 'quit', 'выход']:
+                    if getattr(self, 'show_images_locally', True):
+                        logger.info("👋 До свидания!")
+                    break
+                if user_input.lower() in ['stats', 'метрики', 'статистика']:
+                    # Показываем метрики производительности только в консольном режиме
+                    if getattr(self, 'show_images_locally', True):
+                        stats = self.get_performance_stats()
+                        logger.info("\n📊 МЕТРИКИ ПРОИЗВОДИТЕЛЬНОСТИ:")
+                        logger.info(f"   Всего действий: {stats['total_actions']}")
+                        logger.info(f"   Среднее время ответа: {stats['avg_response_time']} сек")
+                        if stats['recent_metrics']:
+                            logger.info("   Последние действия:")
+                            for metric in stats['recent_metrics'][-5:]:  # Показываем последние 5
+                                timestamp = time.strftime("%H:%M:%S", time.localtime(metric['timestamp']))
+                                logger.info(f"     [{timestamp}] {metric['action']}: {metric['response_time']:.2f} сек")
+                        logger.info(f"   {self.get_context_info()}")
+                    continue
+                if user_input.lower() in ['reset', 'сброс', 'очистить']:
+                    # Сбрасываем метрики и историю
+                    self.performance_metrics.clear()
+                    self.conversation_history.clear()
+                    self.current_context_length = 0
+                    if getattr(self, 'show_images_locally', True):
+                        logger.info("🔄 Метрики и история сброшены")
+                    continue
+                if user_input.lower() in ['logs', 'логи']:
+                    # Показываем последние записи из лог-файла только в консольном режиме
+                    if getattr(self, 'show_images_locally', True):
+                        try:
+                            with open("ai_orchestrator.log", "r", encoding="utf-8") as f:
+                                lines = f.readlines()
+                                logger.info("\n📝 ПОСЛЕДНИЕ ЗАПИСИ В ЛОГЕ:")
+                                for line in lines[-10:]:  # Показываем последние 10 строк
+                                    logger.info(f"   {line.strip()}")
+                        except Exception as e:
+                            logger.error(f"Ошибка чтения лог-файла: {e}")
+                    continue
+                if user_input.lower() in ['export', 'экспорт']:
+                    # Экспортируем метрики в JSON файл только в консольном режиме
+                    if getattr(self, 'show_images_locally', True):
+                        try:
+                            stats = self.get_performance_stats()
+                            export_data = {
+                                "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "performance_stats": stats,
+                                "context_info": {
+                                    "current": self.current_context_length,
+                                    "safe": self.safe_context_length,
+                                    "max": self.max_context_length
+                                }
+                            }
+                            filename = f"metrics_export_{int(time.time())}.json"
+                            with open(filename, "w", encoding="utf-8") as f:
+                                json.dump(export_data, f, ensure_ascii=False, indent=2)
+                            logger.info(f"📊 Метрики экспортированы в {filename}")
+                        except Exception as e:
+                            logger.error(f"Ошибка экспорта метрик: {e}")
+                    continue
+                if not user_input:
+                    continue
+
+                # 4. Перехват: если есть YouTube-ссылка, скачиваем видео и аудио, обрабатываем аудио, затем формируем brain_input: вопрос пользователя (без ссылки, вместо неё название ролика), затем текст из аудио, и только после этого отправляем brain_input в мозг
+                # re уже импортирован в начале файла
+                yt_url_match = re.search(r'https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+', user_input)
+                yt_processed = False  # Флаг для отслеживания обработки YouTube
+                if yt_url_match:
+                    yt_url = yt_url_match.group(0)
+                    logger.info("🔗 Обнаружена ссылка на YouTube, скачиваю видео...")
+                    
+                    # Проверяем VPN статус перед скачиванием
+                    if not self.check_vpn_status():
+                        logger.warning("⚠️ VPN может не работать корректно. YouTube может быть недоступен.")
+                        user_input_no_url = re.sub(r'https?://\S+', '[YouTube недоступен - проверьте VPN]', user_input).strip()
+                        brain_input = f"{user_input_no_url}\n\n[ОШИБКА]: Не удалось скачать YouTube видео. Проверьте VPN соединение."
+                        ai_response = self.call_brain_model(brain_input)
+                        continue
+                    
+                    # Проверяем доступность YouTube ссылки
+                    if not self.check_youtube_accessibility(yt_url):
+                        logger.error("❌ YouTube ссылка недоступна. Проверьте VPN или ссылку.")
+                        user_input_no_url = re.sub(r'https?://\S+', '[YouTube недоступен]', user_input).strip()
+                        brain_input = f"{user_input_no_url}\n\n[ОШИБКА]: YouTube ссылка недоступна. Проверьте VPN или ссылку."
+                        ai_response = self.call_brain_model(brain_input)
+                        continue
+                    
+                    # Получаем информацию о видео
+                    video_info = self.get_youtube_info(yt_url)
+                    if video_info.get('success'):
+                        video_title = video_info['title']
+                        logger.info(f"📹 Название видео: {video_title}")
+                    else:
+                        video_title = "Неизвестное видео"
+                        logger.warning(f"⚠️ Не удалось получить название: {video_info.get('error', 'Неизвестная ошибка')}")
+                    yt_video = self.download_youtube_video(yt_url)
+                    if yt_video:
+                        logger.info(f"✅ Видео скачано: {yt_video}")
+                        # video_title уже получен выше из get_youtube_info
+                    else:
+                        logger.error("❌ Не удалось скачать видео с YouTube")
+                        video_title = "Видео не скачано"
+                    logger.info("🔗 Скачиваю аудиодорожку для транскрипции...")
+                    yt_audio = self.download_youtube_audio(yt_url)
+                    if yt_audio:
+                        logger.info(f"✅ Аудио скачано: {yt_audio}")
+                        # Определяем язык по названию видео, а не по имени файла
+                        if "english" in video_title.lower() or "eng" in video_title.lower():
+                            lang = "en"
+                        elif "рус" in video_title.lower() or "russian" in video_title.lower():
+                            lang = "ru"
+                        else:
+                            # Автоматически определяем язык по названию видео
+                            # Для Rick Astley и подобных - английский
+                            if any(word in video_title.lower() for word in ["rick", "astley", "never", "gonna", "give", "you", "up"]):
+                                lang = "en"
+                                logger.info("🌐 Автоматически определен язык: английский (по названию видео)")
+                            else:
+                                # По умолчанию используем русский
+                                lang = "ru"
+                                logger.info("🌐 Используется язык по умолчанию: русский")
+                        audio_text = self.transcribe_audio_whisper(yt_audio, lang=lang, use_separator=getattr(self, 'use_separator', True))
+                        # --- VISION ПОКАДРОВО ---
+                        vision_frames_desc = ""
+                        if getattr(self, 'use_vision', False) and yt_video:
+                            logger.info("🖼️ Извлекаю кадры из видео для vision...")
+                            frames = self.extract_video_frames(yt_video, fps=1)
+                            frame_results = []  # [(timecode, desc)]
+                            for idx, (timecode, b64) in enumerate(frames):
+                                if not b64:
+                                    continue
+                                vision_prompt = "Describe absolutely everything you see in the image, including all small details, their positions, and any visible text. Be as detailed as possible."
+                                desc = self.call_vision_model(b64 + "\n" + vision_prompt)
+                                frame_results.append((timecode, desc))
+                                logger.info(f"[VISION][{timecode}] {desc}")
+                            # Группировка одинаковых описаний
+                            # collections.defaultdict уже импортирован в начале файла
+                            grouped = []  # [(list_of_timecodes, desc)]
+                            prev_desc = None
+                            prev_times = []
+                            for i, (tc, desc) in enumerate(frame_results):
+                                if prev_desc is None:
+                                    prev_desc = desc
+                                    prev_times = [tc]
+                                elif desc == prev_desc:
+                                    prev_times.append(tc)
+                                else:
+                                    grouped.append((prev_times, prev_desc))
+                                    prev_desc = desc
+                                    prev_times = [tc]
+                            if prev_times:
+                                grouped.append((prev_times, prev_desc))
+                            # Формируем текст с диапазонами и списками
+                            def format_timecodes(times):
+                                def tc_to_sec(tc):
+                                    h, m, s = map(int, tc.strip('[]').split(':'))
+                                    return h*3600 + m*60 + s
+                                if len(times) == 1:
+                                    return times[0]
+                                secs = [tc_to_sec(t) for t in times]
+                                sorted_pairs = sorted(zip(secs, times))
+                                secs_sorted, times_sorted = zip(*sorted_pairs)
+                                # Проверяем, есть ли диапазон подряд
+                                ranges = []
+                                start = end = secs_sorted[0]
+                                start_tc = times_sorted[0]
+                                for i in range(1, len(secs_sorted)):
+                                    if secs_sorted[i] == end + 1:
+                                        end = secs_sorted[i]
+                                    else:
+                                        if start != end:
+                                            ranges.append(f"[{start_tc}-{times_sorted[i-1]}]")
+                                        else:
+                                            ranges.append(f"{start_tc}")
+                                        start = end = secs_sorted[i]
+                                        start_tc = times_sorted[i]
+                                if start != end:
+                                    ranges.append(f"[{start_tc}-{times_sorted[-1]}]")
+                                else:
+                                    ranges.append(f"{start_tc}")
+                                return ', '.join(ranges)
+                            for times, desc in grouped:
+                                vision_frames_desc += f"{format_timecodes(times)}: {desc}\n"
+                        # Формируем brain_input: вопрос пользователя (без ссылки, вместо неё название ролика), ответы vision по кадрам, затем текст из аудио (с таймкодами)
+                        user_input_no_url = re.sub(r'https?://\S+', f'[Видео]: {video_title}' if video_title else '', user_input).strip()
+                        brain_input = ""
+                        brain_input += user_input_no_url
+                        if vision_frames_desc:
+                            brain_input += f"\n[Покадровое описание видео]:\n{vision_frames_desc}"
+                        if audio_text:
+                            brain_input += f"\n[Текст из аудио]:\n{audio_text}"
+                        # Отправляем в мозг и обрабатываем ответ
+                        ai_response = self.call_brain_model(brain_input)
+                        # Показываем информацию о контексте
+                        logger.info(f"📊 {self.get_context_info()}")
+                        continue_dialog = self.process_ai_response(ai_response)
+                        if not continue_dialog:
+                            logger.info("\n" + "="*60)
+                        yt_processed = True  # Отмечаем, что YouTube обработан
+                        continue  # пропускаем стандартный brain_input ниже
+                    else:
+                        logger.error("❌ Не удалось скачать аудио с YouTube")
+
+                # 5. Собираем итоговый запрос для мозга (только если не было YouTube обработки)
+                if not yt_processed:  # Используем флаг вместо yt_url_match
+                    brain_input = ""
+                    if vision_desc:
+                        brain_input += f"[Описание изображения]:\n{vision_desc}\n"
+                    if audio_text:
+                        brain_input += f"[Текст из аудио]:\n{audio_text}\n"
+                    brain_input += user_input
+
+                    # 6. Отправляем запрос в мозг
+                    ai_response = self.call_brain_model(brain_input)
+                    # Показываем информацию о контексте
+                    logger.info(f"📊 {self.get_context_info()}")
+                    # Обрабатываем ответ AI
+                    continue_dialog = self.process_ai_response(ai_response)
+                    if not continue_dialog:
+                        logger.info("\n" + "="*60)
+
+            except Exception as e:
+                if isinstance(e, KeyboardInterrupt):
+                    logger.info("\n👋 Программа прервана пользователем")
+                    break
+                logger.error(f"❌ Неожиданная ошибка: {str(e)}")
+                # Убираем дублирование обработки аудио - это уже делается выше
+                audio_text = ""
+
+                # 3. Запрашиваем у пользователя текстовый вопрос
+                try:
+                    user_input = input("\n👤 Ваш вопрос (или Enter для пропуска, либо вставьте ссылку на YouTube): ").strip()
+                except EOFError:
+                    # Если ввод из файла/pipe, используем пустую строку
+                    user_input = ""
+                    logger.info("📝 Ввод из файла/pipe, продолжаю...")
+                if user_input.lower() in ['exit', 'quit', 'выход']:
+                    logger.info("👋 До свидания!")
+                    break
+                if user_input.lower() in ['stats', 'метрики', 'статистика']:
+                    # Показываем метрики производительности
+                    stats = self.get_performance_stats()
+                    logger.info("\n📊 МЕТРИКИ ПРОИЗВОДИТЕЛЬНОСТИ:")
+                    logger.info(f"   Всего действий: {stats['total_actions']}")
+                    logger.info(f"   Среднее время ответа: {stats['avg_response_time']} сек")
+                    if stats['recent_metrics']:
+                        logger.info("   Последние действия:")
+                        for metric in stats['recent_metrics'][-5:]:  # Показываем последние 5
+                            timestamp = time.strftime("%H:%M:%S", time.localtime(metric['timestamp']))
+                            logger.info(f"     [{timestamp}] {metric['action']}: {metric['response_time']:.2f} сек")
+                    logger.info(f"   {self.get_context_info()}")
+                    continue
+                if user_input.lower() in ['reset', 'сброс', 'очистить']:
+                    # Сбрасываем метрики и историю
+                    self.performance_metrics.clear()
+                    self.conversation_history.clear()
+                    self.current_context_length = 0
+                    logger.info("🔄 Метрики и история сброшены")
+                    continue
+                if user_input.lower() in ['logs', 'логи']:
+                    # Показываем последние записи из лог-файла
+                    try:
+                        with open("ai_orchestrator.log", "r", encoding="utf-8") as f:
+                            lines = f.readlines()
+                            logger.info("\n📝 ПОСЛЕДНИЕ ЗАПИСИ В ЛОГЕ:")
+                            for line in lines[-10:]:  # Показываем последние 10 строк
+                                logger.info(f"   {line.strip()}")
+                    except Exception as e:
+                        logger.error(f"Ошибка чтения лог-файла: {e}")
+                    continue
+                if user_input.lower() in ['export', 'экспорт']:
+                    # Экспортируем метрики в JSON файл
+                    try:
+                        stats = self.get_performance_stats()
+                        export_data = {
+                            "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "performance_stats": stats,
+                            "context_info": {
+                                "current": self.current_context_length,
+                                "safe": self.safe_context_length,
+                                "max": self.max_context_length
+                            }
+                        }
+                        filename = f"metrics_export_{int(time.time())}.json"
+                        with open(filename, "w", encoding="utf-8") as f:
+                            json.dump(export_data, f, ensure_ascii=False, indent=2)
+                        logger.info(f"📊 Метрики экспортированы в {filename}")
+                    except Exception as e:
+                        logger.error(f"Ошибка экспорта метрик: {e}")
+                    continue
+                if not user_input:
+                    continue
+
+
+
+            except KeyboardInterrupt:
+                logger.info("\n�� Программа прервана пользователем")
+                break
+
+
+
+    def start_telegram_bot(self):
+        """Запускает Telegram бота"""
+        if not self.telegram_bot_token:
+            logger.warning("❌ Telegram Bot токен не указан")
+            return
+        
+        try:
+            # Создаем приложение
+            self.telegram_app = Application.builder().token(self.telegram_bot_token).build()
+            
+            # Добавляем обработчики
+            self.telegram_app.add_handler(CommandHandler("start", self._telegram_start))
+            self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._telegram_text_message))
+            self.telegram_app.add_handler(MessageHandler(filters.PHOTO, self._telegram_photo_message))
+            self.telegram_app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, self._telegram_audio_message))
+            
+            # Запускаем бота в фоне в отдельном потоке
+            import threading
+            def run_bot():
+                try:
+                    # Создаем новый event loop для потока
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.telegram_app.run_polling(allowed_updates=Update.ALL_TYPES))
+                except Exception as e:
+                    # В веб-режиме логируем тихо
+                    if not getattr(self, 'show_images_locally', True):
+                        logger.error(f"❌ Ошибка в Telegram боте: {e}")
+                    else:
+                        logger.debug(f"Telegram bot polling error: {e}")
+                finally:
+                    loop.close()
+            
+            bot_thread = threading.Thread(target=run_bot, daemon=True)
+            bot_thread.start()
+            
+            # Показываем сообщение только в консольном режиме
+            if not getattr(self, 'show_images_locally', True):
+                logger.info("🤖 Telegram бот запущен в фоновом режиме")
+            
+        except Exception as e:
+            # В веб-режиме логируем тихо
+            if not getattr(self, 'show_images_locally', True):
+                logger.error(f"❌ Ошибка запуска Telegram бота: {e}")
+            else:
+                logger.debug(f"Telegram bot startup error: {e}")
+
+    async def _telegram_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
+        user_id = str(update.effective_user.id)
+        if user_id != self.telegram_allowed_user_id:
+            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+            return
+        
+        await update.message.reply_text(
+            "🤖 Привет! Я Нейро - AI оркестратор.\n"
+            "Я могу:\n"
+            "• Обрабатывать текстовые сообщения\n"
+            "• Анализировать изображения\n"
+            "• Транскрибировать аудио\n"
+            "• Генерировать изображения\n"
+            "• Выполнять команды PowerShell\n"
+            "• Искать информацию в интернете\n\n"
+            "Просто отправьте мне сообщение, изображение или аудио!"
+        )
+
+    async def _telegram_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик текстовых сообщений"""
+        user_id = str(update.effective_user.id)
+        if user_id != self.telegram_allowed_user_id:
+            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+            return
+        
+        text = update.message.text
+        await update.message.reply_text("🔄 Обрабатываю ваше сообщение...")
+        
+        try:
+            # Отправляем в мозг
+            ai_response = self.call_brain_model(text)
+            
+            # Обрабатываем ответ AI
+            continue_dialog = self.process_ai_response(ai_response)
+            
+            if not continue_dialog:
+                # Если диалог завершен, отправляем финальный ответ
+                if hasattr(self, 'last_final_response') and self.last_final_response:
+                    await update.message.reply_text(self.last_final_response)
+                    
+                    # Если есть сгенерированное изображение, отправляем его
+                    if hasattr(self, 'last_generated_image_b64') and self.last_generated_image_b64:
+                        try:
+                            # Конвертируем base64 в bytes
+                            img_bytes = base64.b64decode(self.last_generated_image_b64)
+                            
+                            # Отправляем изображение
+                            await context.bot.send_photo(
+                                chat_id=update.effective_chat.id,
+                                photo=img_bytes,
+                                caption="🎨 Сгенерированное изображение"
+                            )
+                            
+                            # Очищаем
+                            self.last_generated_image_b64 = None
+                            
+                        except Exception as e:
+                            # В веб-режиме логируем тихо
+                            if not getattr(self, 'show_images_locally', True):
+                                logger.error(f"❌ Ошибка отправки изображения: {e}")
+                            else:
+                                logger.debug(f"Telegram image send error: {e}")
+                            await update.message.reply_text("❌ Ошибка отправки изображения")
+                else:
+                    await update.message.reply_text("✅ Задача выполнена!")
+            else:
+                # Если диалог продолжается, отправляем промежуточный ответ
+                await update.message.reply_text("🔄 Обрабатываю... Пожалуйста, подождите.")
+                
+        except Exception as e:
+            # В веб-режиме логируем тихо
+            if getattr(self, 'show_images_locally', True):
+                logger.error(f"❌ Ошибка обработки текстового сообщения: {e}")
+            else:
+                logger.debug(f"Telegram text message error: {e}")
+            await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+
+    async def _telegram_photo_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик фотографий"""
+        user_id = str(update.effective_user.id)
+        if user_id != self.telegram_allowed_user_id:
+            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+            return
+        
+        await update.message.reply_text("🖼️ Обрабатываю изображение...")
+        
+        try:
+            # Получаем фото
+            photo = update.message.photo[-1]  # Берем самое большое фото
+            file = await context.bot.get_file(photo.file_id)
+            
+            # Скачиваем фото
+            photo_bytes = await file.download_as_bytearray()
+            photo_b64 = base64.b64encode(photo_bytes).decode('ascii')
+            
+            # Анализируем изображение
+            vision_desc = self.call_vision_model(photo_b64)
+            
+            # Отправляем описание
+            await update.message.reply_text(f"👁️ Описание изображения:\n{vision_desc}")
+            
+            # Сохраняем для возможного использования в диалоге
+            self.last_telegram_image = photo_b64
+            
+        except Exception as e:
+            # В веб-режиме логируем тихо
+            if getattr(self, 'show_images_locally', True):
+                logger.error(f"❌ Ошибка обработки фото: {e}")
+            else:
+                logger.debug(f"Telegram photo processing error: {e}")
+            await update.message.reply_text(f"❌ Ошибка обработки изображения: {str(e)}")
+
+    async def _telegram_audio_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик аудио сообщений"""
+        user_id = str(update.effective_user.id)
+        if user_id != self.telegram_allowed_user_id:
+            await update.message.reply_text("❌ У вас нет доступа к этому бота.")
+            return
+        
+        await update.message.reply_text("🎵 Обрабатываю аудио...")
+        
+        try:
+            # Получаем аудио
+            if update.message.audio:
+                audio = update.message.audio
+            else:
+                audio = update.message.voice
+            
+            file = await context.bot.get_file(audio.file_id)
+            
+            # Скачиваем аудио
+            audio_bytes = await file.download_as_bytearray()
+            
+            # Сохраняем во временный файл
+            temp_dir = os.path.join(os.path.dirname(__file__), "temp_audio")
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file = os.path.join(temp_dir, f"telegram_audio_{int(time.time())}.ogg")
+            
+            with open(temp_file, 'wb') as f:
+                f.write(audio_bytes)
+            
+            # Транскрибируем аудио
+            transcript = self.transcribe_audio_whisper(temp_file, use_separator=False)
+            
+            if transcript and not transcript.startswith("[Whisper error]"):
+                await update.message.reply_text(f"🎤 Транскрипция аудио:\n{transcript}")
+                
+                # Сохраняем для возможного использования в диалоге
+                self.last_telegram_audio_transcript = transcript
+            else:
+                await update.message.reply_text("❌ Не удалось распознать аудио")
+            
+            # Удаляем временный файл
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+                
+        except Exception as e:
+            # В веб-режиме логируем тихо
+            if getattr(self, 'show_images_locally', True):
+                logger.error(f"❌ Ошибка обработки аудио: {e}")
+            else:
+                logger.debug(f"Telegram audio processing error: {e}")
+            await update.message.reply_text(f"❌ Ошибка обработки аудио: {str(e)}")
+
+
+def ensure_wav(audio_path: str) -> str:
+    """Конвертирует аудиофайл в WAV формат если он не WAV"""
+    try:
+        if audio_path.lower().endswith('.wav'):
+            return audio_path
+        
+        # Создаем временный файл
+        temp_dir = os.path.join(os.path.dirname(__file__), "Audio", "temp_convert")
+        os.makedirs(temp_dir, exist_ok=True)
+        wav_path = os.path.join(temp_dir, f"converted_{int(time.time())}.wav")
+        
+        # Конвертируем через ffmpeg
+        cmd = [
+            'ffmpeg', '-i', audio_path, '-acodec', 'pcm_s16le', 
+            '-ar', '16000', '-ac', '1', wav_path, '-y'
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        return wav_path
+    except Exception as e:
+        logger.error(f"Ошибка конвертации в WAV: {e}")
+        return audio_path
+
+    def text_to_speech(self, text: str, voice: str = "male", language: str = "ru") -> str:
+        """
+        Озвучивает текст с помощью Hugging Face Hub TTS API
+        
+        Args:
+            text: Текст для озвучки
+            voice: Тип голоса ("male" или "female")
+            language: Язык текста ("ru", "en", etc.)
+            
+        Returns:
+            Путь к созданному аудиофайлу или пустая строка при ошибке
+        """
+        try:
+            from huggingface_hub import InferenceClient
+            
+            # Создаем директорию для сгенерированной речи
+            output_dir = os.path.join(os.path.dirname(__file__), "Audio", "generated_speech")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Генерируем имя файла
+            timestamp = int(time.time())
+            filename = f"tts_{voice}_{language}_{timestamp}.wav"
+            output_path = os.path.join(output_dir, filename)
+            
+            # Выбираем модель в зависимости от языка и голоса
+            if language == "ru":
+                if voice == "male":
+                    model = "ai-forever/mGPT"  # Русский мужской голос
+                else:
+                    model = "ai-forever/mGPT"  # Русский женский голос
+            else:
+                # Для других языков используем универсальную модель
+                model = "microsoft/speecht5_tts"
+            
+            logger.info(f"🎤 Озвучиваю текст: {text[:100]}...")
+            logger.info(f"🔊 Модель: {model}")
+            
+            # Создаем клиент для Hugging Face Hub
+            client = InferenceClient()
+            
+            # Генерируем речь
+            audio_data = client.text_to_speech(
+                text,
+                model=model,
+                voice=voice if voice in ["male", "female"] else "male"
+            )
+            
+            # Сохраняем аудиофайл
+            with open(output_path, "wb") as f:
+                f.write(audio_data)
+            
+            logger.info(f"✅ Аудиофайл сохранен: {output_path}")
+            return output_path
+            
+        except ImportError:
+            logger.error("❌ Hugging Face Hub не установлен. Установите: pip install huggingface_hub")
+            return ""
+        except Exception as e:
+            logger.error(f"❌ Ошибка озвучки текста: {e}")
+            return ""
+
+def main():
+    """Главная функция"""
+    parser = argparse.ArgumentParser(description='AI PowerShell Оркестратор')
+    parser.add_argument('--web', action='store_true', help='Запустить веб-интерфейс')
+    args = parser.parse_args()
+    
+    start_web = args.web
+    
+    # Настройка логирования для внешних библиотек при веб-интерфейсе
+    if not start_web:
+        logging.getLogger('httpx').setLevel(logging.WARNING)
+        logging.getLogger('telegram').setLevel(logging.WARNING)
+        logging.getLogger('telegram.ext').setLevel(logging.WARNING)
+    
+    logger.info("Настройка AI PowerShell Оркестратора")
+    logger.info("="*50)
+    
+    # Настройки (можно вынести в конфиг файл)
+    LM_STUDIO_URL = "http://localhost:1234"  # URL вашего LM Studio сервера
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")  # Ваш Google API ключ
+    GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "")   # Ваш Google CSE ID
+    
+    # Telegram Bot настройки
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")  # Введите токен вашего бота
+    TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "")  # ID пользователя, которому разрешено использовать бота
+
+    # --- Автоматическое управление инструментами ---
+    # Все инструменты по умолчанию выключены для экономии ресурсов
+    # Они будут автоматически включаться при необходимости
+    use_image_generation = False  # Включается автоматически при генерации изображений
+    use_vision = False           # Включается автоматически при анализе изображений
+    use_audio = False            # Включается автоматически при обработке аудио
+    use_separator = True         # Всегда включен при использовании Whisper (как вы просили)
+
+    # Мозг по умолчанию - используем указанную вами модель
+    brain_model = "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
+    logger.info(f"🧠 Используется модель мозга: {os.path.basename(brain_model)}")
+    logger.info("🔧 Инструменты будут автоматически включаться по требованию для экономии ресурсов")
+
+    # Пути к моделям (можно вынести в конфиг)
+    vision_model = "moondream2-llamafile"  # Имя vision-модели всегда фиксировано
+    whisper_model = "ggerganov/whisper-large-v3-GGUF"
+
+    # Проверяем и запускаем нужные модели
+    orchestrator = AIOrchestrator(
+        lm_studio_url=LM_STUDIO_URL,
+        google_api_key=GOOGLE_API_KEY,
+        google_cse_id=GOOGLE_CSE_ID
+    )
+
+    # Проверяем, заданы ли Google API настройки
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+        logger.warning("⚠️  ВНИМАНИЕ: Google API ключ или CSE ID не настроены!")
+        logger.info("   Поиск в интернете будет недоступен.")
+        logger.info("   Для настройки отредактируйте переменные в начале main()")
+        logger.info("")
+
+    # Передаем brain_model и настройки в оркестратор
+    orchestrator.brain_model = brain_model
+    orchestrator.use_separator = use_separator
+    orchestrator.use_image_generation = use_image_generation
+    orchestrator.use_vision = use_vision
+    orchestrator.use_audio = use_audio
+    
+    # Передаем настройки Telegram
+    orchestrator.telegram_bot_token = TELEGRAM_BOT_TOKEN
+    orchestrator.telegram_allowed_user_id = TELEGRAM_ALLOWED_USER_ID
+    
+    # Запускаем веб-интерфейс если указан флаг --web
+    if start_web:
+        try:
+            # Отключаем локальный показ изображений во всплывающих окнах при веб-режиме
+            orchestrator.show_images_locally = False
+        except Exception:
+            pass
+        # Запускаем uvicorn сервер в фоне
+        try:
+            # subprocess, sys, os уже импортированы в начале файла
+            repo_root = os.path.dirname(os.path.abspath(__file__))
+            cmd = [
+                _sys.executable, "-m", "uvicorn", "webui.server:app",
+                "--host", "127.0.0.1", "--port", "8001", "--app-dir", repo_root
+            ]
+            logger.info(f"🌐 Стартую веб-сервер: {' '.join(cmd)}")
+            subprocess.Popen(cmd, cwd=repo_root)
+            logger.info("Откройте в браузере: http://127.0.0.1:8001/")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось запустить веб-интерфейс автоматически: {e}")
+
+    # Запускаем Telegram бота если указан токен
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            if start_web:
+                logger.info("🤖 Запускаю Telegram бота...")
+            orchestrator.start_telegram_bot()
+            if start_web:
+                logger.info("✅ Telegram бот запущен")
+        except Exception as e:
+            if start_web:
+                logger.error(f"❌ Ошибка запуска Telegram бота: {e}")
+            else:
+                # В веб-режиме логируем тихо
+                logger.debug(f"Telegram bot error: {e}")
+    
+    # Запускаем интерактивный режим
+    orchestrator.run_interactive()
+
+
+if __name__ == "__main__":
+    main()
