@@ -1,0 +1,41 @@
+AI PowerShell Orchestrator
+Copyright (c) 2025 [Ваше имя]
+
+DUAL LICENSE AGREEMENT
+
+This software is available under two different licenses:
+
+1. OPEN SOURCE LICENSE (GPL-3.0)
+   For personal, educational, and non-commercial use.
+   
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+2. COMMERCIAL LICENSE
+   For commercial use, distribution, or integration into proprietary software.
+   
+   Commercial licenses are available for purchase. Contact:
+   Email: [ваш_email]
+   
+   Commercial licensing allows you to:
+   - Use the software in commercial products
+   - Distribute without GPL restrictions
+   - Receive priority support
+   - Custom licensing terms available
+
+For more information about licensing options, please contact us.
+
+AI-ASSISTED DEVELOPMENT NOTICE:
+This project was developed with assistance from AI tools (Claude, GPT) for 
+code generation, architecture design, and documentation. All AI-generated 
+code has been thoroughly reviewed, tested, and validated by human developers.
