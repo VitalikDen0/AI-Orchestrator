@@ -2049,49 +2049,6 @@ class AIOrchestrator:
             logger.error(f"❌ Ошибка скачивания модели whisper: {e}")
             return False
 
-    def text_to_speech(self, text: str, voice: str = "male", language: str = "ru") -> str:
-        """
-        Озвучивает текст с помощью gTTS (Google Text-to-Speech)
-        
-        Args:
-            text: Текст для озвучки
-            voice: Тип голоса ("male" или "female") - пока не используется в gTTS
-            language: Язык текста ("ru", "en", etc.)
-            
-        Returns:
-            Путь к созданному аудиофайлу или пустая строка при ошибке
-        """
-        try:
-            from gtts import gTTS
-            
-            # Создаем папку для сгенерированной речи
-            output_dir = os.path.join(os.path.dirname(__file__), "Audio", "generated_speech")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Генерируем уникальное имя файла
-            timestamp = int(time.time())
-            filename = f"tts_{voice}_{language}_{timestamp}.mp3"
-            output_path = os.path.join(output_dir, filename)
-            
-            logger.info(f"🎤 Озвучиваю текст: {text[:100]}...")
-            logger.info(f"🔊 Голос: {voice}, Язык: {language}")
-            
-            # Создаем TTS объект
-            tts = gTTS(text=text, lang=language, slow=False)
-            
-            # Сохраняем аудиофайл
-            tts.save(output_path)
-            
-            logger.info(f"✅ Аудиофайл сохранен: {output_path}")
-            return output_path
-            
-        except ImportError:
-            logger.error("❌ gTTS не установлен. Установите: pip install gTTS")
-            return ""
-        except Exception as e:
-            logger.error(f"❌ Ошибка озвучки текста: {e}")
-            return ""
-
     def download_youtube_audio(self, url: str, out_dir: Optional[str] = None) -> str:
         """
         Скачивает аудиодорожку с YouTube по ссылке (использует yt-dlp)
@@ -2711,24 +2668,24 @@ class AIOrchestrator:
   "content": "Привет! Я Нейро, ваш AI-помощник. Чем могу помочь?"
 }
 
-Задача с Powershell:
+Пример с Powershell:
 {
   "action": "powershell",
   "command": "New-Item -Path 'C:\\\\Users\\\\vital\\\\Desktop\\\\НоваяПапка' -ItemType Directory -Force",
   "description": "Создаю папку 'НоваяПапка' на рабочем столе"
 }
 
-Задача с озвучкой:
+Пример с озвучкой:
 {
   "action": "speak",
-  "text": "Будет 4",
+  "text": "Текст, который нужно озвучить",
   "voice": "male",
   "language": "ru",
-  "description": "Озвучиваю результат математического вычисления"
+  "description": "Текст, который не будет озвучен, а как дополнение к озвучке, пояснение"
 }
 {
   "action": "response",
-  "content": "Результат: 2 + 2 = 4. Это базовое математическое действие сложения, где мы объединяем две единицы с двумя единицами и получаем четыре единицы."
+  "content": "Полноый текст ответа, не будет озвучен, нужен как менее важный текст"
 }
 
 11. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ: Если пользователь использует слова "сгенерируй", "нарисуй", "создай изображение", "покажи как выглядит", "визуализируй", "изобрази" или подобные по смыслу, И генерация изображений включена, используй действие "generate_image" с подробным описанием. ВАЖНО: После успешной генерации изображения система автоматически завершит диалог - НЕ пытайся генерировать повторно!
@@ -4944,64 +4901,114 @@ class AIOrchestrator:
                 logger.debug(f"Telegram audio processing error: {e}")
             await update.message.reply_text(f"❌ Ошибка обработки аудио: {str(e)}")
 
-    def text_to_speech(self, text: str, voice: str = "male", language: str = "ru") -> str:
+    def play_audio_file(self, audio_path: str) -> bool:
         """
-        Озвучивает текст с помощью Hugging Face Hub TTS API
+        Воспроизводит аудиофайл один раз без зацикливания
+        
+        Args:
+            audio_path: Путь к аудиофайлу
+            
+        Returns:
+            True если воспроизведение запущено успешно, False при ошибке
+        """
+        try:
+            import pygame
+            import time
+            
+            logger.info(f"🔊 Воспроизводим аудио: {os.path.basename(audio_path)}")
+            
+            # Инициализируем pygame mixer
+            pygame.mixer.init()
+            
+            # Загружаем и воспроизводим аудио
+            try:
+                pygame.mixer.music.load(audio_path)
+                pygame.mixer.music.play()
+                
+                # Ждем окончания воспроизведения
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.1)
+                
+                # Останавливаем и закрываем
+                pygame.mixer.music.stop()
+                pygame.mixer.quit()
+                
+                logger.info("✅ Аудио воспроизведено через pygame")
+                return True
+                
+            except Exception as e:
+                logger.warning(f"⚠️ pygame воспроизведение не удалось: {e}")
+                pygame.mixer.quit()
+                
+                # Fallback: открываем в плеере по умолчанию
+                import subprocess
+                subprocess.Popen(["start", audio_path], shell=True)
+                logger.info("🔄 Открыт в плеере по умолчанию")
+                return True
+                
+        except ImportError:
+            logger.warning("⚠️ pygame не установлен, используем fallback")
+            # Fallback: открываем в плеере по умолчанию
+            import subprocess
+            subprocess.Popen(["start", audio_path], shell=True)
+            logger.info("🔄 Открыт в плеере по умолчанию")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка воспроизведения аудио: {e}")
+            return False
+
+    def text_to_speech(self, text: str, voice: str = "male", language: str = "ru", auto_play: bool = True) -> str:
+        """
+        Озвучивает текст с помощью gTTS (Google Text-to-Speech)
         
         Args:
             text: Текст для озвучки
-            voice: Тип голоса ("male" или "female")
+            voice: Тип голоса ("male" или "female") - пока не используется в gTTS
             language: Язык текста ("ru", "en", etc.)
+            auto_play: Автоматически воспроизвести после создания файла
             
         Returns:
             Путь к созданному аудиофайлу или пустая строка при ошибке
         """
         try:
-            from huggingface_hub import InferenceClient
+            from gtts import gTTS
             
-            # Создаем директорию для сгенерированной речи
+            # Создаем папку для сгенерированной речи
             output_dir = os.path.join(os.path.dirname(__file__), "Audio", "generated_speech")
             os.makedirs(output_dir, exist_ok=True)
             
-            # Генерируем имя файла
+            # Генерируем уникальное имя файла
             timestamp = int(time.time())
-            filename = f"tts_{voice}_{language}_{timestamp}.wav"
+            filename = f"tts_{voice}_{language}_{timestamp}.mp3"
             output_path = os.path.join(output_dir, filename)
             
-            # Выбираем модель в зависимости от языка и голоса
-            if language == "ru":
-                if voice == "male":
-                    model = "ai-forever/mGPT"  # Русский мужской голос
-                else:
-                    model = "ai-forever/mGPT"  # Русский женский голос
-            else:
-                # Для других языков используем универсальную модель
-                model = "microsoft/speecht5_tts"
-            
             logger.info(f"🎤 Озвучиваю текст: {text[:100]}...")
-            logger.info(f"🔊 Модель: {model}")
+            logger.info(f"🔊 Голос: {voice}, Язык: {language}")
+            logger.info(f"🌐 Использую Google TTS API")
             
-            # Создаем клиент для Hugging Face Hub
-            client = InferenceClient()
-            
-            # Генерируем речь
-            audio_data = client.text_to_speech(
-                text,
-                model=model
-            )
+            # Создаем TTS объект
+            tts = gTTS(text=text, lang=language, slow=False)
             
             # Сохраняем аудиофайл
-            with open(output_path, "wb") as f:
-                f.write(audio_data)
+            tts.save(output_path)
             
             logger.info(f"✅ Аудиофайл сохранен: {output_path}")
+            
+            # Автоматически воспроизводим, если включено
+            if auto_play:
+                self.play_audio_file(output_path)
+            
             return output_path
             
         except ImportError:
-            logger.error("❌ Hugging Face Hub не установлен. Установите: pip install huggingface_hub")
+            logger.error("❌ gTTS не установлен. Установите: pip install gTTS")
             return ""
         except Exception as e:
             logger.error(f"❌ Ошибка озвучки текста: {e}")
+            logger.error(f"🔍 Тип ошибки: {type(e).__name__}")
+            import traceback
+            logger.error(f"📋 Traceback: {traceback.format_exc()}")
             return ""
 
     def enhance_prompt_with_memory(self, user_message: str, system_prompt: str = "") -> str:
