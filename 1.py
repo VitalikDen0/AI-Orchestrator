@@ -9,7 +9,7 @@ AI PowerShell Orchestrator with Google Search Integration
 ТРЕБУЕМЫЕ БИБЛИОТЕКИ:
 pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors
 
-Для postоянной голосовой записи также потребуется веб-интерфейс с поддержкой MediaRecorder API.
+Для постоянной голосовой записи также потребуется веб-интерфейс с поддержкой MediaRecorder API.
 """
 
 import requests
@@ -4503,3 +4503,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
