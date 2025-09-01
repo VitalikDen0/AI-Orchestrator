@@ -82,7 +82,7 @@ p.s. **abliterated** по причине того, что она будет ме
 
 #### Vision модель
 
-- **moondream2-050824**
+- **[moondream2-050824](https://huggingface.co/cjpais/moondream2-llamafile/blob/main/moondream2-050824-q8.gguf)**
 - Скачайте через интерфейс LM Studio
 - Требования: ~2GB VRAM
 
