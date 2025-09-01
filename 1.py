@@ -2823,7 +2823,7 @@ class AIOrchestrator:
     
     def get_context_info(self) -> str:
         """Возвращает информацию о текущем использовании контекста"""
-        return f"Контекст: {self.current_context_length:,} / {self.safe_context_length:,} (безопасный) / {self.max_context_length:,} (максимум)"
+        return f"Контекст: {self.current_context_length:,} токенов / {self.safe_context_length:,} (безопасный) / {self.max_context_length:,} (максимум)"
 
     def add_performance_metric(self, action: str, response_time: float, context_length: int = 0):
         """Добавляет метрику производительности"""
@@ -3158,6 +3158,17 @@ class AIOrchestrator:
             if response.status_code == 200:
                 result = response.json()
                 ai_response = result["choices"][0]["message"]["content"].strip()
+                
+                # Извлекаем информацию о токенах из ответа модели
+                usage_info = result.get("usage", {})
+                prompt_tokens = usage_info.get("prompt_tokens", 0)
+                completion_tokens = usage_info.get("completion_tokens", 0)
+                total_tokens = usage_info.get("total_tokens", 0)
+                
+                # Обновляем текущий размер контекста на основе total_tokens
+                if total_tokens > 0:
+                    self.current_context_length = total_tokens
+                    logger.info(f"📊 Реальные токены: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
                 
                 # Добавляем в историю разговора (если ответ не пустой)
                 if ai_response and ai_response != "{}":
@@ -5040,6 +5051,10 @@ class AIOrchestrator:
                 logger.info(f"📚 Промпт улучшен с помощью памяти (добавлено: {added_length} символов)")
             else:
                 logger.info(f"📚 Промпт не улучшен (память пуста)")
+            
+            # Логируем общую длину промпта для сравнения с токенами
+            total_prompt_length = len(enhanced_prompt)
+            logger.info(f"📝 Общая длина промпта: {total_prompt_length} символов")
             
             return enhanced_prompt
             
