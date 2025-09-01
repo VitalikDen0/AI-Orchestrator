@@ -18,3 +18,5 @@ huggingface-hub==0.17.3
 audio-separator==0.11.2
 imageio==2.31.5
 numpy==1.24.4
+chromadb==0.4.22
+sentence-transformers==2.5.1
