@@ -78,7 +78,7 @@ p.s. **abliterated** по причине того, что она будет ме
 
 #### Audio модель
 
-- **whisper-large-v3** [whisper-large-v3-q8_0](https://huggingface.co/vonjack/whisper-large-v3-gguf) (Использовал Q8)
+- **[whisper-large-v3-q8_0](https://huggingface.co/vonjack/whisper-large-v3-gguf)** (Использовал Q8)
 
 #### Vision модель
 
