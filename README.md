@@ -1,4 +1,4 @@
-# AI PowerShell Orchestrator
+# AI Orchestrator
 
 **Интеллектуальный мультимодальный AI-помощник с системной интеграцией**
 
