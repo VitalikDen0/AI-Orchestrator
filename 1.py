@@ -5,11 +5,10 @@ AI PowerShell Orchestrator with Google Search Integration
 Интегрирует LM Studio, PowerShell команды и поиск Google
 
 ОБНОВЛЕНО: Теперь использует прямую интеграцию со Stable Diffusion для генерации изображений
+ОБНОВЛЕНО: Добавлено векторное хранилище ChromaDB для преодоления ограничений контекста
 
 ТРЕБУЕМЫЕ БИБЛИОТЕКИ:
-pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors
-
-Для постоянной голосовой записи также потребуется веб-интерфейс с поддержкой MediaRecorder API.
+pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors chromadb sentence-transformers
 """
 
 import requests
@@ -41,8 +40,20 @@ from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
+# Импорты для ChromaDB и векторного поиска
+try:
+    import chromadb
+    from chromadb.config import Settings
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    import torch
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
+    print("⚠️ ChromaDB не установлен. Установите: pip install chromadb sentence-transformers")
+
 # Загружаем переменные окружения из .env файла
-# override=True - перезаписываем существующие переменные окружения
+# override=True - перезаписываем существующие переменные
 load_dotenv(override=True)
 
 # Настройка логирования в файл
@@ -56,6 +67,784 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+### НОВОЕ: Класс для работы с векторным хранилищем ChromaDB ###
+class ChromaDBManager:
+    """
+    Менеджер векторного хранилища ChromaDB для преодоления ограничений контекста
+    и обучения на предпочтениях пользователя
+    """
+    
+    def __init__(self, db_path: str = "chroma_db", embedding_model: str = "all-MiniLM-L6-v2", use_gpu: bool = True):
+        """
+        Инициализация ChromaDB менеджера
+        
+        Args:
+            db_path: Путь к базе данных ChromaDB
+            embedding_model: Модель для создания эмбеддингов (784 размерности)
+            use_gpu: Использовать GPU для создания эмбеддингов (если доступен)
+        """
+        self.db_path = db_path
+        self.embedding_model = embedding_model
+        self.use_gpu = use_gpu
+        self.client = None
+        self.collection = None
+        self.embedding_model_obj = None
+        self.initialized = False
+        
+        # Создаем папку для базы данных если её нет
+        os.makedirs(db_path, exist_ok=True)
+        
+        # Инициализируем ChromaDB
+        self._initialize_chromadb()
+    
+    def _initialize_chromadb(self):
+        """Инициализация ChromaDB клиента и коллекции"""
+        try:
+            if not CHROMADB_AVAILABLE:
+                logger.warning("⚠️ ChromaDB недоступен, векторное хранилище отключено")
+                return
+            
+            # Инициализируем клиент ChromaDB
+            self.client = chromadb.PersistentClient(
+                path=self.db_path,
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
+            
+            # Создаем или получаем коллекцию
+            self.collection = self.client.get_or_create_collection(
+                name="conversation_memory",
+                metadata={"description": "Векторное хранилище диалогов и предпочтений пользователя"}
+            )
+            
+            # Загружаем модель для эмбеддингов
+            logger.info(f"📦 Загружаю модель эмбеддингов: {self.embedding_model}")
+            
+            # Проверяем доступность GPU
+            device = "cuda" if self.use_gpu and torch.cuda.is_available() else "cpu"
+            logger.info(f"🔧 Используется устройство: {device}")
+            
+            # Получаем информацию о GPU
+            gpu_info = self.get_gpu_info()
+            
+            self.embedding_model_obj = SentenceTransformer(self.embedding_model, device=device)
+            
+            # Проверяем размерность эмбеддингов
+            test_embedding = self.embedding_model_obj.encode("test")
+            embedding_dim = len(test_embedding)
+            logger.info(f"✅ Модель эмбеддингов загружена, размерность: {embedding_dim}")
+            
+            # Проверяем количество записей в базе
+            count = self.collection.count()
+            logger.info(f"📊 База данных содержит {count} записей")
+            
+            self.initialized = True
+            logger.info("✅ ChromaDB успешно инициализирован")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации ChromaDB: {e}")
+            self.initialized = False
+    
+    def get_gpu_info(self) -> Dict[str, Any]:
+        """
+        Получает информацию о GPU для ChromaDB
+        
+        Returns:
+            Словарь с информацией о GPU
+        """
+        gpu_info = {
+            "gpu_available": False,
+            "gpu_name": None,
+            "gpu_memory": None,
+            "device_used": "cpu"
+        }
+        
+        try:
+            if torch.cuda.is_available():
+                gpu_info["gpu_available"] = True
+                gpu_info["gpu_name"] = torch.cuda.get_device_name(0)
+                gpu_info["gpu_memory"] = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+                gpu_info["device_used"] = "cuda" if self.use_gpu else "cpu"
+                
+                logger.info(f"🎮 GPU доступен: {gpu_info['gpu_name']}")
+                logger.info(f"💾 GPU память: {gpu_info['gpu_memory']:.1f} GB")
+            else:
+                logger.info("💻 GPU недоступен, используется CPU")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка получения информации о GPU: {e}")
+            
+        return gpu_info
+    
+    def add_conversation_memory(self, user_message: str, ai_response: str, 
+                               context: str = "", metadata: Dict[str, Any] = None) -> bool:
+        """
+        Добавляет диалог в векторное хранилище
+        
+        Args:
+            user_message: Сообщение пользователя
+            ai_response: Ответ ИИ
+            context: Дополнительный контекст
+            metadata: Дополнительные метаданные
+            
+        Returns:
+            True если успешно добавлено, False при ошибке
+        """
+        if not self.initialized:
+            return False
+        
+        try:
+            # Создаем уникальный ID для записи
+            timestamp = int(time.time())
+            record_id = f"conv_{timestamp}_{hash(user_message) % 10000}"
+            
+            # Объединяем текст для создания эмбеддинга
+            combined_text = f"User: {user_message}\nAI: {ai_response}"
+            if context:
+                combined_text += f"\nContext: {context}"
+            
+            # Создаем эмбеддинг
+            embedding = self.embedding_model_obj.encode(combined_text).tolist()
+            
+            # Подготавливаем метаданные
+            record_metadata = {
+                "timestamp": timestamp,
+                "user_message": user_message,
+                "ai_response": ai_response,
+                "context": context,
+                "type": "conversation"
+            }
+            
+            if metadata:
+                record_metadata.update(metadata)
+            
+            # Добавляем в коллекцию
+            self.collection.add(
+                embeddings=[embedding],
+                documents=[combined_text],
+                metadatas=[record_metadata],
+                ids=[record_id]
+            )
+            
+            logger.info(f"💾 Добавлена запись в ChromaDB: {record_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления в ChromaDB: {e}")
+            return False
+    
+    def add_user_preference(self, preference_text: str, category: str = "general", 
+                           metadata: Dict[str, Any] = None) -> bool:
+        """
+        Добавляет предпочтение пользователя в векторное хранилище
+        
+        Args:
+            preference_text: Текст предпочтения
+            category: Категория предпочтения
+            metadata: Дополнительные метаданные
+            
+        Returns:
+            True если успешно добавлено, False при ошибке
+        """
+        if not self.initialized:
+            return False
+        
+        try:
+            # Создаем уникальный ID
+            timestamp = int(time.time())
+            record_id = f"pref_{timestamp}_{hash(preference_text) % 10000}"
+            
+            # Создаем эмбеддинг
+            embedding = self.embedding_model_obj.encode(preference_text).tolist()
+            
+            # Подготавливаем метаданные
+            record_metadata = {
+                "timestamp": timestamp,
+                "preference_text": preference_text,
+                "category": category,
+                "type": "preference"
+            }
+            
+            if metadata:
+                record_metadata.update(metadata)
+            
+            # Добавляем в коллекцию
+            self.collection.add(
+                embeddings=[embedding],
+                documents=[preference_text],
+                metadatas=[record_metadata],
+                ids=[record_id]
+            )
+            
+            logger.info(f"💾 Добавлено предпочтение в ChromaDB: {record_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления предпочтения в ChromaDB: {e}")
+            return False
+    
+    def search_similar_conversations(self, query: str, n_results: int = 5, 
+                                   similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
+        """
+        Ищет похожие диалоги в векторном хранилище
+        
+        Args:
+            query: Поисковый запрос
+            n_results: Количество результатов
+            similarity_threshold: Порог схожести (0-1)
+            
+        Returns:
+            Список найденных диалогов с метаданными
+        """
+        if not self.initialized:
+            return []
+        
+        try:
+            # Создаем эмбеддинг для запроса
+            query_embedding = self.embedding_model_obj.encode(query).tolist()
+            
+            # Ищем похожие записи
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                where={"type": "conversation"}
+            )
+            
+            # Фильтруем по порогу схожести
+            filtered_results = []
+            if results['distances'] and results['distances'][0]:
+                for i, distance in enumerate(results['distances'][0]):
+                    # ChromaDB возвращает расстояния, конвертируем в схожесть
+                    similarity = 1 - distance
+                    if similarity >= similarity_threshold:
+                        result = {
+                            'id': results['ids'][0][i],
+                            'document': results['documents'][0][i],
+                            'metadata': results['metadatas'][0][i],
+                            'similarity': similarity,
+                            'distance': distance
+                        }
+                        filtered_results.append(result)
+            
+            logger.info(f"🔍 Найдено {len(filtered_results)} похожих диалогов")
+            return filtered_results
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка поиска в ChromaDB: {e}")
+            return []
+    
+    def search_user_preferences(self, query: str, category: str = None, 
+                               n_results: int = 3) -> List[Dict[str, Any]]:
+        """
+        Ищет предпочтения пользователя
+        
+        Args:
+            query: Поисковый запрос
+            category: Категория предпочтений (опционально)
+            n_results: Количество результатов
+            
+        Returns:
+            Список найденных предпочтений
+        """
+        if not self.initialized:
+            return []
+        
+        try:
+            # Создаем эмбеддинг для запроса
+            query_embedding = self.embedding_model_obj.encode(query).tolist()
+            
+            # Формируем условия поиска
+            where_condition = {"type": "preference"}
+            if category:
+                where_condition["category"] = category
+            
+            # Ищем похожие записи
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                where=where_condition
+            )
+            
+            # Формируем результат
+            preferences = []
+            if results['documents'] and results['documents'][0]:
+                for i, document in enumerate(results['documents'][0]):
+                    similarity = 1 - results['distances'][0][i]
+                    preference = {
+                        'id': results['ids'][0][i],
+                        'preference_text': document,
+                        'metadata': results['metadatas'][0][i],
+                        'similarity': similarity
+                    }
+                    preferences.append(preference)
+            
+            logger.info(f"🔍 Найдено {len(preferences)} предпочтений пользователя")
+            return preferences
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка поиска предпочтений в ChromaDB: {e}")
+            return []
+    
+    def get_conversation_context(self, query: str, max_context_length: int = 2000) -> str:
+        """
+        Получает релевантный контекст из предыдущих диалогов
+        
+        Args:
+            query: Текущий запрос пользователя
+            max_context_length: Максимальная длина контекста
+            
+        Returns:
+            Строка с релевантным контекстом
+        """
+        if not self.initialized:
+            return ""
+        
+        try:
+            # Ищем похожие диалоги
+            similar_conversations = self.search_similar_conversations(
+                query, n_results=3, similarity_threshold=0.6
+            )
+            
+            if not similar_conversations:
+                return ""
+            
+            # Формируем контекст
+            context_parts = []
+            current_length = 0
+            
+            for conv in similar_conversations:
+                conv_text = f"Предыдущий диалог (схожесть {conv['similarity']:.2f}):\n{conv['document']}\n"
+                
+                if current_length + len(conv_text) <= max_context_length:
+                    context_parts.append(conv_text)
+                    current_length += len(conv_text)
+                else:
+                    break
+            
+            context = "\n".join(context_parts)
+            logger.info(f"📚 Получен контекст длиной {len(context)} символов")
+            return context
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения контекста из ChromaDB: {e}")
+            return ""
+    
+    def get_user_preferences_summary(self, query: str = None) -> str:
+        """
+        Получает краткое резюме предпочтений пользователя
+        
+        Args:
+            query: Контекстный запрос (опционально)
+            
+        Returns:
+            Строка с резюме предпочтений
+        """
+        if not self.initialized:
+            return ""
+        
+        try:
+            # Ищем релевантные предпочтения
+            if query:
+                preferences = self.search_user_preferences(query, n_results=5)
+            else:
+                # Получаем все предпочтения
+                results = self.collection.get(where={"type": "preference"})
+                preferences = []
+                if results['documents']:
+                    for i, doc in enumerate(results['documents']):
+                        preference = {
+                            'preference_text': doc,
+                            'metadata': results['metadatas'][i],
+                            'similarity': 1.0  # Для общих предпочтений
+                        }
+                        preferences.append(preference)
+            
+            if not preferences:
+                return ""
+            
+            # Формируем резюме
+            summary_parts = ["Предпочтения пользователя:"]
+            
+            for pref in preferences[:3]:  # Ограничиваем 3 предпочтениями
+                category = pref['metadata'].get('category', 'general')
+                summary_parts.append(f"- {category}: {pref['preference_text'][:100]}...")
+            
+            summary = "\n".join(summary_parts)
+            logger.info(f"📋 Сформировано резюме предпочтений длиной {len(summary)} символов")
+            return summary
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения резюме предпочтений: {e}")
+            return ""
+    
+    def cleanup_old_records(self, days_to_keep: int = 30) -> int:
+        """
+        Удаляет старые записи из базы данных
+        
+        Args:
+            days_to_keep: Количество дней для хранения записей
+            
+        Returns:
+            Количество удаленных записей
+        """
+        if not self.initialized:
+            return 0
+        
+        try:
+            cutoff_timestamp = int(time.time()) - (days_to_keep * 24 * 60 * 60)
+            
+            # Получаем все записи
+            results = self.collection.get()
+            
+            if not results['ids']:
+                return 0
+            
+            # Находим записи для удаления
+            ids_to_delete = []
+            for i, metadata in enumerate(results['metadatas']):
+                timestamp = metadata.get('timestamp', 0)
+                if timestamp < cutoff_timestamp:
+                    ids_to_delete.append(results['ids'][i])
+            
+            # Удаляем старые записи
+            if ids_to_delete:
+                self.collection.delete(ids=ids_to_delete)
+                logger.info(f"🧹 Удалено {len(ids_to_delete)} старых записей из ChromaDB")
+                return len(ids_to_delete)
+            
+            return 0
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки ChromaDB: {e}")
+            return 0
+    
+    def get_database_stats(self) -> Dict[str, Any]:
+        """
+        Получает статистику базы данных
+        
+        Returns:
+            Словарь со статистикой
+        """
+        if not self.initialized:
+            return {"error": "ChromaDB не инициализирован"}
+        
+        try:
+            total_count = self.collection.count()
+            
+            # Подсчитываем по типам
+            conversations = self.collection.get(where={"type": "conversation"})
+            preferences = self.collection.get(where={"type": "preference"})
+            
+            stats = {
+                "total_records": total_count,
+                "conversations": len(conversations['ids']) if conversations['ids'] else 0,
+                "preferences": len(preferences['ids']) if preferences['ids'] else 0,
+                "database_path": self.db_path,
+                "embedding_model": self.embedding_model
+            }
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики ChromaDB: {e}")
+            return {"error": str(e)}
+
+    def get_database_stats(self) -> Dict[str, Any]:
+        """
+        Получает статистику базы данных
+        
+        Returns:
+            Словарь со статистикой
+        """
+        if not self.initialized:
+            return {"error": "ChromaDB не инициализирован"}
+        
+        try:
+            total_count = self.collection.count()
+            
+            # Подсчитываем по типам
+            conversations = self.collection.get(where={"type": "conversation"})
+            preferences = self.collection.get(where={"type": "preference"})
+            
+            stats = {
+                "total_records": total_count,
+                "conversations": len(conversations['ids']) if conversations['ids'] else 0,
+                "preferences": len(preferences['ids']) if preferences['ids'] else 0,
+                "database_path": self.db_path,
+                "embedding_model": self.embedding_model
+            }
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики ChromaDB: {e}")
+            return {"error": str(e)}
+
+    ### НОВЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С CHROMADB ###
+    
+    def add_to_memory(self, user_message: str, ai_response: str, context: str = "", 
+                     metadata: Dict[str, Any] = None) -> bool:
+        """
+        Добавляет диалог в векторное хранилище памяти
+        
+        Args:
+            user_message: Сообщение пользователя
+            ai_response: Ответ ИИ
+            context: Дополнительный контекст
+            metadata: Дополнительные метаданные
+            
+        Returns:
+            True если успешно добавлено
+        """
+        try:
+            return self.chromadb_manager.add_conversation_memory(
+                user_message, ai_response, context, metadata
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления в память: {e}")
+            return False
+    
+    def add_user_preference(self, preference_text: str, category: str = "general", 
+                           metadata: Dict[str, Any] = None) -> bool:
+        """
+        Добавляет предпочтение пользователя в векторное хранилище
+        
+        Args:
+            preference_text: Текст предпочтения
+            category: Категория предпочтения
+            metadata: Дополнительные метаданные
+            
+        Returns:
+            True если успешно добавлено
+        """
+        try:
+            return self.chromadb_manager.add_user_preference(
+                preference_text, category, metadata
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления предпочтения: {e}")
+            return False
+    
+    def get_relevant_context(self, query: str, max_context_length: int = 2000) -> str:
+        """
+        Получает релевантный контекст из предыдущих диалогов
+        
+        Args:
+            query: Текущий запрос пользователя
+            max_context_length: Максимальная длина контекста
+            
+        Returns:
+            Строка с релевантным контекстом
+        """
+        try:
+            return self.chromadb_manager.get_conversation_context(query, max_context_length)
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения контекста: {e}")
+            return ""
+    
+    def get_user_preferences(self, query: str = None) -> str:
+        """
+        Получает предпочтения пользователя
+        
+        Args:
+            query: Контекстный запрос (опционально)
+            
+        Returns:
+            Строка с предпочтениями пользователя
+        """
+        try:
+            return self.chromadb_manager.get_user_preferences_summary(query)
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения предпочтений: {e}")
+            return ""
+    
+    def search_similar_conversations(self, query: str, n_results: int = 5, 
+                                   similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
+        """
+        Ищет похожие диалоги в векторном хранилище
+        
+        Args:
+            query: Поисковый запрос
+            n_results: Количество результатов
+            similarity_threshold: Порог схожести (0-1)
+            
+        Returns:
+            Список найденных диалогов
+        """
+        try:
+            return self.chromadb_manager.search_similar_conversations(
+                query, n_results, similarity_threshold
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка поиска похожих диалогов: {e}")
+            return []
+    
+    def cleanup_old_memory(self, days_to_keep: int = 30) -> int:
+        """
+        Удаляет старые записи из памяти
+        
+        Args:
+            days_to_keep: Количество дней для хранения записей
+            
+        Returns:
+            Количество удаленных записей
+        """
+        try:
+            return self.chromadb_manager.cleanup_old_records(days_to_keep)
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки памяти: {e}")
+            return 0
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """
+        Получает статистику памяти
+        
+        Returns:
+            Словарь со статистикой
+        """
+        try:
+            return self.chromadb_manager.get_database_stats()
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики памяти: {e}")
+            return {"error": str(e)}
+    
+    def get_gpu_info(self) -> Dict[str, Any]:
+        """
+        Получает информацию о GPU для ChromaDB
+        
+        Returns:
+            Словарь с информацией о GPU
+        """
+        try:
+            if hasattr(self, 'chromadb_manager') and self.chromadb_manager:
+                return self.chromadb_manager.get_gpu_info()
+            else:
+                return {"error": "ChromaDB не инициализирован"}
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о GPU: {e}")
+            return {"error": str(e)}
+    
+    def enhance_prompt_with_memory(self, user_message: str, system_prompt: str = "") -> str:
+        """
+        Улучшает промпт с помощью контекста из памяти
+        
+        Args:
+            user_message: Сообщение пользователя
+            system_prompt: Системный промпт
+            
+        Returns:
+            Улучшенный промпт с контекстом
+        """
+        try:
+            # Получаем релевантный контекст
+            context = self.get_relevant_context(user_message, max_context_length=1500)
+            
+            # Получаем предпочтения пользователя
+            preferences = self.get_user_preferences(user_message)
+            
+            # Формируем улучшенный промпт
+            enhanced_prompt = system_prompt
+            
+            if context:
+                enhanced_prompt += f"\n\nРЕЛЕВАНТНЫЙ КОНТЕКСТ ИЗ ПРЕДЫДУЩИХ ДИАЛОГОВ:\n{context}\n\nИНСТРУКЦИЯ: Используйте эту информацию только если она релевантна текущему запросу. Не упоминайте источник информации явно."
+            
+            if preferences:
+                enhanced_prompt += f"\n\nПРЕДПОЧТЕНИЯ ПОЛЬЗОВАТЕЛЯ:\n{preferences}\n\nИНСТРУКЦИЯ: Учитывайте эти предпочтения при формировании ответа, но не упоминайте их явно."
+            
+            enhanced_prompt += f"\n\nТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
+            
+            logger.info(f"📚 Промпт улучшен с помощью памяти (длина: {len(enhanced_prompt)} символов)")
+            return enhanced_prompt
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка улучшения промпта: {e}")
+            return f"{system_prompt}\n\nТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
+    
+    def auto_save_conversation(self, user_message: str, ai_response: str, 
+                              context: str = "", metadata: Dict[str, Any] = None):
+        """
+        Автоматически сохраняет диалог в память
+        
+        Args:
+            user_message: Сообщение пользователя
+            ai_response: Ответ ИИ
+            context: Дополнительный контекст
+            metadata: Дополнительные метаданные
+        """
+        try:
+            # Добавляем базовые метаданные
+            if metadata is None:
+                metadata = {}
+            
+            metadata.update({
+                "auto_saved": True,
+                "response_length": len(ai_response),
+                "user_message_length": len(user_message)
+            })
+            
+            # Сохраняем в память
+            success = self.add_to_memory(user_message, ai_response, context, metadata)
+            
+            if success:
+                logger.info("💾 Диалог автоматически сохранен в память")
+            else:
+                logger.warning("⚠️ Не удалось сохранить диалог в память")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка автоматического сохранения: {e}")
+    
+    def extract_preferences_from_response(self, user_message: str, ai_response: str):
+        """
+        Извлекает предпочтения пользователя из диалога и сохраняет их
+        
+        Args:
+            user_message: Сообщение пользователя
+            ai_response: Ответ ИИ
+        """
+        try:
+            # Простые паттерны для извлечения предпочтений
+            preference_patterns = [
+                r"мне нравится (.+?)(?:\.|$)",
+                r"я предпочитаю (.+?)(?:\.|$)",
+                r"лучше всего (.+?)(?:\.|$)",
+                r"хочу (.+?)(?:\.|$)",
+                r"нужно (.+?)(?:\.|$)",
+                r"важно (.+?)(?:\.|$)"
+            ]
+            
+            # Ищем предпочтения в сообщении пользователя
+            for pattern in preference_patterns:
+                matches = re.findall(pattern, user_message.lower())
+                for match in matches:
+                    if len(match) > 10:  # Минимальная длина предпочтения
+                        self.add_user_preference(
+                            match.strip(),
+                            category="user_preference",
+                            metadata={"source": "extracted", "pattern": pattern}
+                        )
+            
+            # Также ищем в ответе ИИ, если там есть подтверждения
+            confirmation_patterns = [
+                r"понял(?:а)?, что вам нравится (.+?)(?:\.|$)",
+                r"запомню, что вы предпочитаете (.+?)(?:\.|$)",
+                r"учту ваше предпочтение (.+?)(?:\.|$)"
+            ]
+            
+            for pattern in confirmation_patterns:
+                matches = re.findall(pattern, ai_response.lower())
+                for match in matches:
+                    if len(match) > 10:
+                        self.add_user_preference(
+                            match.strip(),
+                            category="confirmed_preference",
+                            metadata={"source": "ai_confirmation", "pattern": pattern}
+                        )
+                        
+        except Exception as e:
+            logger.error(f"❌ Ошибка извлечения предпочтений: {e}")
 
 ### НОВОЕ: Функция для сжатия изображений ###
 def image_to_base64_balanced(image_path: str, max_size=(500, 500), palette_colors=12) -> str:
@@ -1834,6 +2623,12 @@ class AIOrchestrator:
         # Инициализируем базовую директорию
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         
+        # Инициализируем ChromaDB для векторного хранилища
+        self.chromadb_manager = ChromaDBManager(
+            db_path=os.path.join(self.base_dir, "chroma_db"),
+            use_gpu=True  # Включаем поддержку GPU
+        )
+        
         # Проверяем наличие ffmpeg для конвертации аудио
         self._check_ffmpeg()
         
@@ -1844,6 +2639,20 @@ class AIOrchestrator:
 
         # Универсальный системный промпт для оркестратора
         self.system_prompt = """
+ВЫ - ИНТЕЛЛЕКТУАЛЬНЫЙ АССИСТЕНТ С ДОСТУПОМ К ВЕКТОРНОЙ ПАМЯТИ (ChromaDB):
+
+У вас есть доступ к векторной базе данных ChromaDB, которая хранит:
+1. Все предыдущие диалоги с пользователем
+2. Предпочтения пользователя, извлеченные из разговоров
+3. Контекстную информацию для улучшения ответов
+
+ВАЖНЫЕ ПРИНЦИПЫ РАБОТЫ С ПАМЯТЬЮ:
+- ВСЕ диалоги автоматически сохраняются в память после каждого ответа
+- Вы НЕ используете память напрямую в новых чатах - только если это релевантно
+- Если пользователь спрашивает о чем-то, что обсуждалось ранее, вы можете вспомнить это из памяти
+- Предпочтения пользователя помогают персонализировать ответы
+- Память работает автоматически - вам не нужно явно обращаться к ней
+
 ИНФОРМАЦИЯ О ГЕНЕРАЦИИ ИЗОБРАЖЕНИЙ:
 
 Категории и теги для генерации изображений (каждый тег подписан, обязательные отмечены [!]):
@@ -2566,8 +3375,11 @@ class AIOrchestrator:
         """
         start_time = time.time()
         try:
+            # Улучшаем промпт с помощью памяти ChromaDB
+            enhanced_system_prompt = self.enhance_prompt_with_memory(user_message, self.system_prompt)
+            
             messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": self.system_prompt}
+                {"role": "system", "content": enhanced_system_prompt}
             ]
             
             # Добавляем историю разговора с управлением контекстом
@@ -2587,7 +3399,7 @@ class AIOrchestrator:
             self._trim_context_if_needed(total_length)
             
             # Пересобираем сообщения после обрезки
-            messages = [{"role": "system", "content": self.system_prompt}]
+            messages = [{"role": "system", "content": enhanced_system_prompt}]
             messages.extend(self.conversation_history)
             if vision_desc:
                 messages.append({"role": "user", "content": vision_desc})
@@ -2614,6 +3426,12 @@ class AIOrchestrator:
                 if ai_response and ai_response != "{}":
                     self.conversation_history.append({"role": "user", "content": user_message})
                     self.conversation_history.append({"role": "assistant", "content": ai_response})
+                    
+                    # Автоматически сохраняем диалог в ChromaDB
+                    self.auto_save_conversation(user_message, ai_response, vision_desc)
+                    
+                    # Извлекаем предпочтения пользователя из диалога
+                    self.extract_preferences_from_response(user_message, ai_response)
                 
                 return ai_response
             else:
@@ -3705,7 +4523,7 @@ class AIOrchestrator:
             logger.info("💡 Если в папке Photos есть изображение или в Audio есть аудиофайл, сначала будет анализ глазами/ушами, затем вы сможете задать вопрос для мозга.")
             logger.info(f"🧠 Модель: {os.path.basename(self.brain_model)}")
             logger.info(f"📊 {self.get_context_info()}")
-            logger.info("💻 Доступные команды: 'stats' (метрики), 'reset' (сброс), 'logs' (логи), 'export' (экспорт), 'exit' (выход)")
+            logger.info("💻 Доступные команды: 'stats' (метрики), 'reset' (сброс), 'logs' (логи), 'export' (экспорт), 'memory' (память), 'gpu' (видеокарта), 'search' (поиск), 'preferences' (предпочтения), 'cleanup' (очистка), 'exit' (выход)")
             logger.info("="*60)
 
         vision_desc = ""
@@ -3830,6 +4648,85 @@ class AIOrchestrator:
                             logger.info(f"📊 Метрики экспортированы в {filename}")
                         except Exception as e:
                             logger.error(f"Ошибка экспорта метрик: {e}")
+                    continue
+                if user_input.lower() in ['memory', 'память', 'mem']:
+                    # Показываем статистику памяти ChromaDB
+                    if getattr(self, 'show_images_locally', True):
+                        try:
+                            stats = self.get_memory_stats()
+                            logger.info("\n🧠 СТАТИСТИКА ПАМЯТИ CHROMADB:")
+                            if "error" not in stats:
+                                logger.info(f"   Всего записей: {stats['total_records']}")
+                                logger.info(f"   Диалогов: {stats['conversations']}")
+                                logger.info(f"   Предпочтений: {stats['preferences']}")
+                                logger.info(f"   Путь к БД: {stats['database_path']}")
+                                logger.info(f"   Модель эмбеддингов: {stats['embedding_model']}")
+                            else:
+                                logger.error(f"   Ошибка получения статистики: {stats['error']}")
+                        except Exception as e:
+                            logger.error(f"Ошибка получения статистики памяти: {e}")
+                    continue
+                if user_input.lower() in ['gpu', 'видеокарта', 'gpuinfo']:
+                    # Показываем информацию о GPU для ChromaDB
+                    if getattr(self, 'show_images_locally', True):
+                        try:
+                            gpu_info = self.get_gpu_info()
+                            logger.info("\n🎮 ИНФОРМАЦИЯ О GPU ДЛЯ CHROMADB:")
+                            if "error" not in gpu_info:
+                                logger.info(f"   GPU доступен: {'Да' if gpu_info['gpu_available'] else 'Нет'}")
+                                if gpu_info['gpu_available']:
+                                    logger.info(f"   Название GPU: {gpu_info['gpu_name']}")
+                                    logger.info(f"   Память GPU: {gpu_info['gpu_memory']:.1f} GB")
+                                logger.info(f"   Используемое устройство: {gpu_info['device_used']}")
+                            else:
+                                logger.error(f"   Ошибка получения информации о GPU: {gpu_info['error']}")
+                        except Exception as e:
+                            logger.error(f"Ошибка получения информации о GPU: {e}")
+                    continue
+                if user_input.lower() in ['cleanup', 'очистка', 'clean']:
+                    # Очищаем старые записи из памяти
+                    if getattr(self, 'show_images_locally', True):
+                        try:
+                            days = input("🗑️ Введите количество дней для хранения записей (по умолчанию 30): ").strip()
+                            days_to_keep = int(days) if days.isdigit() else 30
+                            deleted_count = self.cleanup_old_memory(days_to_keep)
+                            logger.info(f"🧹 Удалено {deleted_count} старых записей из памяти")
+                        except Exception as e:
+                            logger.error(f"Ошибка очистки памяти: {e}")
+                    continue
+                if user_input.lower() in ['search', 'поиск', 'find']:
+                    # Поиск похожих диалогов в памяти
+                    if getattr(self, 'show_images_locally', True):
+                        try:
+                            query = input("🔍 Введите поисковый запрос: ").strip()
+                            if query:
+                                results = self.search_similar_conversations(query, n_results=3)
+                                if results:
+                                    logger.info(f"\n🔍 НАЙДЕНО {len(results)} ПОХОЖИХ ДИАЛОГОВ:")
+                                    for i, result in enumerate(results, 1):
+                                        logger.info(f"   {i}. Схожесть: {result['similarity']:.2f}")
+                                        logger.info(f"      ID: {result['id']}")
+                                        logger.info(f"      Текст: {result['document'][:100]}...")
+                                        logger.info(f"      Время: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(result['metadata']['timestamp']))}")
+                                        logger.info("")
+                                else:
+                                    logger.info("🔍 Похожих диалогов не найдено")
+                        except Exception as e:
+                            logger.error(f"Ошибка поиска: {e}")
+                    continue
+                if user_input.lower() in ['preferences', 'предпочтения', 'prefs']:
+                    # Показываем предпочтения пользователя
+                    if getattr(self, 'show_images_locally', True):
+                        try:
+                            query = input("👤 Введите контекст для поиска предпочтений (или Enter для всех): ").strip()
+                            preferences = self.get_user_preferences(query if query else None)
+                            if preferences:
+                                logger.info(f"\n👤 ПРЕДПОЧТЕНИЯ ПОЛЬЗОВАТЕЛЯ:")
+                                logger.info(preferences)
+                            else:
+                                logger.info("👤 Предпочтения не найдены")
+                        except Exception as e:
+                            logger.error(f"Ошибка получения предпочтений: {e}")
                     continue
                 if not user_input:
                     continue
@@ -4503,4 +5400,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
