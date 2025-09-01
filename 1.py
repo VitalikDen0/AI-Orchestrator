@@ -42,7 +42,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения из .env файла
-load_dotenv()
+# override=True - перезаписываем существующие переменные окружения
+load_dotenv(override=True)
 
 # Настройка логирования в файл
 log_file = "ai_orchestrator.log"
@@ -4071,11 +4072,28 @@ class AIOrchestrator:
 
 
 
-    def start_telegram_bot(self):
-        """Запускает Telegram бота"""
+    def start_telegram_bot(self) -> bool:
+        """Запускает Telegram бота. Возвращает True при успешном старте, иначе False."""
         if not self.telegram_bot_token:
             logger.warning("❌ Telegram Bot токен не указан")
-            return
+            return False
+        
+        # Предварительная проверка токена через getMe и редактирование токена в логах
+        try:
+            redacted = self.telegram_bot_token[:10] + "..." if len(self.telegram_bot_token) > 13 else "***"
+            logger.info(f"🔐 Проверяю Telegram токен (redacted: {redacted})")
+            resp = requests.get(f"https://api.telegram.org/bot{self.telegram_bot_token}/getMe", timeout=5)
+            if resp.status_code != 200:
+                logger.error("❌ Ошибка проверки Telegram токена: сервер вернул неуспешный статус")
+                return False
+            data = resp.json()
+            if not data.get("ok"):
+                # Не логируем сырой токен
+                logger.error(f"❌ Telegram токен отклонен сервером (token: {redacted})")
+                return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки Telegram токена: {e}")
+            return False
         
         try:
             # Создаем приложение
@@ -4110,6 +4128,7 @@ class AIOrchestrator:
             # Показываем сообщение только в консольном режиме
             if not getattr(self, 'show_images_locally', True):
                 logger.info("🤖 Telegram бот запущен в фоновом режиме")
+            return True
             
         except Exception as e:
             # В веб-режиме логируем тихо
@@ -4117,6 +4136,7 @@ class AIOrchestrator:
                 logger.error(f"❌ Ошибка запуска Telegram бота: {e}")
             else:
                 logger.debug(f"Telegram bot startup error: {e}")
+            return False
 
     async def _telegram_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
@@ -4389,12 +4409,12 @@ def main():
     
     # Настройки (можно вынести в конфиг файл)
     LM_STUDIO_URL = "http://localhost:1234"  # URL вашего LM Studio сервера
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")  # Ваш Google API ключ
-    GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "")   # Ваш Google CSE ID
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()  # Ваш Google API ключ
+    GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "").strip()   # Ваш Google CSE ID
     
     # Telegram Bot настройки
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")  # Введите токен вашего бота
-    TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "")  # ID пользователя, которому разрешено использовать бота
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()  # Введите токен вашего бота
+    TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()  # ID пользователя, которому разрешено использовать бота
 
     # --- Автоматическое управление инструментами ---
     # Все инструменты по умолчанию выключены для экономии ресурсов
@@ -4464,9 +4484,12 @@ def main():
         try:
             if start_web:
                 logger.info("🤖 Запускаю Telegram бота...")
-            orchestrator.start_telegram_bot()
+            tg_started = orchestrator.start_telegram_bot()
             if start_web:
-                logger.info("✅ Telegram бот запущен")
+                if tg_started:
+                    logger.info("✅ Telegram бот запущен")
+                else:
+                    logger.info("ℹ️ Telegram бот не запущен (проверьте токен)")
         except Exception as e:
             if start_web:
                 logger.error(f"❌ Ошибка запуска Telegram бота: {e}")
