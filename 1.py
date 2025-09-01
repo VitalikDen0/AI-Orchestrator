@@ -726,125 +726,7 @@ class ChromaDBManager:
         except Exception as e:
             logger.error(f"❌ Ошибка получения информации о GPU: {e}")
             return {"error": str(e)}
-    
-    def enhance_prompt_with_memory(self, user_message: str, system_prompt: str = "") -> str:
-        """
-        Улучшает промпт с помощью контекста из памяти
-        
-        Args:
-            user_message: Сообщение пользователя
-            system_prompt: Системный промпт
-            
-        Returns:
-            Улучшенный промпт с контекстом
-        """
-        try:
-            # Получаем релевантный контекст
-            context = self.get_relevant_context(user_message, max_context_length=1500)
-            
-            # Получаем предпочтения пользователя
-            preferences = self.get_user_preferences(user_message)
-            
-            # Формируем улучшенный промпт
-            enhanced_prompt = system_prompt
-            
-            if context:
-                enhanced_prompt += f"\n\nРЕЛЕВАНТНЫЙ КОНТЕКСТ ИЗ ПРЕДЫДУЩИХ ДИАЛОГОВ:\n{context}\n\nИНСТРУКЦИЯ: Используйте эту информацию только если она релевантна текущему запросу. Не упоминайте источник информации явно."
-            
-            if preferences:
-                enhanced_prompt += f"\n\nПРЕДПОЧТЕНИЯ ПОЛЬЗОВАТЕЛЯ:\n{preferences}\n\nИНСТРУКЦИЯ: Учитывайте эти предпочтения при формировании ответа, но не упоминайте их явно."
-            
-            enhanced_prompt += f"\n\nТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
-            
-            logger.info(f"📚 Промпт улучшен с помощью памяти (длина: {len(enhanced_prompt)} символов)")
-            return enhanced_prompt
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка улучшения промпта: {e}")
-            return f"{system_prompt}\n\nТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
-    
-    def auto_save_conversation(self, user_message: str, ai_response: str, 
-                              context: str = "", metadata: Dict[str, Any] = None):
-        """
-        Автоматически сохраняет диалог в память
-        
-        Args:
-            user_message: Сообщение пользователя
-            ai_response: Ответ ИИ
-            context: Дополнительный контекст
-            metadata: Дополнительные метаданные
-        """
-        try:
-            # Добавляем базовые метаданные
-            if metadata is None:
-                metadata = {}
-            
-            metadata.update({
-                "auto_saved": True,
-                "response_length": len(ai_response),
-                "user_message_length": len(user_message)
-            })
-            
-            # Сохраняем в память
-            success = self.add_to_memory(user_message, ai_response, context, metadata)
-            
-            if success:
-                logger.info("💾 Диалог автоматически сохранен в память")
-            else:
-                logger.warning("⚠️ Не удалось сохранить диалог в память")
-                
-        except Exception as e:
-            logger.error(f"❌ Ошибка автоматического сохранения: {e}")
-    
-    def extract_preferences_from_response(self, user_message: str, ai_response: str):
-        """
-        Извлекает предпочтения пользователя из диалога и сохраняет их
-        
-        Args:
-            user_message: Сообщение пользователя
-            ai_response: Ответ ИИ
-        """
-        try:
-            # Простые паттерны для извлечения предпочтений
-            preference_patterns = [
-                r"мне нравится (.+?)(?:\.|$)",
-                r"я предпочитаю (.+?)(?:\.|$)",
-                r"лучше всего (.+?)(?:\.|$)",
-                r"хочу (.+?)(?:\.|$)",
-                r"нужно (.+?)(?:\.|$)",
-                r"важно (.+?)(?:\.|$)"
-            ]
-            
-            # Ищем предпочтения в сообщении пользователя
-            for pattern in preference_patterns:
-                matches = re.findall(pattern, user_message.lower())
-                for match in matches:
-                    if len(match) > 10:  # Минимальная длина предпочтения
-                        self.add_user_preference(
-                            match.strip(),
-                            category="user_preference",
-                            metadata={"source": "extracted", "pattern": pattern}
-                        )
-            
-            # Также ищем в ответе ИИ, если там есть подтверждения
-            confirmation_patterns = [
-                r"понял(?:а)?, что вам нравится (.+?)(?:\.|$)",
-                r"запомню, что вы предпочитаете (.+?)(?:\.|$)",
-                r"учту ваше предпочтение (.+?)(?:\.|$)"
-            ]
-            
-            for pattern in confirmation_patterns:
-                matches = re.findall(pattern, ai_response.lower())
-                for match in matches:
-                    if len(match) > 10:
-                        self.add_user_preference(
-                            match.strip(),
-                            category="confirmed_preference",
-                            metadata={"source": "ai_confirmation", "pattern": pattern}
-                        )
-                        
-        except Exception as e:
-            logger.error(f"❌ Ошибка извлечения предпочтений: {e}")
+
 
 ### НОВОЕ: Функция для сжатия изображений ###
 def image_to_base64_balanced(image_path: str, max_size=(500, 500), palette_colors=12) -> str:
@@ -5202,30 +5084,6 @@ class AIOrchestrator:
                 logger.debug(f"Telegram audio processing error: {e}")
             await update.message.reply_text(f"❌ Ошибка обработки аудио: {str(e)}")
 
-
-def ensure_wav(audio_path: str) -> str:
-    """Конвертирует аудиофайл в WAV формат если он не WAV"""
-    try:
-        if audio_path.lower().endswith('.wav'):
-            return audio_path
-        
-        # Создаем временный файл
-        temp_dir = os.path.join(os.path.dirname(__file__), "Audio", "temp_convert")
-        os.makedirs(temp_dir, exist_ok=True)
-        wav_path = os.path.join(temp_dir, f"converted_{int(time.time())}.wav")
-        
-        # Конвертируем через ffmpeg
-        cmd = [
-            'ffmpeg', '-i', audio_path, '-acodec', 'pcm_s16le', 
-            '-ar', '16000', '-ac', '1', wav_path, '-y'
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        
-        return wav_path
-    except Exception as e:
-        logger.error(f"Ошибка конвертации в WAV: {e}")
-        return audio_path
-
     def text_to_speech(self, text: str, voice: str = "male", language: str = "ru") -> str:
         """
         Озвучивает текст с помощью Hugging Face Hub TTS API
@@ -5286,6 +5144,148 @@ def ensure_wav(audio_path: str) -> str:
         except Exception as e:
             logger.error(f"❌ Ошибка озвучки текста: {e}")
             return ""
+
+    def enhance_prompt_with_memory(self, user_message: str, system_prompt: str = "") -> str:
+        """
+        Улучшает промпт с помощью контекста из памяти
+        
+        Args:
+            user_message: Сообщение пользователя
+            system_prompt: Системный промпт
+            
+        Returns:
+            Улучшенный промпт с контекстом
+        """
+        try:
+            # Получаем релевантный контекст
+            context = self.get_relevant_context(user_message, max_context_length=1500)
+            
+            # Получаем предпочтения пользователя
+            preferences = self.get_user_preferences(user_message)
+            
+            # Формируем улучшенный промпт
+            enhanced_prompt = system_prompt
+            
+            if context:
+                enhanced_prompt += f"\n\nРЕЛЕВАНТНЫЙ КОНТЕКСТ ИЗ ПРЕДЫДУЩИХ ДИАЛОГОВ:\n{context}\n\nИНСТРУКЦИЯ: Используйте эту информацию только если она релевантна текущему запросу. Не упоминайте источник информации явно."
+            
+            if preferences:
+                enhanced_prompt += f"\n\nПРЕДПОЧТЕНИЯ ПОЛЬЗОВАТЕЛЯ:\n{preferences}\n\nИНСТРУКЦИЯ: Учитывайте эти предпочтения при формировании ответа, но не упоминайте их явно."
+            
+            enhanced_prompt += f"\n\nТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
+            
+            logger.info(f"📚 Промпт улучшен с помощью памяти (длина: {len(enhanced_prompt)} символов)")
+            return enhanced_prompt
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка улучшения промпта: {e}")
+            return f"{system_prompt}\n\nТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
+    
+    def auto_save_conversation(self, user_message: str, ai_response: str, 
+                              context: str = "", metadata: Dict[str, Any] = None):
+        """
+        Автоматически сохраняет диалог в память
+        
+        Args:
+            user_message: Сообщение пользователя
+            ai_response: Ответ ИИ
+            context: Дополнительный контекст
+            metadata: Дополнительные метаданные
+        """
+        try:
+            # Добавляем базовые метаданные
+            if metadata is None:
+                metadata = {}
+            
+            metadata.update({
+                "auto_saved": True,
+                "response_length": len(ai_response),
+                "user_message_length": len(user_message)
+            })
+            
+            # Сохраняем в память
+            success = self.add_to_memory(user_message, ai_response, context, metadata)
+            
+            if success:
+                logger.info("💾 Диалог автоматически сохранен в память")
+            else:
+                logger.warning("⚠️ Не удалось сохранить диалог в память")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка автоматического сохранения: {e}")
+    
+    def extract_preferences_from_response(self, user_message: str, ai_response: str):
+        """
+        Извлекает предпочтения пользователя из диалога и сохраняет их
+        
+        Args:
+            user_message: Сообщение пользователя
+            ai_response: Ответ ИИ
+        """
+        try:
+            # Простые паттерны для извлечения предпочтений
+            preference_patterns = [
+                r"мне нравится (.+?)(?:\.|$)",
+                r"я предпочитаю (.+?)(?:\.|$)",
+                r"лучше всего (.+?)(?:\.|$)",
+                r"хочу (.+?)(?:\.|$)",
+                r"нужно (.+?)(?:\.|$)",
+                r"важно (.+?)(?:\.|$)"
+            ]
+            
+            # Ищем предпочтения в сообщении пользователя
+            for pattern in preference_patterns:
+                matches = re.findall(pattern, user_message.lower())
+                for match in matches:
+                    if len(match) > 10:  # Минимальная длина предпочтения
+                        self.add_user_preference(
+                            match.strip(),
+                            category="user_preference",
+                            metadata={"source": "extracted", "pattern": pattern}
+                        )
+            
+            # Также ищем в ответе ИИ, если там есть подтверждения
+            confirmation_patterns = [
+                r"понял(?:а)?, что вам нравится (.+?)(?:\.|$)",
+                r"запомню, что вы предпочитаете (.+?)(?:\.|$)",
+                r"учту ваше предпочтение (.+?)(?:\.|$)"
+            ]
+            
+            for pattern in confirmation_patterns:
+                matches = re.findall(pattern, ai_response.lower())
+                for match in matches:
+                    if len(match) > 10:
+                        self.add_user_preference(
+                            match.strip(),
+                            category="confirmed_preference",
+                            metadata={"source": "ai_confirmation", "pattern": pattern}
+                        )
+                        
+        except Exception as e:
+            logger.error(f"❌ Ошибка извлечения предпочтений: {e}")
+
+def ensure_wav(audio_path: str) -> str:
+    """Конвертирует аудиофайл в WAV формат если он не WAV"""
+    try:
+        if audio_path.lower().endswith('.wav'):
+            return audio_path
+        
+        # Создаем временный файл
+        temp_dir = os.path.join(os.path.dirname(__file__), "Audio", "temp_convert")
+        os.makedirs(temp_dir, exist_ok=True)
+        wav_path = os.path.join(temp_dir, f"converted_{int(time.time())}.wav")
+        
+        # Конвертируем через ffmpeg
+        cmd = [
+            'ffmpeg', '-i', audio_path, '-acodec', 'pcm_s16le', 
+            '-ar', '16000', '-ac', '1', wav_path, '-y'
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        return wav_path
+    except Exception as e:
+        logger.error(f"Ошибка конвертации в WAV: {e}")
+        return audio_path
 
 def main():
     """Главная функция"""
