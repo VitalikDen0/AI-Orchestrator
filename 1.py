@@ -583,151 +583,6 @@ class ChromaDBManager:
             logger.error(f"❌ Ошибка получения статистики ChromaDB: {e}")
             return {"error": str(e)}
 
-    ### НОВЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С CHROMADB ###
-    
-    def add_to_memory(self, user_message: str, ai_response: str, context: str = "", 
-                     metadata: Dict[str, Any] = None) -> bool:
-        """
-        Добавляет диалог в векторное хранилище памяти
-        
-        Args:
-            user_message: Сообщение пользователя
-            ai_response: Ответ ИИ
-            context: Дополнительный контекст
-            metadata: Дополнительные метаданные
-            
-        Returns:
-            True если успешно добавлено
-        """
-        try:
-            return self.chromadb_manager.add_conversation_memory(
-                user_message, ai_response, context, metadata
-            )
-        except Exception as e:
-            logger.error(f"❌ Ошибка добавления в память: {e}")
-            return False
-    
-    def add_user_preference(self, preference_text: str, category: str = "general", 
-                           metadata: Dict[str, Any] = None) -> bool:
-        """
-        Добавляет предпочтение пользователя в векторное хранилище
-        
-        Args:
-            preference_text: Текст предпочтения
-            category: Категория предпочтения
-            metadata: Дополнительные метаданные
-            
-        Returns:
-            True если успешно добавлено
-        """
-        try:
-            return self.chromadb_manager.add_user_preference(
-                preference_text, category, metadata
-            )
-        except Exception as e:
-            logger.error(f"❌ Ошибка добавления предпочтения: {e}")
-            return False
-    
-    def get_relevant_context(self, query: str, max_context_length: int = 2000) -> str:
-        """
-        Получает релевантный контекст из предыдущих диалогов
-        
-        Args:
-            query: Текущий запрос пользователя
-            max_context_length: Максимальная длина контекста
-            
-        Returns:
-            Строка с релевантным контекстом
-        """
-        try:
-            return self.chromadb_manager.get_conversation_context(query, max_context_length)
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения контекста: {e}")
-            return ""
-    
-    def get_user_preferences(self, query: str = None) -> str:
-        """
-        Получает предпочтения пользователя
-        
-        Args:
-            query: Контекстный запрос (опционально)
-            
-        Returns:
-            Строка с предпочтениями пользователя
-        """
-        try:
-            return self.chromadb_manager.get_user_preferences_summary(query)
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения предпочтений: {e}")
-            return ""
-    
-    def search_similar_conversations(self, query: str, n_results: int = 5, 
-                                   similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
-        """
-        Ищет похожие диалоги в векторном хранилище
-        
-        Args:
-            query: Поисковый запрос
-            n_results: Количество результатов
-            similarity_threshold: Порог схожести (0-1)
-            
-        Returns:
-            Список найденных диалогов
-        """
-        try:
-            return self.chromadb_manager.search_similar_conversations(
-                query, n_results, similarity_threshold
-            )
-        except Exception as e:
-            logger.error(f"❌ Ошибка поиска похожих диалогов: {e}")
-            return []
-    
-    def cleanup_old_memory(self, days_to_keep: int = 30) -> int:
-        """
-        Удаляет старые записи из памяти
-        
-        Args:
-            days_to_keep: Количество дней для хранения записей
-            
-        Returns:
-            Количество удаленных записей
-        """
-        try:
-            return self.chromadb_manager.cleanup_old_records(days_to_keep)
-        except Exception as e:
-            logger.error(f"❌ Ошибка очистки памяти: {e}")
-            return 0
-    
-    def get_memory_stats(self) -> Dict[str, Any]:
-        """
-        Получает статистику памяти
-        
-        Returns:
-            Словарь со статистикой
-        """
-        try:
-            return self.chromadb_manager.get_database_stats()
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения статистики памяти: {e}")
-            return {"error": str(e)}
-    
-    def get_gpu_info(self) -> Dict[str, Any]:
-        """
-        Получает информацию о GPU для ChromaDB
-        
-        Returns:
-            Словарь с информацией о GPU
-        """
-        try:
-            if hasattr(self, 'chromadb_manager') and self.chromadb_manager:
-                return self.chromadb_manager.get_gpu_info()
-            else:
-                return {"error": "ChromaDB не инициализирован"}
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения информации о GPU: {e}")
-            return {"error": str(e)}
-
-
 ### НОВОЕ: Функция для сжатия изображений ###
 def image_to_base64_balanced(image_path: str, max_size=(500, 500), palette_colors=12) -> str:
     """
@@ -5263,6 +5118,150 @@ class AIOrchestrator:
                         
         except Exception as e:
             logger.error(f"❌ Ошибка извлечения предпочтений: {e}")
+
+    ### МЕТОДЫ ДЛЯ РАБОТЫ С CHROMADB ###
+    
+    def add_to_memory(self, user_message: str, ai_response: str, context: str = "", 
+                     metadata: Dict[str, Any] = None) -> bool:
+        """
+        Добавляет диалог в векторное хранилище памяти
+        
+        Args:
+            user_message: Сообщение пользователя
+            ai_response: Ответ ИИ
+            context: Дополнительный контекст
+            metadata: Дополнительные метаданные
+            
+        Returns:
+            True если успешно добавлено
+        """
+        try:
+            return self.chromadb_manager.add_conversation_memory(
+                user_message, ai_response, context, metadata
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления в память: {e}")
+            return False
+    
+    def add_user_preference(self, preference_text: str, category: str = "general", 
+                           metadata: Dict[str, Any] = None) -> bool:
+        """
+        Добавляет предпочтение пользователя в векторное хранилище
+        
+        Args:
+            preference_text: Текст предпочтения
+            category: Категория предпочтения
+            metadata: Дополнительные метаданные
+            
+        Returns:
+            True если успешно добавлено
+        """
+        try:
+            return self.chromadb_manager.add_user_preference(
+                preference_text, category, metadata
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления предпочтения: {e}")
+            return False
+    
+    def get_relevant_context(self, query: str, max_context_length: int = 2000) -> str:
+        """
+        Получает релевантный контекст из предыдущих диалогов
+        
+        Args:
+            query: Текущий запрос пользователя
+            max_context_length: Максимальная длина контекста
+            
+        Returns:
+            Строка с релевантным контекстом
+        """
+        try:
+            return self.chromadb_manager.get_conversation_context(query, max_context_length)
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения контекста: {e}")
+            return ""
+    
+    def get_user_preferences(self, query: str = None) -> str:
+        """
+        Получает предпочтения пользователя
+        
+        Args:
+            query: Контекстный запрос (опционально)
+            
+        Returns:
+            Строка с предпочтениями пользователя
+        """
+        try:
+            return self.chromadb_manager.get_user_preferences_summary(query)
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения предпочтений: {e}")
+            return ""
+    
+    def search_similar_conversations(self, query: str, n_results: int = 5, 
+                                   similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
+        """
+        Ищет похожие диалоги в векторном хранилище
+        
+        Args:
+            query: Поисковый запрос
+            n_results: Количество результатов
+            similarity_threshold: Порог схожести (0-1)
+            
+        Returns:
+            Список найденных диалогов
+        """
+        try:
+            return self.chromadb_manager.search_similar_conversations(
+                query, n_results, similarity_threshold
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка поиска похожих диалогов: {e}")
+            return []
+    
+    def cleanup_old_memory(self, days_to_keep: int = 30) -> int:
+        """
+        Удаляет старые записи из памяти
+        
+        Args:
+            days_to_keep: Количество дней для хранения записей
+            
+        Returns:
+            Количество удаленных записей
+        """
+        try:
+            return self.chromadb_manager.cleanup_old_records(days_to_keep)
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки памяти: {e}")
+            return 0
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """
+        Получает статистику памяти
+        
+        Returns:
+            Словарь со статистикой
+        """
+        try:
+            return self.chromadb_manager.get_database_stats()
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики памяти: {e}")
+            return {"error": str(e)}
+    
+    def get_gpu_info(self) -> Dict[str, Any]:
+        """
+        Получает информацию о GPU для ChromaDB
+        
+        Returns:
+            Словарь с информацией о GPU
+        """
+        try:
+            if hasattr(self, 'chromadb_manager') and self.chromadb_manager:
+                return self.chromadb_manager.get_gpu_info()
+            else:
+                return {"error": "ChromaDB не инициализирован"}
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о GPU: {e}")
+            return {"error": str(e)}
 
 def ensure_wav(audio_path: str) -> str:
     """Конвертирует аудиофайл в WAV формат если он не WAV"""
