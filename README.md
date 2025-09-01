@@ -76,6 +76,10 @@ pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorc
 - Требования: ~4GB VRAM
 p.s. **abliterated** по причине того, что она будет меньше отказывать в действиях
 
+#### Audio модель
+
+- **whisper-large-v3** [whisper-large-v3-q8_0](https://huggingface.co/vonjack/whisper-large-v3-gguf) (Использовал Q8)
+
 #### Vision модель
 
 - **moondream2-050824**
