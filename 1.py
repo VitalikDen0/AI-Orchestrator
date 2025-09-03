@@ -29,7 +29,7 @@ import mss
 import queue
 import logging
 import argparse
-from typing import Dict, Any, List, Union, Optional
+from typing import Dict, Any, List, Union, Optional, TYPE_CHECKING
 import urllib.parse
 from PIL import Image
 from io import BytesIO
@@ -39,6 +39,15 @@ import telegram
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+
+# Помощь статическим анализаторам: явные объявления для опциональных внешних символов
+from typing import Any as _Any
+chromadb: _Any = None
+Settings: _Any = None
+SentenceTransformer: _Any = None
+torch: _Any = None
+_imageio: _Any = None
+_pygame: _Any = None
 
 # Импорты для ChromaDB и векторного поиска
 try:
@@ -52,21 +61,145 @@ except ImportError:
     CHROMADB_AVAILABLE = False
     print("⚠️ ChromaDB не установлен. Установите: pip install chromadb sentence-transformers")
 
+# Проверки доступности опциональных модулей
+try:
+    import torch as _torch
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
+
+try:
+    import diffusers as _diffusers
+    DIFFUSERS_AVAILABLE = True
+except Exception:
+    DIFFUSERS_AVAILABLE = False
+
+try:
+    import imageio as _imageio
+    IMAGEIO_AVAILABLE = True
+except Exception:
+    IMAGEIO_AVAILABLE = False
+
+try:
+    import pygame as _pygame
+    PYGAME_AVAILABLE = True
+except Exception:
+    PYGAME_AVAILABLE = False
+
 # Загружаем переменные окружения из .env файла
 # override=True - перезаписываем существующие переменные
 load_dotenv(override=True)
 
-# Настройка логирования в файл
+# Determine if running in web mode (show verbose console logs)
+IS_WEB = any(arg == '--web' for arg in _sys.argv)
+
+# Настройка логирования: всегда пишем подробный файл, но в консоль показываем INFO только в --web
 log_file = "ai_orchestrator.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file, mode='w', encoding='utf-8'),  # Перезаписываем файл
-        logging.StreamHandler()  # И выводим в консоль
-    ]
-)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+
+# File handler: keep full INFO logs for later inspection
+file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
+# Console handler: verbose only for --web, otherwise warnings+ only
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(file_formatter)
+root_logger.addHandler(console_handler)
+
 logger = logging.getLogger(__name__)
+
+# Disable chromadb telemetry / noisy chromadb logs entirely
+try:
+    chroma_logger = logging.getLogger('chromadb')
+    chroma_logger.disabled = True
+except Exception:
+    pass
+
+# Filter for telemetry messages: only applied to console handler so file logs keep full info
+class TelemetryFilter(logging.Filter):
+    def __init__(self, patterns=None):
+        super().__init__()
+        self.patterns = patterns or ["Failed to send telemetry event", "telemetry", "capture() takes"]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = ''
+        for p in self.patterns:
+            if p in msg:
+                return False
+        return True
+
+# Apply telemetry filter to console only
+try:
+    console_handler.addFilter(TelemetryFilter())
+except Exception:
+    pass
+
+
+class _StderrFilterWriter:
+    """A file-like wrapper for stderr that filters lines containing given patterns."""
+    def __init__(self, orig, patterns):
+        self.orig = orig
+        self.patterns = patterns
+
+    def write(self, data):
+        if not data:
+            return
+        for p in self.patterns:
+            if p in data:
+                return
+        try:
+            self.orig.write(data)
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self.orig.flush()
+        except Exception:
+            pass
+if TYPE_CHECKING:
+    try:
+        import chromadb  # type: ignore
+        from chromadb.config import Settings  # type: ignore
+    except Exception:
+        pass
+    # Stubs for optional heavy libraries so Pylance doesn't warn
+    try:
+        import imageio as _imageio  # type: ignore
+    except Exception:
+        pass
+    try:
+        import pygame as _pygame  # type: ignore
+    except Exception:
+        pass
+    try:
+        import diffusers as _diffusers  # type: ignore
+    except Exception:
+        pass
+    try:
+        import torch as _torch  # type: ignore
+    except Exception:
+        pass
+
+
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_stderr_patterns(patterns):
+    orig = _sys.stderr
+    try:
+        _sys.stderr = _StderrFilterWriter(orig, patterns)
+        yield
+    finally:
+        _sys.stderr = orig
 
 ### НОВОЕ: Класс для работы с векторным хранилищем ChromaDB ###
 class ChromaDBManager:
@@ -105,14 +238,15 @@ class ChromaDBManager:
                 logger.warning("⚠️ ChromaDB недоступен, векторное хранилище отключено")
                 return
             
-            # Инициализируем клиент ChromaDB
-            self.client = chromadb.PersistentClient(
-                path=self.db_path,
-                settings=Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
+            # Инициализируем клиент ChromaDB (подавляем телеметрию в stderr)
+            with suppress_stderr_patterns(["Failed to send telemetry event", "capture() takes", "telemetry"]):
+                self.client = chromadb.PersistentClient(
+                    path=self.db_path,
+                    settings=Settings(
+                        anonymized_telemetry=False,
+                        allow_reset=True
+                    )
                 )
-            )
             
             # Создаем или получаем коллекцию
             self.collection = self.client.get_or_create_collection(
@@ -138,7 +272,11 @@ class ChromaDBManager:
             logger.info(f"✅ Модель эмбеддингов загружена, размерность: {embedding_dim}")
             
             # Проверяем количество записей в базе
-            count = self.collection.count()
+            if self.collection is None:
+                logger.warning("⚠️ Коллекция ChromaDB не инициализирована при попытке получить count")
+                count = 0
+            else:
+                count = self.collection.count()
             logger.info(f"📊 База данных содержит {count} записей")
             
             self.initialized = True
@@ -179,8 +317,8 @@ class ChromaDBManager:
             
         return gpu_info
     
-    def add_conversation_memory(self, user_message: str, ai_response: str, 
-                               context: str = "", metadata: Dict[str, Any] = None) -> bool:
+    def add_conversation_memory(self, user_message: str, ai_response: str,
+                               context: str = "", metadata: Optional[Dict[str, Any]] = None) -> bool:
         """
         Добавляет диалог в векторное хранилище
         
@@ -206,7 +344,10 @@ class ChromaDBManager:
             if context:
                 combined_text += f"\nContext: {context}"
             
-            # Создаем эмбеддинг
+            # Создаем эмбеддинг (если модель доступна)
+            if not self.initialized or self.embedding_model_obj is None:
+                logger.warning("⚠️ Эмбеддинговая модель не инициализирована, пропускаю добавление в ChromaDB")
+                return False
             embedding = self.embedding_model_obj.encode(combined_text).tolist()
             
             # Подготавливаем метаданные
@@ -222,7 +363,10 @@ class ChromaDBManager:
                 record_metadata.update(metadata)
             
             # Добавляем в коллекцию
-            self.collection.add(
+                if self.collection is None:
+                    logger.warning("⚠️ Коллекция ChromaDB не инициализирована при попытке add")
+                    return False
+                self.collection.add(
                 embeddings=[embedding],
                 documents=[combined_text],
                 metadatas=[record_metadata],
@@ -236,8 +380,8 @@ class ChromaDBManager:
             logger.error(f"❌ Ошибка добавления в ChromaDB: {e}")
             return False
     
-    def add_user_preference(self, preference_text: str, category: str = "general", 
-                           metadata: Dict[str, Any] = None) -> bool:
+    def add_user_preference(self, preference_text: str, category: str = "general",
+                           metadata: Optional[Dict[str, Any]] = None) -> bool:
         """
         Добавляет предпочтение пользователя в векторное хранилище
         
@@ -257,7 +401,10 @@ class ChromaDBManager:
             timestamp = int(time.time())
             record_id = f"pref_{timestamp}_{hash(preference_text) % 10000}"
             
-            # Создаем эмбеддинг
+            # Создаем эмбеддинг (если модель доступна)
+            if not self.initialized or self.embedding_model_obj is None:
+                logger.warning("⚠️ Эмбеддинговая модель не инициализирована, пропускаю добавление предпочтения")
+                return False
             embedding = self.embedding_model_obj.encode(preference_text).tolist()
             
             # Подготавливаем метаданные
@@ -272,7 +419,10 @@ class ChromaDBManager:
                 record_metadata.update(metadata)
             
             # Добавляем в коллекцию
-            self.collection.add(
+                if self.collection is None:
+                    logger.warning("⚠️ Коллекция ChromaDB не инициализирована при попытке add preference")
+                    return False
+                self.collection.add(
                 embeddings=[embedding],
                 documents=[preference_text],
                 metadatas=[record_metadata],
@@ -286,7 +436,7 @@ class ChromaDBManager:
             logger.error(f"❌ Ошибка добавления предпочтения в ChromaDB: {e}")
             return False
     
-    def search_similar_conversations(self, query: str, n_results: int = 5, 
+    def search_similar_conversations(self, query: str, n_results: int = 5,
                                    similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
         """
         Ищет похожие диалоги в векторном хранилище
@@ -304,30 +454,56 @@ class ChromaDBManager:
         
         try:
             # Создаем эмбеддинг для запроса
+            if not self.initialized or self.embedding_model_obj is None:
+                logger.warning("⚠️ Эмбеддинговая модель не инициализирована, поиск невозможен")
+                return []
             query_embedding = self.embedding_model_obj.encode(query).tolist()
             
-            # Ищем похожие записи
+            # Ищем похожие записи (если коллекция доступна)
+            if self.collection is None:
+                logger.warning("⚠️ Коллекция ChromaDB не доступна, поиск невозможен")
+                return []
             results = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=n_results,
-                where={"type": "conversation"}
+                where={"type": "conversation"}  # type: ignore[arg-type]
             )
             
             # Фильтруем по порогу схожести
             filtered_results = []
-            if results['distances'] and results['distances'][0]:
-                for i, distance in enumerate(results['distances'][0]):
-                    # ChromaDB возвращает расстояния, конвертируем в схожесть
-                    similarity = 1 - distance
-                    if similarity >= similarity_threshold:
-                        result = {
-                            'id': results['ids'][0][i],
-                            'document': results['documents'][0][i],
-                            'metadata': results['metadatas'][0][i],
-                            'similarity': similarity,
-                            'distance': distance
-                        }
-                        filtered_results.append(result)
+            # Защищаемся от отсутствия ключей или пустых результатов
+            if isinstance(results, dict) and results:
+                distances = results.get('distances')
+                ids = results.get('ids')
+                documents = results.get('documents')
+                metadatas = results.get('metadatas')
+
+                if distances and isinstance(distances, list) and distances and distances[0]:
+                    for i, distance in enumerate(distances[0]):
+                        # ChromaDB возвращает расстояния, конвертируем в схожесть
+                        similarity = 1 - distance
+                        if similarity >= similarity_threshold:
+                            # Проверяем, что остальные структуры содержат нужные элементы
+                            doc = None
+                            meta = None
+                            idv = None
+                            try:
+                                idv = ids[0][i] if ids and ids[0] and len(ids[0]) > i else None
+                                doc = documents[0][i] if documents and documents[0] and len(documents[0]) > i else None
+                                meta = metadatas[0][i] if metadatas and metadatas[0] and len(metadatas[0]) > i else None
+                            except Exception:
+                                idv = None
+                                doc = None
+                                meta = None
+
+                            result = {
+                                'id': idv,
+                                'document': doc,
+                                'metadata': meta,
+                                'similarity': similarity,
+                                'distance': distance
+                            }
+                            filtered_results.append(result)
             
             logger.info(f"🔍 Найдено {len(filtered_results)} похожих диалогов")
             return filtered_results
@@ -336,7 +512,7 @@ class ChromaDBManager:
             logger.error(f"❌ Ошибка поиска в ChromaDB: {e}")
             return []
     
-    def search_user_preferences(self, query: str, category: str = None, 
+    def search_user_preferences(self, query: str, category: Optional[str] = None,
                                n_results: int = 3) -> List[Dict[str, Any]]:
         """
         Ищет предпочтения пользователя
@@ -354,6 +530,9 @@ class ChromaDBManager:
         
         try:
             # Создаем эмбеддинг для запроса
+            if not self.initialized or self.embedding_model_obj is None:
+                logger.warning("⚠️ Эмбеддинговая модель не инициализирована, поиск предпочтений невозможен")
+                return []
             query_embedding = self.embedding_model_obj.encode(query).tolist()
             
             # Формируем условия поиска
@@ -362,24 +541,37 @@ class ChromaDBManager:
                 where_condition["category"] = category
             
             # Ищем похожие записи
+            if self.collection is None:
+                logger.warning("⚠️ Коллекция ChromaDB не доступна, поиск предпочтений невозможен")
+                return []
             results = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=n_results,
-                where=where_condition
+                where=where_condition  # type: ignore[arg-type]
             )
             
             # Формируем результат
             preferences = []
-            if results['documents'] and results['documents'][0]:
-                for i, document in enumerate(results['documents'][0]):
-                    similarity = 1 - results['distances'][0][i]
-                    preference = {
-                        'id': results['ids'][0][i],
-                        'preference_text': document,
-                        'metadata': results['metadatas'][0][i],
-                        'similarity': similarity
-                    }
-                    preferences.append(preference)
+            if isinstance(results, dict) and results:
+                docs = results.get('documents')
+                distances = results.get('distances')
+                ids = results.get('ids')
+                metadatas = results.get('metadatas')
+
+                if docs and isinstance(docs, list) and docs and docs[0]:
+                    for i, document in enumerate(docs[0]):
+                        try:
+                            dist = distances[0][i] if distances and distances[0] and len(distances[0]) > i else None
+                            sim = 1 - dist if dist is not None else 0.0
+                            pref = {
+                                'id': ids[0][i] if ids and ids[0] and len(ids[0]) > i else None,
+                                'preference_text': document,
+                                'metadata': metadatas[0][i] if metadatas and metadatas[0] and len(metadatas[0]) > i else {},
+                                'similarity': sim
+                            }
+                            preferences.append(pref)
+                        except Exception:
+                            continue
             
             logger.info(f"🔍 Найдено {len(preferences)} предпочтений пользователя")
             return preferences
@@ -432,7 +624,7 @@ class ChromaDBManager:
             logger.error(f"❌ Ошибка получения контекста из ChromaDB: {e}")
             return ""
     
-    def get_user_preferences_summary(self, query: str = None) -> str:
+    def get_user_preferences_summary(self, query: Optional[str] = None) -> str:
         """
         Получает краткое резюме предпочтений пользователя
         
@@ -451,16 +643,20 @@ class ChromaDBManager:
                 preferences = self.search_user_preferences(query, n_results=5)
             else:
                 # Получаем все предпочтения
-                results = self.collection.get(where={"type": "preference"})
+                results = self.collection.get(where={"type": "preference"})  # type: ignore[arg-type]
                 preferences = []
-                if results['documents']:
-                    for i, doc in enumerate(results['documents']):
-                        preference = {
-                            'preference_text': doc,
-                            'metadata': results['metadatas'][i],
-                            'similarity': 1.0  # Для общих предпочтений
-                        }
-                        preferences.append(preference)
+                if isinstance(results, dict) and results:
+                    docs = results.get('documents')
+                    metadatas = results.get('metadatas')
+                    if docs:
+                        for i, doc in enumerate(docs):
+                            pref_meta = metadatas[i] if metadatas and len(metadatas) > i else {}
+                            preference = {
+                                'preference_text': doc,
+                                'metadata': pref_meta,
+                                'similarity': 1.0  # Для общих предпочтений
+                            }
+                            preferences.append(preference)
             
             if not preferences:
                 return ""
@@ -497,20 +693,35 @@ class ChromaDBManager:
             cutoff_timestamp = int(time.time()) - (days_to_keep * 24 * 60 * 60)
             
             # Получаем все записи
-            results = self.collection.get()
-            
-            if not results['ids']:
+            if self.collection is None:
+                logger.warning("⚠️ Коллекция ChromaDB не доступна, очистка записей пропущена")
                 return 0
-            
+            results = self.collection.get()
+
+            # Защита от отсутствия ключей/пустых результатов
+            if not isinstance(results, dict) or not results:
+                return 0
+
+            ids = results.get('ids')
+            metadatas = results.get('metadatas')
+            if not ids:
+                return 0
+
             # Находим записи для удаления
             ids_to_delete = []
-            for i, metadata in enumerate(results['metadatas']):
-                timestamp = metadata.get('timestamp', 0)
-                if timestamp < cutoff_timestamp:
-                    ids_to_delete.append(results['ids'][i])
+            if metadatas:
+                for i, metadata in enumerate(metadatas):
+                    timestamp = metadata.get('timestamp', 0) if isinstance(metadata, dict) else 0
+                    if timestamp < cutoff_timestamp:
+                        # Защищаем доступ к ids
+                        if ids and len(ids) > i:
+                            ids_to_delete.append(ids[i])
             
             # Удаляем старые записи
             if ids_to_delete:
+                if self.collection is None:
+                    logger.warning("⚠️ Коллекция ChromaDB не доступна, удаление невозможно")
+                    return 0
                 self.collection.delete(ids=ids_to_delete)
                 logger.info(f"🧹 Удалено {len(ids_to_delete)} старых записей из ChromaDB")
                 return len(ids_to_delete)
@@ -532,47 +743,22 @@ class ChromaDBManager:
             return {"error": "ChromaDB не инициализирован"}
         
         try:
-            total_count = self.collection.count()
-            
-            # Подсчитываем по типам
-            conversations = self.collection.get(where={"type": "conversation"})
-            preferences = self.collection.get(where={"type": "preference"})
-            
-            stats = {
-                "total_records": total_count,
-                "conversations": len(conversations['ids']) if conversations['ids'] else 0,
-                "preferences": len(preferences['ids']) if preferences['ids'] else 0,
-                "database_path": self.db_path,
-                "embedding_model": self.embedding_model
-            }
-            
-            return stats
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения статистики ChromaDB: {e}")
-            return {"error": str(e)}
+            if self.collection is None:
+                logger.warning("⚠️ Коллекция ChromaDB не доступна, статистика недоступна")
+                return {"error": "ChromaDB не инициализирован"}
 
-    def get_database_stats(self) -> Dict[str, Any]:
-        """
-        Получает статистику базы данных
-        
-        Returns:
-            Словарь со статистикой
-        """
-        if not self.initialized:
-            return {"error": "ChromaDB не инициализирован"}
-        
-        try:
             total_count = self.collection.count()
-            
             # Подсчитываем по типам
-            conversations = self.collection.get(where={"type": "conversation"})
-            preferences = self.collection.get(where={"type": "preference"})
-            
+            conversations = self.collection.get(where={"type": "conversation"})  # type: ignore[arg-type]
+            preferences = self.collection.get(where={"type": "preference"})  # type: ignore[arg-type]
+
+            conv_ids = conversations.get('ids') if isinstance(conversations, dict) else None
+            pref_ids = preferences.get('ids') if isinstance(preferences, dict) else None
+
             stats = {
                 "total_records": total_count,
-                "conversations": len(conversations['ids']) if conversations['ids'] else 0,
-                "preferences": len(preferences['ids']) if preferences['ids'] else 0,
+                "conversations": len(conv_ids) if conv_ids else 0,
+                "preferences": len(pref_ids) if pref_ids else 0,
                 "database_path": self.db_path,
                 "embedding_model": self.embedding_model
             }
@@ -641,11 +827,11 @@ class AIOrchestrator:
                 frames.append((timecode, b64))
             return frames
         except Exception as e:
-            logger.error(f"Ошибка извлечения кадров: {e}")
+            self.logger.error(f"Ошибка извлечения кадров: {e}")
             return []
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
-    def download_youtube_video(self, url: str, out_dir: Optional[str] = None) -> str:
+    def download_youtube_video(self, url: str, out_dir: Optional[str] = None) -> Optional[str]:
         """
         Скачивает видео с YouTube по ссылке (использует yt-dlp)
         Возвращает путь к mp4-файлу или пустую строку
@@ -661,9 +847,9 @@ class AIOrchestrator:
         
         if cookies_path and self.check_cookies_validity(cookies_path):
             use_cookies = True
-            logger.info("🍪 Использую cookies для аутентификации YouTube")
+            self.logger.info("🍪 Использую cookies для аутентификации YouTube")
         else:
-            logger.info("ℹ️ Cookies не найдены или невалидны, использую базовые параметры")
+            self.logger.info("ℹ️ Cookies не найдены или невалидны, использую базовые параметры")
             if not cookies_path:
                 self.suggest_cookies_update()
         
@@ -682,48 +868,48 @@ class AIOrchestrator:
         ]
         
         # Добавляем cookies если доступны
-        if use_cookies:
-            base_cmd.extend(["--cookies", cookies_path])
+        if cookies_path:
+            base_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
         
         # Добавляем URL в конец
         cmd = base_cmd + [url]
         
         try:
-            logger.info(f"Скачиваю видео с YouTube: {url}")
+            self.logger.info(f"Скачиваю видео с YouTube: {url}")
             # Логируем команду в одну строку для избежания обрезания
             cmd_str = " ".join(cmd)
-            logger.info(f"Команда: {cmd_str}")
+            self.logger.info(f"Команда: {cmd_str}")
             
             # Запускаем с таймаутом
             result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
             
             if result.stdout:
-                logger.info(f"yt-dlp stdout: {result.stdout}")
+                self.logger.info(f"yt-dlp stdout: {result.stdout}")
             if result.stderr:
-                logger.warning(f"yt-dlp stderr: {result.stderr}")
+                self.logger.warning(f"yt-dlp stderr: {result.stderr}")
             
             # Найти скачанный файл
             for fname in os.listdir(out_dir):
                 if fname.startswith("yt_video") and fname.endswith('.mp4'):
-                    logger.info(f"✅ Видео успешно скачано: {fname}")
+                    self.logger.info(f"✅ Видео успешно скачано: {fname}")
                     return os.path.join(out_dir, fname)
             
-            logger.warning("⚠️ Файл не найден после скачивания")
+            self.logger.warning("⚠️ Файл не найден после скачивания")
             return ""
             
         except subprocess.TimeoutExpired:
-            logger.error("❌ Таймаут скачивания видео (5 минут)")
+            self.logger.error("❌ Таймаут скачивания видео (5 минут)")
             return ""
         except subprocess.CalledProcessError as e:
-            logger.error(f"❌ Ошибка yt-dlp: {e}")
+            self.logger.error(f"❌ Ошибка yt-dlp: {e}")
             if e.stderr:
-                logger.error(f"stderr: {e.stderr}")
+                self.logger.error(f"stderr: {e.stderr}")
             return ""
         except Exception as e:
-            logger.error(f"❌ Неожиданная ошибка скачивания видео: {e}")
+            self.logger.error(f"❌ Неожиданная ошибка скачивания видео: {e}")
             
             # Пробуем альтернативный метод с другими параметрами
-            logger.info("🔄 Пробую альтернативный метод скачивания...")
+            self.logger.info("🔄 Пробую альтернативный метод скачивания...")
             try:
                 alt_cmd = [
                     "yt-dlp",
@@ -738,27 +924,27 @@ class AIOrchestrator:
                 ]
                 
                 # Добавляем cookies если доступны
-                if use_cookies:
-                    alt_cmd.extend(["--cookies", cookies_path])
+                if cookies_path:
+                    alt_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
                 
                 alt_cmd.append(url)
                 
                 # Логируем команду в одну строку
                 alt_cmd_str = " ".join(alt_cmd)
-                logger.info(f"Альтернативная команда: {alt_cmd_str}")
+                self.logger.info(f"Альтернативная команда: {alt_cmd_str}")
                 result = subprocess.run(alt_cmd, check=True, capture_output=True, text=True, timeout=300)
                 
                 # Найти скачанный файл
                 for fname in os.listdir(out_dir):
                     if fname.startswith("yt_video") and fname.endswith('.mp4'):
-                        logger.info(f"✅ Видео успешно скачано альтернативным методом: {fname}")
+                        self.logger.info(f"✅ Видео успешно скачано альтернативным методом: {fname}")
                         return os.path.join(out_dir, fname)
                         
             except Exception as alt_e:
-                logger.error(f"❌ Альтернативный метод также не сработал: {alt_e}")
+                self.logger.error(f"❌ Альтернативный метод также не сработал: {alt_e}")
                 
                 # Пробуем третий метод с максимально простыми параметрами
-                logger.info("🔄 Пробую третий метод (минимальные параметры)...")
+                self.logger.info("🔄 Пробую третий метод (минимальные параметры)...")
                 try:
                     simple_cmd = [
                         "yt-dlp",
@@ -768,26 +954,25 @@ class AIOrchestrator:
                         "-f", "best",
                         "-o", out_path
                     ]
-                    
                     # Добавляем cookies если доступны
-                    if use_cookies:
-                        simple_cmd.extend(["--cookies", cookies_path])
-                    
+                    if use_cookies and cookies_path:
+                        simple_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
+
                     simple_cmd.append(url)
                     
                     # Логируем команду в одну строку
                     simple_cmd_str = " ".join(simple_cmd)
-                    logger.info(f"Третий метод: {simple_cmd_str}")
+                    self.logger.info(f"Третий метод: {simple_cmd_str}")
                     result = subprocess.run(simple_cmd, check=True, capture_output=True, text=True, timeout=300)
                     
                     # Найти скачанный файл
                     for fname in os.listdir(out_dir):
                         if fname.startswith("yt_video") and fname.endswith('.mp4'):
-                            logger.info(f"✅ Видео успешно скачано третьим методом: {fname}")
+                            self.logger.info(f"✅ Видео успешно скачано третьим методом: {fname}")
                             return os.path.join(out_dir, fname)
                             
                 except Exception as simple_e:
-                    logger.error(f"❌ Третий метод также не сработал: {simple_e}")
+                    self.logger.error(f"❌ Третий метод также не сработал: {simple_e}")
             
             return ""
     
@@ -801,22 +986,22 @@ class AIOrchestrator:
             response = requests.get("https://ifconfig.me", timeout=10)
             if response.status_code == 200:
                 ip = response.text.strip()
-                logger.info(f"🌐 Текущий IP адрес: {ip}")
+                self.logger.info(f"🌐 Текущий IP адрес: {ip}")
                 
                 # Проверяем, не из РФ ли IP
                 ru_ips = ["185.", "31.", "46.", "37.", "95.", "178.", "79.", "5.", "176.", "195."]
                 if any(ip.startswith(prefix) for prefix in ru_ips):
-                    logger.warning("⚠️ IP адрес похож на российский. VPN может не работать корректно.")
+                    self.logger.warning("⚠️ IP адрес похож на российский. VPN может не работать корректно.")
                     return False
                 else:
-                    logger.info("✅ IP адрес не из РФ. VPN работает.")
+                    self.logger.info("✅ IP адрес не из РФ. VPN работает.")
                     return True
             else:
-                logger.warning(f"⚠️ Не удалось проверить IP: {response.status_code}")
+                self.logger.warning(f"⚠️ Не удалось проверить IP: {response.status_code}")
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки VPN: {e}")
+            self.logger.error(f"❌ Ошибка проверки VPN: {e}")
             return False
 
     def get_youtube_info(self, url: str) -> dict:
@@ -824,13 +1009,14 @@ class AIOrchestrator:
         Получает информацию о YouTube видео без скачивания
         """
         try:
+            import json
             # Проверяем наличие cookies
             cookies_path = self.get_youtube_cookies_path()
             use_cookies = False
             
             if cookies_path and self.check_cookies_validity(cookies_path):
                 use_cookies = True
-                logger.info("🍪 Использую cookies для получения информации о видео")
+                self.logger.info("🍪 Использую cookies для получения информации о видео")
             
             # Базовые параметры для yt-dlp
             base_cmd = [
@@ -845,12 +1031,12 @@ class AIOrchestrator:
             
             # Добавляем cookies если доступны
             if use_cookies:
-                base_cmd.extend(["--cookies", cookies_path])
+                base_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
             
             # Добавляем URL в конец
             cmd = base_cmd + [url]
             
-            logger.info("📋 Получаю информацию о YouTube видео...")
+            self.logger.info("📋 Получаю информацию о YouTube видео...")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             
             if result.returncode == 0 and result.stdout:
@@ -861,7 +1047,7 @@ class AIOrchestrator:
                     duration = info.get('duration', 0)
                     uploader = info.get('uploader', 'Неизвестный автор')
                     
-                    logger.info(f"✅ Информация получена: {title} ({duration}с) от {uploader}")
+                    self.logger.info(f"✅ Информация получена: {title} ({duration}с) от {uploader}")
                     return {
                         'title': title,
                         'duration': duration,
@@ -869,13 +1055,13 @@ class AIOrchestrator:
                         'success': True
                     }
                 except json.JSONDecodeError:
-                    logger.error("❌ Ошибка парсинга JSON информации о видео")
+                    self.logger.error("❌ Ошибка парсинга JSON информации о видео")
                     return {'success': False, 'error': 'JSON parse error'}
             else:
-                logger.error(f"❌ Не удалось получить информацию: {result.stderr}")
+                self.logger.error(f"❌ Не удалось получить информацию: {result.stderr}")
                 
                 # Пробуем альтернативный метод без Android клиента
-                logger.info("🔄 Пробую альтернативный метод получения информации...")
+                self.logger.info("🔄 Пробую альтернативный метод получения информации...")
                 try:
                     alt_cmd = [
                         "yt-dlp",
@@ -889,11 +1075,11 @@ class AIOrchestrator:
                     
                     # Добавляем cookies если доступны
                     if use_cookies:
-                        alt_cmd.extend(["--cookies", cookies_path])
+                        alt_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
                     
                     alt_cmd.append(url)
                     
-                    logger.info("🔄 Альтернативная команда для получения информации...")
+                    self.logger.info("🔄 Альтернативная команда для получения информации...")
                     alt_result = subprocess.run(alt_cmd, capture_output=True, text=True, timeout=60)
                     
                     if alt_result.returncode == 0 and alt_result.stdout:
@@ -904,7 +1090,7 @@ class AIOrchestrator:
                             duration = info.get('duration', 0)
                             uploader = info.get('uploader', 'Неизвестный автор')
                             
-                            logger.info(f"✅ Информация получена альтернативным методом: {title} ({duration}с) от {uploader}")
+                            self.logger.info(f"✅ Информация получена альтернативным методом: {title} ({duration}с) от {uploader}")
                             return {
                                 'title': title,
                                 'duration': duration,
@@ -912,18 +1098,18 @@ class AIOrchestrator:
                                 'success': True
                             }
                         except json.JSONDecodeError:
-                            logger.error("❌ Ошибка парсинга JSON альтернативным методом")
+                            self.logger.error("❌ Ошибка парсинга JSON альтернативным методом")
                             return {'success': False, 'error': 'JSON parse error (alt method)'}
                     else:
-                        logger.error(f"❌ Альтернативный метод также не сработал: {alt_result.stderr}")
+                        self.logger.error(f"❌ Альтернативный метод также не сработал: {alt_result.stderr}")
                         return {'success': False, 'error': result.stderr}
                         
                 except Exception as alt_e:
-                    logger.error(f"❌ Ошибка альтернативного метода: {alt_e}")
+                    self.logger.error(f"❌ Ошибка альтернативного метода: {alt_e}")
                     return {'success': False, 'error': result.stderr}
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка получения информации о видео: {e}")
+            self.logger.error(f"❌ Ошибка получения информации о видео: {e}")
             return {'success': False, 'error': str(e)}
 
     def check_youtube_accessibility(self, url: str) -> bool:
@@ -937,7 +1123,7 @@ class AIOrchestrator:
             
             if cookies_path and self.check_cookies_validity(cookies_path):
                 use_cookies = True
-                logger.info("🍪 Использую cookies для проверки доступности")
+                self.logger.info("🍪 Использую cookies для проверки доступности")
             
             # Базовые параметры для yt-dlp
             base_cmd = [
@@ -952,22 +1138,22 @@ class AIOrchestrator:
             
             # Добавляем cookies если доступны
             if use_cookies:
-                base_cmd.extend(["--cookies", cookies_path])
+                base_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
             
             # Добавляем URL в конец
             test_cmd = base_cmd + [url]
             
-            logger.info("🔍 Проверяю доступность YouTube ссылки...")
+            self.logger.info("🔍 Проверяю доступность YouTube ссылку...")
             result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=60)
             
             if result.returncode == 0:
-                logger.info("✅ YouTube ссылка доступна")
+                self.logger.info("✅ YouTube ссылка доступна")
                 return True
             else:
-                logger.warning(f"⚠️ YouTube ссылка недоступна: {result.stderr}")
+                self.logger.warning(f"⚠️ YouTube ссылка недоступна: {result.stderr}")
                 
                 # Пробуем альтернативный метод с web клиентом
-                logger.info("🔄 Пробую альтернативный метод проверки...")
+                self.logger.info("🔄 Пробую альтернативный метод проверки...")
                 try:
                     alt_test_cmd = [
                         "yt-dlp",
@@ -981,25 +1167,25 @@ class AIOrchestrator:
                     
                     # Добавляем cookies если доступны
                     if use_cookies:
-                        alt_test_cmd.extend(["--cookies", cookies_path])
+                        alt_test_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
                     
                     alt_test_cmd.append(url)
                     
                     alt_result = subprocess.run(alt_test_cmd, capture_output=True, text=True, timeout=60)
                     
                     if alt_result.returncode == 0:
-                        logger.info("✅ YouTube ссылка доступна через альтернативный метод")
+                        self.logger.info("✅ YouTube ссылка доступна через альтернативный метод")
                         return True
                     else:
-                        logger.warning(f"⚠️ YouTube ссылка недоступна и через альтернативный метод: {alt_result.stderr}")
+                        self.logger.warning(f"⚠️ YouTube ссылка недоступна и через альтернативный метод: {alt_result.stderr}")
                         return False
                         
                 except Exception as alt_e:
-                    logger.error(f"❌ Ошибка альтернативной проверки: {alt_e}")
+                    self.logger.error(f"❌ Ошибка альтернативной проверки: {alt_e}")
                     return False
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки доступности YouTube: {e}")
+            self.logger.error(f"❌ Ошибка проверки доступности YouTube: {e}")
             return False
 
     def _auto_load_brain_model(self):
@@ -1016,15 +1202,15 @@ class AIOrchestrator:
                             model_loaded = True
                             # Сохраняем короткий ID модели для API вызовов
                             self.brain_model_id = m.get("id")
-                            logger.info(f"✅ Модель мозга уже загружена: {os.path.basename(self.brain_model)} (ID: {self.brain_model_id})")
+                            self.logger.info(f"✅ Модель мозга уже загружена: {os.path.basename(self.brain_model)} (ID: {self.brain_model_id})")
                             return
                 else:
-                    logger.warning(f"⚠️ Не удалось проверить статус моделей: {resp.status_code}")
+                    self.logger.warning(f"⚠️ Не удалось проверить статус моделей: {resp.status_code}")
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка проверки статуса моделей: {e}")
+                self.logger.warning(f"⚠️ Ошибка проверки статуса моделей: {e}")
             
             # Если модель не загружена, пытаемся загрузить
-            logger.info(f"🧠 Автоматически загружаю модель мозга: {os.path.basename(self.brain_model)}")
+            self.logger.info(f"🧠 Автоматически загружаю модель мозга: {os.path.basename(self.brain_model)}")
             
             # Пытаемся загрузить модель через API
             payload = {
@@ -1035,26 +1221,26 @@ class AIOrchestrator:
             try:
                 resp = requests.post(f"{self.lm_studio_url}/v1/models/load", json=payload, timeout=30)
                 if resp.status_code == 200:
-                    logger.info("✅ Модель мозга успешно загружена через API")
+                    self.logger.info("✅ Модель мозга успешно загружена через API")
                     # Получаем короткий ID модели после загрузки
                     self._update_brain_model_id()
                 else:
-                    logger.warning(f"⚠️ Не удалось загрузить модель через API: {resp.status_code}")
+                    self.logger.warning(f"⚠️ Не удалось загрузить модель через API: {resp.status_code}")
                     # Пробуем запустить через LM Studio
                     self.launch_model(self.brain_model)
-                    logger.info("🔄 Запускаю модель через LM Studio...")
+                    self.logger.info("🔄 Запускаю модель через LM Studio...")
                     # Пытаемся получить ID модели после запуска
                     self._update_brain_model_id()
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка API загрузки модели: {e}")
+                self.logger.warning(f"⚠️ Ошибка API загрузки модели: {e}")
                 # Пробуем запустить через LM Studio
                 self.launch_model(self.brain_model)
-                logger.info("🔄 Запускаю модель через LM Studio...")
+                self.logger.info("🔄 Запускаю модель через LM Studio...")
                 # Пытаемся получить ID модели после запуска
                 self._update_brain_model_id()
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка автозагрузки модели мозга: {e}")
+            self.logger.error(f"❌ Ошибка автозагрузки модели мозга: {e}")
     
     def _update_brain_model_id(self):
         """Обновляет короткий ID модели мозга из API"""
@@ -1065,27 +1251,27 @@ class AIOrchestrator:
                 for m in data.get("data", []):
                     if self.brain_model in m.get("id", "") and m.get("isLoaded", False):
                         self.brain_model_id = m.get("id")
-                        logger.info(f"✅ Обновлен ID модели мозга: {self.brain_model_id}")
+                        self.logger.info(f"✅ Обновлен ID модели мозга: {self.brain_model_id}")
                         return
-                logger.warning("⚠️ Не удалось найти загруженную модель для получения ID")
+                self.logger.warning("⚠️ Не удалось найти загруженную модель для получения ID")
             else:
-                logger.warning(f"⚠️ Не удалось получить список моделей для обновления ID: {resp.status_code}")
+                self.logger.warning(f"⚠️ Не удалось получить список моделей для обновления ID: {resp.status_code}")
         except Exception as e:
-            logger.warning(f"⚠️ Ошибка обновления ID модели мозга: {e}")
+            self.logger.warning(f"⚠️ Ошибка обновления ID модели мозга: {e}")
     
     def _check_ffmpeg(self):
         """Проверяет наличие ffmpeg в системе для конвертации аудио"""
         try:
             result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
-                logger.info("✅ ffmpeg найден в системе")
+                self.logger.info("✅ ffmpeg найден в системе")
             else:
-                logger.warning("⚠️ ffmpeg найден, но не может быть запущен")
+                self.logger.warning("⚠️ ffmpeg найден, но не может быть запущен")
         except (subprocess.CalledProcessError, FileNotFoundError):
-            logger.warning("⚠️ ffmpeg не найден в системе. Установите ffmpeg для конвертации аудио.")
-            logger.info("💡 Скачайте с https://ffmpeg.org/download.html")
+            self.logger.warning("⚠️ ffmpeg не найден в системе. Установите ffmpeg для конвертации аудио.")
+            self.logger.info("💡 Скачайте с https://ffmpeg.org/download.html")
         except Exception as e:
-            logger.warning(f"⚠️ Ошибка проверки ffmpeg: {e}")
+            self.logger.warning(f"⚠️ Ошибка проверки ffmpeg: {e}")
     
     def is_model_running(self, model_name: str) -> bool:
         """
@@ -1100,7 +1286,7 @@ class AIOrchestrator:
                         return True
             return False
         except Exception as e:
-            logger.error(f"Ошибка проверки модели {model_name}: {e}")
+            self.logger.error(f"Ошибка проверки модели {model_name}: {e}")
             return False
 
     def get_model_context_info(self) -> Dict[str, int]:
@@ -1122,7 +1308,7 @@ class AIOrchestrator:
                     for term in search_terms:
                         if term.lower() in model_id:
                             target_model = m
-                            logger.info(f"🎯 Найдена модель: {m.get('id')}")
+                            self.logger.info(f"🎯 Найдена модель: {m.get('id')}")
                             break
                     if target_model:
                         break
@@ -1136,16 +1322,16 @@ class AIOrchestrator:
                     # Если не удалось получить через чат, сохраняем ID модели для использования
                     if not hasattr(self, 'brain_model_id') or not self.brain_model_id:
                         self.brain_model_id = target_model.get("id")
-                        logger.info(f"✅ Сохранен ID модели мозга: {self.brain_model_id}")
+                        self.logger.info(f"✅ Сохранен ID модели мозга: {self.brain_model_id}")
                 
             # Если не удалось получить информацию, используем значения по умолчанию
-            logger.warning("⚠️ Не удалось получить информацию о контексте модели, используем значения по умолчанию")
+            self.logger.warning("⚠️ Не удалось получить информацию о контексте модели, используем значения по умолчанию")
             return {
                 "max_context": 262144,
                 "safe_context": 32768
             }
         except Exception as e:
-            logger.warning(f"⚠️ Ошибка получения информации о контексте модели: {e}")
+            self.logger.warning(f"⚠️ Ошибка получения информации о контексте модели: {e}")
             return {
                 "max_context": 262144,
                 "safe_context": 32768
@@ -1183,7 +1369,7 @@ class AIOrchestrator:
                     
                     if context_length:
                         safe_context = max(context_length // 8, 32768)
-                        logger.info(f"✅ Найден context_length в stats: {context_length}")
+                        self.logger.info(f"✅ Найден context_length в stats: {context_length}")
                         return {
                             "max_context": context_length,
                             "safe_context": safe_context
@@ -1192,16 +1378,16 @@ class AIOrchestrator:
                 # Проверяем другие поля на предмет информации о контексте
                 for key, value in data.items():
                     if isinstance(value, dict) and ("context" in key.lower() or "token" in key.lower()):
-                        logger.debug(f"🔍 Проверяем поле {key}: {value}")
+                        self.logger.debug(f"🔍 Проверяем поле {key}: {value}")
                 
-                logger.debug("❌ Информация о контексте не найдена в ответе модели")
+                self.logger.debug("❌ Информация о контексте не найдена в ответе модели")
                 return None
             else:
-                logger.warning(f"❌ Ошибка запроса к модели: {resp.status_code}")
+                self.logger.warning(f"❌ Ошибка запроса к модели: {resp.status_code}")
                 return None
                 
         except Exception as e:
-            logger.warning(f"❌ Ошибка получения информации через чат: {e}")
+            self.logger.warning(f"❌ Ошибка получения информации через чат: {e}")
             return None
 
     def _initialize_dynamic_context(self):
@@ -1212,9 +1398,9 @@ class AIOrchestrator:
             context_info = self.get_model_context_info()
             self.max_context_length = context_info["max_context"]
             self.safe_context_length = context_info["safe_context"]
-            logger.info(f"📊 Контекст инициализирован: максимум {self.max_context_length:,}, безопасный {self.safe_context_length:,}")
+            self.logger.info(f"📊 Контекст инициализирован: максимум {self.max_context_length:,}, безопасный {self.safe_context_length:,}")
         except Exception as e:
-            logger.warning(f"⚠️ Ошибка инициализации динамического контекста: {e}")
+            self.logger.warning(f"⚠️ Ошибка инициализации динамического контекста: {e}")
             # Оставляем значения по умолчанию
             self.max_context_length = 262144
             self.safe_context_length = 32768
@@ -1227,15 +1413,15 @@ class AIOrchestrator:
         if self.current_context_length > self.max_context_length:
             # Критический лимит - агрессивная обрезка
             self.conversation_history = self.conversation_history[-2:]  # Оставляем только 2 последних сообщения
-            logger.warning(f"Критическое превышение контекста ({self.current_context_length:,} > {self.max_context_length:,}) - агрессивная обрезка истории")
+            self.logger.warning(f"Критическое превышение контекста ({self.current_context_length:,} > {self.max_context_length:,}) - агрессивная обрезка истории")
         elif self.current_context_length > self.safe_context_length:
             # Превышение безопасного лимита - аккуратная обрезка
             self.conversation_history = self.conversation_history[-5:]  # Оставляем только 5 последних сообщений
-            logger.warning(f"Превышение безопасного контекста ({self.current_context_length:,} > {self.safe_context_length:,}) - аккуратная обрезка истории")
+            self.logger.warning(f"Превышение безопасного контекста ({self.current_context_length:,} > {self.safe_context_length:,}) - аккуратная обрезка истории")
         elif self.current_context_length > self.safe_context_length * 0.8:
             # Приближение к безопасному лимиту - профилактическая обрезка
             self.conversation_history = self.conversation_history[-10:]  # Оставляем только 10 последних сообщений
-            logger.info(f"Приближение к безопасному лимиту ({self.current_context_length:,} > {self.safe_context_length * 0.8:,}) - профилактическая обрезка истории")
+            self.logger.info(f"Приближение к безопасному лимиту ({self.current_context_length:,} > {self.safe_context_length * 0.8:,}) - профилактическая обрезка истории")
 
     def launch_model(self, model_path: str):
         """
@@ -1244,10 +1430,10 @@ class AIOrchestrator:
         try:
             # threading уже импортирован в начале файла
             lmstudio_exe = os.getenv("LMSTUDIO_EXE", r"C:\Program Files\LM Studio\LM Studio.exe")
-            logger.info(f"Запускаю модель: {model_path}")
+            self.logger.info(f"Запускаю модель: {model_path}")
             threading.Thread(target=lambda: os.system(f'"{lmstudio_exe}" --model "{model_path}"'), daemon=True).start()
         except Exception as e:
-            logger.error(f"Ошибка запуска модели: {e}")
+            self.logger.error(f"Ошибка запуска модели: {e}")
 
     def ask_qwen(self, question: str) -> Optional[str]:
         """Запрос к Qwen для генерации промтов изображений
@@ -1271,10 +1457,10 @@ class AIOrchestrator:
                 result = resp.json()
                 return result["choices"][0]["message"]["content"].strip()
             else:
-                logger.error(f"Ошибка Qwen: {resp.status_code} - {resp.text}")
+                self.logger.error(f"Ошибка Qwen: {resp.status_code} - {resp.text}")
                 return None
         except Exception as e:
-            logger.error(f"Ошибка запроса к Qwen: {e}")
+            self.logger.error(f"Ошибка запроса к Qwen: {e}")
             return None
 
     def get_youtube_cookies_path(self) -> Optional[str]:
@@ -1287,17 +1473,17 @@ class AIOrchestrator:
         # Сначала ищем в текущей рабочей директории
         cookies_path = os.path.join(os.getcwd(), cookies_file)
         if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
-            logger.info(f"🍪 Найден файл cookies в рабочей директории: {cookies_file}")
+            self.logger.info(f"🍪 Найден файл cookies в рабочей директории: {cookies_file}")
             return cookies_path
         
         # Затем ищем в директории скрипта
         cookies_path = os.path.join(os.path.dirname(__file__), cookies_file)
         if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
-            logger.info(f"🍪 Найден файл cookies в директории скрипта: {cookies_file}")
+            self.logger.info(f"🍪 Найден файл cookies в директории скрипта: {cookies_file}")
             return cookies_path
         
         # Если файл не найден нигде
-        logger.info(f"ℹ️ Файл cookies не найден: {cookies_file}")
+        self.logger.info(f"ℹ️ Файл cookies не найден: {cookies_file}")
         return None
 
     def check_cookies_validity(self, cookies_path: str) -> bool:
@@ -1317,30 +1503,30 @@ class AIOrchestrator:
             has_youtube = any(domain in content for domain in youtube_domains)
             
             if not has_youtube:
-                logger.warning("⚠️ В файле cookies не найдены домены YouTube")
+                self.logger.warning("⚠️ В файле cookies не найдены домены YouTube")
                 return False
                 
             # Проверяем формат (должен содержать табуляции)
             if '\t' not in content:
-                logger.warning("⚠️ Неверный формат файла cookies (отсутствуют табуляции)")
+                self.logger.warning("⚠️ Неверный формат файла cookies (отсутствуют табуляции)")
                 return False
                 
-            logger.info("✅ Файл cookies валиден")
+            self.logger.info("✅ Файл cookies валиден")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки cookies: {e}")
+            self.logger.error(f"❌ Ошибка проверки cookies: {e}")
             return False
 
     def suggest_cookies_update(self):
         """
         Предлагает пользователю обновить cookies
         """
-        logger.info("💡 Для улучшения работы с YouTube рекомендуется:")
-        logger.info("   1. Запустить: python extract_chrome_cookies.py")
-        logger.info("   2. Закрыть Chrome перед извлечением")
-        logger.info("   3. Войти в YouTube через VPN")
-        logger.info("   4. Cookies обновляются каждые 2-3 месяца")
+        self.logger.info("💡 Для улучшения работы с YouTube рекомендуется:")
+        self.logger.info("   1. Запустить: python extract_chrome_cookies.py")
+        self.logger.info("   2. Закрыть Chrome перед извлечением")
+        self.logger.info("   3. Войти в YouTube через VPN")
+        self.logger.info("   4. Cookies обновляются каждые 2-3 месяца")
 
     def generate_image_stable_diffusion(self, prompt: str, negative_prompt: str, params: dict) -> Optional[str]:
         """Генерация изображения через прямую интеграцию со Stable Diffusion"""
@@ -1348,7 +1534,7 @@ class AIOrchestrator:
         
         # Автоматически включаем генерацию изображений при необходимости
         if not getattr(self, 'use_image_generation', False):
-            logger.info("🔧 Автоматически включаю генерацию изображений")
+            self.logger.info("🔧 Автоматически включаю генерацию изображений")
             self.use_image_generation = True
             # Запускаем таймер автоматического выключения
             self.auto_disable_tools("image_generation")
@@ -1372,16 +1558,17 @@ class AIOrchestrator:
         if gen_params["seed"] == -1:
             import random
             gen_params["seed"] = random.randint(0, 2**32 - 1)
-            logger.info(f"🎲 Сгенерирован случайный seed: {gen_params['seed']}")
+            self.logger.info(f"🎲 Сгенерирован случайный seed: {gen_params['seed']}")
         
-        logger.info(f"🔧 Параметры генерации: {gen_params}")
+        self.logger.info(f"🔧 Параметры генерации: {gen_params}")
         
         try:
             # Устанавливаем необходимые зависимости
             self._install_diffusers_dependencies()
             
-            # Импортируем необходимые библиотеки
-            from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+            # Импортируем необходимые библиотеки (рекомендованные подмодули для совместимости с Pylance)
+            from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline  # type: ignore
+            from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler  # type: ignore
             import torch
             
             # Путь к модели
@@ -1389,10 +1576,10 @@ class AIOrchestrator:
             
             # Проверяем существование модели
             if not os.path.exists(model_path):
-                logger.error(f"❌ Модель не найдена: {model_path}")
+                self.logger.error(f"❌ Модель не найдена: {model_path}")
                 return None
             
-            logger.info(f"📦 Загружаю модель: {model_path}")
+            self.logger.info(f"📦 Загружаю модель: {model_path}")
             
             # Загружаем pipeline
             pipe = StableDiffusionPipeline.from_single_file(
@@ -1404,18 +1591,18 @@ class AIOrchestrator:
             # Перемещаем на GPU если доступен
             if torch.cuda.is_available():
                 pipe = pipe.to("cuda")
-                logger.info("🚀 Модель перемещена на GPU")
+                self.logger.info("🚀 Модель перемещена на GPU")
             else:
-                logger.warning("⚠️ GPU недоступен, использую CPU")
+                self.logger.warning("⚠️ GPU недоступен, использую CPU")
             
             # Настраиваем scheduler
             if gen_params["sampler_name"] == "dpmpp_2m":
                 pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-                logger.info("⚙️ Использую DPMSolverMultistepScheduler")
+                self.logger.info("⚙️ Использую DPMSolverMultistepScheduler")
             
             # Генерируем изображение
-            logger.info(f"🎨 Генерирую изображение: {prompt[:50]}...")
-            
+            self.logger.info(f"🎨 Генерирую изображение: {prompt[:50]}...")
+
             result = pipe(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -1425,9 +1612,48 @@ class AIOrchestrator:
                 height=gen_params["height"],
                 generator=torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(gen_params["seed"])
             )
-            
-            # Получаем изображение
-            image = result.images[0]
+
+            # Получаем изображение: результат pipe может быть объектом с атрибутом images или кортежем (image, extras)
+            image = None
+            try:
+                imgs = getattr(result, 'images', None)
+                if imgs:
+                    image = imgs[0]
+                elif isinstance(result, (tuple, list)) and len(result) > 0:
+                    image = result[0]
+            except Exception:
+                image = None
+
+            if image is None:
+                raise RuntimeError('Не удалось получить изображение из результата pipeline')
+
+            # Нормализация: если image — numpy array или torch tensor, конвертируем в PIL.Image
+            try:
+                import numpy as _np
+                try:
+                    import torch as _torch
+                except Exception:
+                    _torch = None
+
+                if hasattr(image, 'save'):
+                    img_to_save = image
+                elif _np and isinstance(image, _np.ndarray):
+                    img_to_save = Image.fromarray(image.astype('uint8'))
+                elif _torch and _torch.is_tensor(image):
+                    arr = image.detach().cpu().numpy()
+                    img_to_save = Image.fromarray(arr.astype('uint8'))
+                else:
+                    # Попытка сконвертировать общим способом
+                    img_to_save = Image.fromarray(_np.array(image).astype('uint8'))
+            except Exception:
+                # В крайнем случае пытаемся работать напрямую — пусть вызов .save выбросит понятную ошибку
+                img_to_save = image
+            # Подсказка для статического анализатора: гарантируем, что img_to_save рассматривается как PIL.Image
+            try:
+                from typing import cast
+                img_to_save = cast(Image.Image, img_to_save)
+            except Exception:
+                pass
             
             # Сохраняем изображение
             output_dir = os.path.join(os.path.dirname(__file__), "Images", "generated")
@@ -1436,25 +1662,49 @@ class AIOrchestrator:
             filename = f"ConsoleTest_{gen_params['seed']}.png"
             output_path = os.path.join(output_dir, filename)
             
-            image.save(output_path)
-            logger.info(f"💾 Изображение сохранено: {output_path}")
+            # Сохраняем PIL.Image
+            try:
+                # Если уже PIL.Image
+                if isinstance(img_to_save, Image.Image):
+                    img_to_save.save(output_path)
+                    self.logger.info(f"💾 Изображение сохранено: {output_path}")
+                else:
+                    # Пытаемся сохранить оригинальный объект как PIL
+                    if isinstance(image, Image.Image):
+                        image.save(output_path)
+                        self.logger.info(f"💾 Изображение сохранено (fallback): {output_path}")
+                    else:
+                        import numpy as _np
+                        Image.fromarray(_np.array(image).astype('uint8')).save(output_path)
+                        self.logger.info(f"💾 Изображение сохранено (converted fallback): {output_path}")
+            except Exception:
+                self.logger.error(f"❌ Не удалось сохранить изображение ни одним из способов")
             
             # Автоматически открываем изображение
             try:
                 subprocess.run(["start", output_path], shell=True, check=True)
-                logger.info("🖼️ Изображение автоматически открыто")
+                self.logger.info("🖼️ Изображение автоматически открыто")
             except Exception as e:
-                logger.warning(f"⚠️ Не удалось открыть изображение: {e}")
+                self.logger.warning(f"⚠️ Не удалось открыть изображение: {e}")
             
             # Конвертируем в base64
             buf = BytesIO()
-            image.save(buf, format="PNG")
+            try:
+                if isinstance(img_to_save, Image.Image):
+                    img_to_save.save(buf, format="PNG")
+                elif isinstance(image, Image.Image):
+                    image.save(buf, format="PNG")
+                else:
+                    import numpy as _np
+                    Image.fromarray(_np.array(image).astype('uint8')).save(buf, format="PNG")
+            except Exception:
+                self.logger.error("❌ Не удалось сконвертировать изображение в буфер PNG")
             img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
             
             return img_b64
             
         except Exception as e:
-            logger.error(f"❌ Ошибка генерации изображения: {e}")
+            self.logger.error(f"❌ Ошибка генерации изображения: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -1462,7 +1712,7 @@ class AIOrchestrator:
             # Записываем метрику производительности
             response_time = time.time() - start_time
             self.add_performance_metric("image_generation", response_time)
-            logger.info(f"🎨 Изображение сгенерировано за {response_time:.2f} сек")
+            self.logger.info(f"🎨 Изображение сгенерировано за {response_time:.2f} сек")
 
     def generate_video_stable_diffusion(self, prompt: str, negative_prompt: str, params: dict) -> Optional[str]:
         """Генерация видео через прямую интеграцию со Stable Diffusion"""
@@ -1470,7 +1720,7 @@ class AIOrchestrator:
         
         # Автоматически включаем генерацию изображений при необходимости
         if not getattr(self, 'use_image_generation', False):
-            logger.info("🔧 Автоматически включаю генерацию изображений")
+            self.logger.info("🔧 Автоматически включаю генерацию изображений")
             self.use_image_generation = True
             # Запускаем таймер автоматического выключения
             self.auto_disable_tools("image_generation")
@@ -1495,30 +1745,31 @@ class AIOrchestrator:
         if gen_params["seed"] == -1:
             import random
             gen_params["seed"] = random.randint(0, 2**32 - 1)
-            logger.info(f"🎲 Сгенерирован случайный seed: {gen_params['seed']}")
+            self.logger.info(f"🎲 Сгенерирован случайный seed: {gen_params['seed']}")
         
-        logger.info(f"🔧 Параметры генерации видео: {gen_params}")
+        self.logger.info(f"🔧 Параметры генерации видео: {gen_params}")
         
         try:
             # Устанавливаем необходимые зависимости
             self._install_diffusers_dependencies()
             
-            # Импортируем необходимые библиотеки
-            from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+            # Импортируем необходимые библиотеки (рекомендованные подмодули для совместимости с Pylance)
+            from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline  # type: ignore
+            from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler  # type: ignore
             import torch
             from PIL import Image
             import numpy as np
-            import imageio
+            import imageio  # type: ignore
             
             # Путь к модели
             model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH", "J:\\ComfyUI\\models\\checkpoints\\novaAnime_v20.safetensors")
             
             # Проверяем существование модели
             if not os.path.exists(model_path):
-                logger.error(f"❌ Модель не найдена: {model_path}")
+                self.logger.error(f"❌ Модель не найдена: {model_path}")
                 return None
             
-            logger.info(f"📦 Загружаю модель: {model_path}")
+            self.logger.info(f"📦 Загружаю модель: {model_path}")
             
             # Загружаем pipeline
             pipe = StableDiffusionPipeline.from_single_file(
@@ -1530,13 +1781,13 @@ class AIOrchestrator:
             # Перемещаем на GPU если доступен
             if torch.cuda.is_available():
                 pipe = pipe.to("cuda")
-                logger.info("🚀 Модель перемещена на GPU")
+                self.logger.info("🚀 Модель перемещена на GPU")
             else:
-                logger.warning("⚠️ GPU недоступен, использую CPU")
+                self.logger.warning("⚠️ GPU недоступен, использую CPU")
             
             # Настраиваем scheduler
             pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-            logger.info("⚙️ Использую DPMSolverMultistepScheduler")
+            self.logger.info("⚙️ Использую DPMSolverMultistepScheduler")
             
             # Параметры генерации
             generation_config = {
@@ -1547,7 +1798,7 @@ class AIOrchestrator:
                 "num_images_per_prompt": 1
             }
             
-            logger.info(f"🎬 Генерирую {gen_params['num_frames']} кадров для видео...")
+            self.logger.info(f"🎬 Генерирую {gen_params['num_frames']} кадров для видео...")
             
             frames = []
             key_frames = gen_params["key_frames"]
@@ -1573,8 +1824,22 @@ class AIOrchestrator:
                         **generation_config
                     )
                 
-                frames.append(result.images[0])
-                logger.info(f"  ✅ Ключевой кадр {i+1} готов")
+                # Безопасно извлекаем изображение из результата pipeline
+                frame_img = None
+                try:
+                    imgs = getattr(result, 'images', None)
+                    if imgs:
+                        frame_img = imgs[0]
+                    elif isinstance(result, (tuple, list)) and len(result) > 0:
+                        frame_img = result[0]
+                except Exception:
+                    frame_img = None
+
+                if frame_img is None:
+                    raise RuntimeError('Не удалось получить кадр из результата pipeline')
+
+                frames.append(frame_img)
+                self.logger.info(f"  ✅ Ключевой кадр {i+1} готов")
             
             # Создаем интерполированные кадры между ключевыми кадрами
             frames_per_segment = gen_params["num_frames"] // (key_frames - 1)
@@ -1598,12 +1863,12 @@ class AIOrchestrator:
                     frames.append(interpolated_image)
                     
                     frame_num = segment * frames_per_segment + i + 1
-                    logger.info(f"  ✅ Кадр {frame_num}/{gen_params['num_frames']} готов (сегмент {segment+1}, интерполяция: {t_smooth:.2f})")
+                    self.logger.info(f"  ✅ Кадр {frame_num}/{gen_params['num_frames']} готов (сегмент {segment+1}, интерполяция: {t_smooth:.2f})")
             
             # Добавляем последний ключевой кадр если нужно
             if len(frames) < gen_params["num_frames"]:
                 frames.append(frames[-1])
-                logger.info(f"  ✅ Добавлен финальный кадр")
+                self.logger.info(f"  ✅ Добавлен финальный кадр")
             
             frames = frames[:gen_params["num_frames"]]  # Убеждаемся, что возвращаем нужное количество кадров
             
@@ -1612,15 +1877,40 @@ class AIOrchestrator:
             os.makedirs(output_dir, exist_ok=True)
             
             # Сохраняем кадры
-            logger.info("💾 Сохраняю кадры...")
+            self.logger.info("💾 Сохраняю кадры...")
             for i, frame in enumerate(frames):
                 frame_path = os.path.join(output_dir, f"video_frame_{i:03d}.png")
-                frame.save(frame_path)
-                logger.info(f"  💾 Кадр {i+1} сохранен: {frame_path}")
+                try:
+                    if hasattr(frame, 'save'):
+                        try:
+                            from typing import cast
+                            frame = cast(Image.Image, frame)
+                        except Exception:
+                            pass
+                        frame.save(frame_path)
+                    else:
+                        # Попытка привести numpy array / tensor к PIL Image
+                        import numpy as _np
+                        try:
+                            import torch as _torch
+                        except Exception:
+                            _torch = None
+
+                        if _torch and _torch.is_tensor(frame):
+                            arr = frame.detach().cpu().numpy()
+                            Image.fromarray(arr.astype('uint8')).save(frame_path)
+                        elif isinstance(frame, _np.ndarray):
+                            Image.fromarray(frame.astype('uint8')).save(frame_path)
+                        else:
+                            Image.fromarray(_np.array(frame).astype('uint8')).save(frame_path)
+
+                    self.logger.info(f"  💾 Кадр {i+1} сохранен: {frame_path}")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Не удалось сохранить кадр {i+1}: {e}")
             
             # Создаем видео
             video_path = os.path.join(output_dir, f"ConsoleVideo_{gen_params['seed']}.mp4")
-            logger.info(f"🎬 Создаю видео: {video_path}")
+            self.logger.info(f"🎬 Создаю видео: {video_path}")
             
             # Конвертируем PIL изображения в numpy массивы
             video_frames = []
@@ -1631,19 +1921,19 @@ class AIOrchestrator:
             # Создаем видео с высоким качеством
             imageio.mimsave(video_path, video_frames, fps=gen_params["fps"], quality=8)
             
-            logger.info(f"✅ Видео создано: {video_path}")
+            self.logger.info(f"✅ Видео создано: {video_path}")
             
             # Автоматически открываем видео
             try:
                 subprocess.run(["start", video_path], shell=True, check=True)
-                logger.info("🎬 Видео автоматически открыто")
+                self.logger.info("🎬 Видео автоматически открыто")
             except Exception as e:
-                logger.warning(f"⚠️ Не удалось открыть видео: {e}")
+                self.logger.warning(f"⚠️ Не удалось открыть видео: {e}")
             
             return video_path
             
         except Exception as e:
-            logger.error(f"❌ Ошибка генерации видео: {e}")
+            self.logger.error(f"❌ Ошибка генерации видео: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -1651,7 +1941,7 @@ class AIOrchestrator:
             # Записываем метрику производительности
             response_time = time.time() - start_time
             self.add_performance_metric("video_generation", response_time)
-            logger.info(f"🎬 Видео сгенерировано за {response_time:.2f} сек")
+            self.logger.info(f"🎬 Видео сгенерировано за {response_time:.2f} сек")
 
     def _add_dynamic_elements(self, prompt, frame_index, total_frames):
         """Добавляет динамические элементы к промпту в зависимости от номера кадра"""
@@ -1714,17 +2004,17 @@ class AIOrchestrator:
         try:
             import diffusers
             import torch
-            logger.info("✅ diffusers и torch уже установлены")
+            self.logger.info("✅ diffusers и torch уже установлены")
             return
         except ImportError:
-            logger.info("📦 Устанавливаю зависимости для diffusers...")
+            self.logger.info("📦 Устанавливаю зависимости для diffusers...")
             
             try:
-                subprocess.run([sys.executable, "-m", "pip", "install", "diffusers", "transformers", "torch", "torchvision", "accelerate", "safetensors"], 
+                subprocess.run([_sys.executable, "-m", "pip", "install", "diffusers", "transformers", "torch", "torchvision", "accelerate", "safetensors"], 
                              check=True, capture_output=True)
-                logger.info("✅ Зависимости установлены успешно")
+                self.logger.info("✅ Зависимости установлены успешно")
             except subprocess.CalledProcessError as e:
-                logger.error(f"❌ Ошибка установки зависимостей: {e}")
+                self.logger.error(f"❌ Ошибка установки зависимостей: {e}")
                 raise
 
     def show_image_base64_temp(self, b64img: str):
@@ -1738,8 +2028,8 @@ class AIOrchestrator:
             time.sleep(5)
             img.close()
         except Exception as e:
-            logger.error(f"Ошибка показа изображения: {e}")
-    def find_new_audio(self) -> str:
+            self.logger.error(f"Ошибка показа изображения: {e}")
+    def find_new_audio(self) -> Optional[str]:
         """Находит новый аудиофайл для обработки"""
         audio_extensions = ['.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac']
         
@@ -1767,7 +2057,7 @@ class AIOrchestrator:
         except Exception as e:
             self.logger.error(f"❌ Ошибка при удалении аудиофайла: {e}")
 
-    def transcribe_audio_whisper(self, audio_path: str, lang: str = "ru", use_separator: bool = True) -> str:
+    def transcribe_audio_whisper(self, audio_path: str, lang: str = "ru", use_separator: bool = True) -> Optional[str]:
         """
         Распознаёт аудио через whisper-cli. Если use_separator=True, предварительно выделяет вокал через audio-separator.
         Возвращает текст транскрипта (выводит только один раз при получении).
@@ -1776,7 +2066,7 @@ class AIOrchestrator:
         
         # Автоматически включаем audio модель при необходимости
         if not getattr(self, 'use_audio', False):
-            logger.info("🔧 Автоматически включаю audio модель")
+            self.logger.info("🔧 Автоматически включаю audio модель")
             self.use_audio = True
             # Запускаем таймер автоматического выключения
             self.auto_disable_tools("audio")
@@ -1804,7 +2094,7 @@ class AIOrchestrator:
             if use_separator:
                 try:
                     from audio_separator.separator import Separator
-                    logger.info("🎵 Использую audio-separator для выделения вокала...")
+                    self.logger.info("🎵 Использую audio-separator для выделения вокала...")
                     out_dir = os.path.join(base_dir, "separated")
                     os.makedirs(out_dir, exist_ok=True)
                     separator = Separator(output_dir=out_dir)
@@ -1814,22 +2104,22 @@ class AIOrchestrator:
                     for file_path in output_files:
                         if '(Vocals)' in os.path.basename(file_path):
                             vocals_path = file_path  # audio-separator возвращает полный путь
-                            logger.info(f"[SUCCESS] Вокал найден: {vocals_path}")
+                            self.logger.info(f"[SUCCESS] Вокал найден: {vocals_path}")
                             break
                     if not vocals_path:
-                        logger.warning("⚠️ Не удалось найти файл с голосом после разделения дорожек, использую оригинал")
+                        self.logger.warning("⚠️ Не удалось найти файл с голосом после разделения дорожек, использую оригинал")
                     else:
                         audio_for_whisper = vocals_path
                 except ImportError:
-                    logger.warning("⚠️ Не установлена библиотека audio-separator. Пытаюсь установить автоматически...")
+                    self.logger.warning("⚠️ Не установлена библиотека audio-separator. Пытаюсь установить автоматически...")
                     try:
                         import subprocess
                         subprocess.run([_sys.executable, "-m", "pip", "install", "audio-separator"], 
                                      capture_output=True, check=True)
-                        logger.info("✅ audio-separator успешно установлен")
+                        self.logger.info("✅ audio-separator успешно установлен")
                         # Повторно пытаемся импортировать
                         from audio_separator.separator import Separator
-                        logger.info("🎵 Использую audio-separator для выделения вокала...")
+                        self.logger.info("🎵 Использую audio-separator для выделения вокала...")
                         out_dir = os.path.join(base_dir, "separated")
                         os.makedirs(out_dir, exist_ok=True)
                         separator = Separator(output_dir=out_dir)
@@ -1839,28 +2129,28 @@ class AIOrchestrator:
                         for file_path in output_files:
                             if '(Vocals)' in os.path.basename(file_path):
                                 vocals_path = file_path  # audio-separator возвращает полный путь
-                                logger.info(f"[SUCCESS] Вокал найден: {vocals_path}")
+                                self.logger.info(f"[SUCCESS] Вокал найден: {vocals_path}")
                                 break
                         if not vocals_path:
-                            logger.warning("⚠️ Не удалось найти файл с голосом после разделения дорожек, использую оригинал")
+                            self.logger.warning("⚠️ Не удалось найти файл с голосом после разделения дорожек, использую оригинал")
                         else:
                             audio_for_whisper = vocals_path
                     except Exception as install_error:
-                        logger.warning(f"⚠️ Не удалось установить audio-separator: {install_error}")
-                        logger.info("ℹ️ Продолжаю без разделения дорожек")
+                        self.logger.warning(f"⚠️ Не удалось установить audio-separator: {install_error}")
+                        self.logger.info("ℹ️ Продолжаю без разделения дорожек")
                 except Exception as e:
-                    logger.warning(f"⚠️ Ошибка audio-separator: {e}, использую оригинал")
+                    self.logger.warning(f"⚠️ Ошибка audio-separator: {e}, использую оригинал")
             
             # Конвертируем аудио в WAV формат для Whisper (если это не уже WAV)
             if not audio_for_whisper.lower().endswith('.wav'):
                 wav_path = self.convert_audio_to_wav(audio_for_whisper)
                 if wav_path:
                     audio_for_whisper = wav_path
-                    logger.info(f"✅ Аудио конвертировано в WAV: {os.path.basename(wav_path)}")
+                    self.logger.info(f"✅ Аудио конвертировано в WAV: {os.path.basename(wav_path)}")
                 else:
-                    logger.warning("⚠️ Не удалось конвертировать в WAV, использую оригинал")
+                    self.logger.warning("⚠️ Не удалось конвертировать в WAV, использую оригинал")
             else:
-                logger.info("✅ Аудио уже в WAV формате")
+                self.logger.info("✅ Аудио уже в WAV формате")
             
             # Переименовать используемый файл в .used.расширение
             base_used, ext_used = os.path.splitext(audio_for_whisper)
@@ -1868,12 +2158,12 @@ class AIOrchestrator:
             try:
                 if os.path.exists(audio_for_whisper):
                     os.rename(audio_for_whisper, used_path)
-                    logger.info(f"✅ Аудиофайл переименован в: {os.path.basename(used_path)}")
+                    self.logger.info(f"✅ Аудиофайл переименован в: {os.path.basename(used_path)}")
                 else:
-                    logger.warning(f"⚠️ Аудиофайл не найден для переименования: {audio_for_whisper}")
+                    self.logger.warning(f"⚠️ Аудиофайл не найден для переименования: {audio_for_whisper}")
                     used_path = audio_for_whisper
             except Exception as e:
-                logger.error(f"Ошибка переименования аудио после whisper: {e}")
+                self.logger.error(f"Ошибка переименования аудио после whisper: {e}")
                 # Если не удалось переименовать, используем оригинальный файл
                 used_path = audio_for_whisper
             
@@ -1882,11 +2172,12 @@ class AIOrchestrator:
             if lang:
                 cmd += ["--language", lang]
             cmd.append(used_path)
-            logger.info(f"[INFO] Запуск Whisper: {' '.join(cmd)}")
+            self.logger.info(f"[INFO] Запуск Whisper: {' '.join(cmd)}")
+            import subprocess
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, encoding="utf-8", errors="replace")
             transcript = result.stdout.strip() if result.stdout else ""
             if transcript:
-                logger.info("\n=== ТРАНСКРИПТ АУДИО ===\n" + transcript)
+                self.logger.info("\n=== ТРАНСКРИПТ АУДИО ===\n" + transcript)
                 return transcript
             
             # Очистка временных файлов если был separator
@@ -1895,23 +2186,23 @@ class AIOrchestrator:
                     separated_dir = os.path.dirname(audio_for_whisper)
                     if os.path.exists(separated_dir):
                         shutil.rmtree(separated_dir)
-                        logger.info("🧹 Временные файлы audio-separator очищены")
+                        self.logger.info("🧹 Временные файлы audio-separator очищены")
                 except Exception as e:
-                    logger.warning(f"⚠️ Не удалось очистить временные файлы: {e}")
+                    self.logger.warning(f"⚠️ Не удалось очистить временные файлы: {e}")
             
             err = result.stderr.strip() if result.stderr else ""
             return f"[Whisper error] Не удалось получить транскрипт. STDERR: {err}"
         except Exception as e:
             error_msg = f"Исключение whisper-cli: {str(e)}"
-            logger.error(error_msg)
+            self.logger.error(error_msg)
             return f"[Whisper error] {error_msg}"
         finally:
             # Записываем метрику производительности
             response_time = time.time() - start_time
             self.add_performance_metric("whisper_transcription", response_time)
-            logger.info(f"🎤 Whisper обработал за {response_time:.2f} сек")
+            self.logger.info(f"🎤 Whisper обработал за {response_time:.2f} сек")
 
-    def convert_audio_to_wav(self, audio_path: str) -> str:
+    def convert_audio_to_wav(self, audio_path: str) -> Optional[str]:
         """
         Конвертирует аудиофайл в WAV формат для Whisper.
         Возвращает путь к WAV файлу или None при ошибке.
@@ -1928,7 +2219,7 @@ class AIOrchestrator:
             try:
                 subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
             except (subprocess.CalledProcessError, FileNotFoundError):
-                logger.warning("⚠️ ffmpeg не найден в системе. Установите ffmpeg для конвертации аудио.")
+                self.logger.warning("⚠️ ffmpeg не найден в системе. Установите ffmpeg для конвертации аудио.")
                 return None
             
             # Создаем временную папку для конвертации
@@ -1949,18 +2240,18 @@ class AIOrchestrator:
                 wav_path
             ]
             
-            logger.info(f"🔄 Конвертирую аудио в WAV: {' '.join(cmd)}")
+            self.logger.info(f"🔄 Конвертирую аудио в WAV: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             
             if result.returncode == 0 and os.path.exists(wav_path):
-                logger.info(f"✅ Конвертация успешна: {os.path.basename(wav_path)}")
+                self.logger.info(f"✅ Конвертация успешна: {os.path.basename(wav_path)}")
                 return wav_path
             else:
-                logger.error(f"❌ Ошибка конвертации: {result.stderr}")
+                self.logger.error(f"❌ Ошибка конвертации: {result.stderr}")
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка конвертации аудио в WAV: {e}")
+            self.logger.error(f"❌ Ошибка конвертации аудио в WAV: {e}")
             return None
 
     def check_whisper_setup(self) -> bool:
@@ -1975,36 +2266,36 @@ class AIOrchestrator:
             
             # Проверяем whisper-cli.exe
             if not os.path.exists(exe_path):
-                logger.error(f"❌ Не найден whisper-cli.exe в папке Release: {exe_path}")
-                logger.info("💡 Скачайте whisper.cpp с https://github.com/ggerganov/whisper.cpp")
+                self.logger.error(f"❌ Не найден whisper-cli.exe в папке Release: {exe_path}")
+                self.logger.info("💡 Скачайте whisper.cpp с https://github.com/ggerganov/whisper.cpp")
                 return False
             
             # Проверяем модель
             if not os.path.exists(model_path):
-                logger.warning(f"⚠️ Не найдена модель whisper в папке models: {model_path}")
-                logger.info("🔄 Пытаюсь автоматически скачать модель...")
+                self.logger.warning(f"⚠️ Не найдена модель whisper в папке models: {model_path}")
+                self.logger.info("🔄 Пытаюсь автоматически скачать модель...")
                 if self.download_whisper_model():
-                    logger.info("✅ Модель whisper успешно загружена")
+                    self.logger.info("✅ Модель whisper успешно загружена")
                 else:
-                    logger.error("❌ Не удалось загрузить модель whisper")
-                    logger.info("💡 Скачайте модель whisper-large-v3-q8_0.gguf вручную")
+                    self.logger.error("❌ Не удалось загрузить модель whisper")
+                    self.logger.info("💡 Скачайте модель whisper-large-v3-q8_0.gguf вручную")
                     return False
             
             # Проверяем права на выполнение
             try:
                 result = subprocess.run([exe_path, "--help"], capture_output=True, text=True, timeout=10)
                 if result.returncode != 0:
-                    logger.warning("⚠️ whisper-cli.exe не может быть запущен")
+                    self.logger.warning("⚠️ whisper-cli.exe не может быть запущен")
                     return False
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка запуска whisper-cli.exe: {e}")
+                self.logger.warning(f"⚠️ Ошибка запуска whisper-cli.exe: {e}")
                 return False
             
-            logger.info("✅ Whisper настройка проверена успешно")
+            self.logger.info("✅ Whisper настройка проверена успешно")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки настройки Whisper: {e}")
+            self.logger.error(f"❌ Ошибка проверки настройки Whisper: {e}")
             return False
 
     def download_whisper_model(self) -> bool:
@@ -2023,8 +2314,8 @@ class AIOrchestrator:
             # URL для скачивания модели (используем Hugging Face)
             model_url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q8_0.bin"
             
-            logger.info(f"📥 Скачиваю модель whisper: {model_name}")
-            logger.info(f"🔗 URL: {model_url}")
+            self.logger.info(f"📥 Скачиваю модель whisper: {model_name}")
+            self.logger.info(f"🔗 URL: {model_url}")
             
             # Скачиваем модель
             response = requests.get(model_url, stream=True, timeout=300)
@@ -2040,13 +2331,13 @@ class AIOrchestrator:
                         downloaded += len(chunk)
                         if total_size > 0:
                             percent = (downloaded / total_size) * 100
-                            logger.info(f"📊 Прогресс: {percent:.1f}% ({downloaded}/{total_size} байт)")
+                            self.logger.info(f"📊 Прогресс: {percent:.1f}% ({downloaded}/{total_size} байт)")
             
-            logger.info(f"✅ Модель скачана: {model_path}")
+            self.logger.info(f"✅ Модель скачана: {model_path}")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Ошибка скачивания модели whisper: {e}")
+            self.logger.error(f"❌ Ошибка скачивания модели whisper: {e}")
             return False
 
     def download_youtube_audio(self, url: str, out_dir: Optional[str] = None) -> str:
@@ -2065,9 +2356,9 @@ class AIOrchestrator:
         
         if cookies_path and self.check_cookies_validity(cookies_path):
             use_cookies = True
-            logger.info("🍪 Использую cookies для аутентификации YouTube")
+            self.logger.info("🍪 Использую cookies для аутентификации YouTube")
         else:
-            logger.info("ℹ️ Cookies не найдены или невалидны, использую базовые параметры")
+            self.logger.info("ℹ️ Cookies не найдены или невалидны, использую базовые параметры")
         
         # Базовые параметры для yt-dlp
         base_cmd = [
@@ -2083,50 +2374,50 @@ class AIOrchestrator:
             "--extract-audio", "--audio-format", "wav",  # Сразу в WAV для Whisper
             "-o", out_path
         ]
-        
+
         # Добавляем cookies если доступны
         if use_cookies:
-            base_cmd.extend(["--cookies", cookies_path])
+            base_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
         
         # Добавляем URL в конец
         cmd = base_cmd + [url]
         
         try:
-            logger.info(f"Скачиваю аудио с YouTube: {url}")
+            self.logger.info(f"Скачиваю аудио с YouTube: {url}")
             # Логируем команду в одну строку для избежания обрезания
             cmd_str = " ".join(cmd)
-            logger.info(f"Команда: {cmd_str}")
+            self.logger.info(f"Команда: {cmd_str}")
             
             # Запускаем с таймаутом
             result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
             
             if result.stdout:
-                logger.info(f"yt-dlp stdout: {result.stdout}")
+                self.logger.info(f"yt-dlp stdout: {result.stdout}")
             if result.stderr:
-                logger.warning(f"yt-dlp stderr: {result.stderr}")
+                self.logger.warning(f"yt-dlp stderr: {result.stderr}")
             
             # Найти скачанный файл
             for fname in os.listdir(out_dir):
                 if fname.startswith("yt_audio") and fname.endswith(('.wav', '.m4a', '.mp3', '.ogg', '.flac')):
-                    logger.info(f"✅ Аудио успешно скачано: {fname}")
+                    self.logger.info(f"✅ Аудио успешно скачано: {fname}")
                     return os.path.join(out_dir, fname)
             
-            logger.warning("⚠️ Аудиофайл не найден после скачивания")
+            self.logger.warning("⚠️ Аудиофайл не найден после скачивания")
             return ""
             
         except subprocess.TimeoutExpired:
-            logger.error("❌ Таймаут скачивания аудио (5 минут)")
+            self.logger.error("❌ Таймаут скачивания аудио (5 минут)")
             return ""
         except subprocess.CalledProcessError as e:
-            logger.error(f"❌ Ошибка yt-dlp: {e}")
+            self.logger.error(f"❌ Ошибка yt-dlp: {e}")
             if e.stderr:
-                logger.error(f"stderr: {e.stderr}")
+                self.logger.error(f"stderr: {e.stderr}")
             return ""
         except Exception as e:
-            logger.error(f"❌ Неожиданная ошибка скачивания аудио: {e}")
+            self.logger.error(f"❌ Неожиданная ошибка скачивания аудио: {e}")
             
             # Пробуем альтернативный метод с другими параметрами
-            logger.info("🔄 Пробую альтернативный метод скачивания...")
+            self.logger.info("🔄 Пробую альтернативный метод скачивания...")
             try:
                 alt_cmd = [
                     "yt-dlp",
@@ -2140,29 +2431,29 @@ class AIOrchestrator:
                     "--extract-audio", "--audio-format", "wav",  # Сразу в WAV для Whisper
                     "-o", out_path
                 ]
-                
+
                 # Добавляем cookies если доступны
                 if use_cookies:
-                    alt_cmd.extend(["--cookies", cookies_path])
-                
+                    alt_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
+
                 alt_cmd.append(url)
                 
                 # Логируем команду в одну строку
                 alt_cmd_str = " ".join(alt_cmd)
-                logger.info(f"Альтернативная команда: {alt_cmd_str}")
+                self.logger.info(f"Альтернативная команда: {alt_cmd_str}")
                 result = subprocess.run(alt_cmd, check=True, capture_output=True, text=True, timeout=300)
                 
                 # Найти скачанный файл
                 for fname in os.listdir(out_dir):
                     if fname.startswith("yt_audio") and fname.endswith(('.wav', '.m4a', '.mp3', '.ogg', '.flac')):
-                        logger.info(f"✅ Аудио успешно скачано альтернативным методом: {fname}")
+                        self.logger.info(f"✅ Аудио успешно скачано альтернативным методом: {fname}")
                         return os.path.join(out_dir, fname)
                         
             except Exception as alt_e:
-                logger.error(f"❌ Альтернативный метод также не сработал: {alt_e}")
+                self.logger.error(f"❌ Альтернативный метод также не сработал: {alt_e}")
                 
                 # Пробуем третий метод с максимально простыми параметрами
-                logger.info("🔄 Пробую третий метод (минимальные параметры)...")
+                self.logger.info("🔄 Пробую третий метод (минимальные параметры)...")
                 try:
                     simple_cmd = [
                         "yt-dlp",
@@ -2176,21 +2467,21 @@ class AIOrchestrator:
                     
                     # Добавляем cookies если доступны
                     if use_cookies:
-                        simple_cmd.extend(["--cookies", cookies_path])
+                        simple_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
                     
                     simple_cmd.append(url)
                     
-                    logger.info(f"Третий метод: {' '.join(simple_cmd)}")
+                    self.logger.info(f"Третий метод: {' '.join(simple_cmd)}")
                     result = subprocess.run(simple_cmd, check=True, capture_output=True, text=True, timeout=300)
                     
                     # Найти скачанный файл
                     for fname in os.listdir(out_dir):
                         if fname.startswith("yt_audio") and fname.endswith(('.m4a', '.mp3', '.wav', '.ogg', '.flac')):
-                            logger.info(f"✅ Аудио успешно скачано третьим методом: {fname}")
+                            self.logger.info(f"✅ Аудио успешно скачано третьим методом: {fname}")
                             return os.path.join(out_dir, fname)
                             
                 except Exception as simple_e:
-                    logger.error(f"❌ Третий метод также не сработал: {simple_e}")
+                    self.logger.error(f"❌ Третий метод также не сработал: {simple_e}")
             
             return ""
     def find_new_image(self) -> str:
@@ -2217,7 +2508,7 @@ class AIOrchestrator:
         try:
             os.rename(image_path, new_path)
         except Exception as e:
-            logger.error(f"Ошибка переименования изображения: {e}")
+            self.logger.error(f"Ошибка переименования изображения: {e}")
     def extract_first_json(self, text: str) -> str:
         """
         Извлекает первый корректный JSON-блок из текста, поддерживая модуль <think>.
@@ -2274,6 +2565,8 @@ class AIOrchestrator:
         self.lm_studio_url = lm_studio_url.rstrip("/")
         self.google_api_key = google_api_key
         self.google_cse_id = google_cse_id
+        # unify logger usage for instance methods
+        self.logger = logger
         self.conversation_history: List[Dict[str, Any]] = []
         self.brain_model = "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
         self.brain_model_id = None  # Короткий ID модели для API вызовов
@@ -2715,7 +3008,7 @@ class AIOrchestrator:
 ПОМНИ: Ты не просто исполнитель команд, а интеллектуальный помощник, который думает, планирует и адаптируется!
 """
 
-    def auto_disable_tools(self, tool_name: str = None):
+    def auto_disable_tools(self, tool_name: Optional[str] = None):
         """Автоматически выключает инструмент через заданное время после использования"""
         import threading
         import time
@@ -4213,6 +4506,9 @@ class AIOrchestrator:
         except Exception as e:
             logger.error(f"❌ Ошибка обработки ответа AI: {str(e)}")
             return False
+        # Гарантируем возврат значения по умолчанию, если по каким-то причинам не сработал ни один return
+        logger.error("❌ process_ai_response завершился без явного return, возвращаю False по умолчанию")
+        return False
 
     def run_interactive(self):
         """Запуск интерактивного режима (глаза, аудио, мозг)"""
@@ -4704,11 +5000,15 @@ class AIOrchestrator:
             # Запускаем бота в фоне в отдельном потоке
             import threading
             def run_bot():
+                loop = None
                 try:
                     # Создаем новый event loop для потока
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                    loop.run_until_complete(self.telegram_app.run_polling(allowed_updates=Update.ALL_TYPES))
+                    from typing import Any, cast
+                    coro = self.telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+                    if coro is not None:
+                        loop.run_until_complete(cast(Any, coro))
                 except Exception as e:
                     # В веб-режиме логируем тихо
                     if not getattr(self, 'show_images_locally', True):
@@ -4716,7 +5016,11 @@ class AIOrchestrator:
                     else:
                         logger.debug(f"Telegram bot polling error: {e}")
                 finally:
-                    loop.close()
+                    if loop is not None:
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass
             
             bot_thread = threading.Thread(target=run_bot, daemon=True)
             bot_thread.start()
@@ -4736,6 +5040,8 @@ class AIOrchestrator:
 
     async def _telegram_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
+        if update is None or update.message is None or update.effective_user is None:
+            return
         user_id = str(update.effective_user.id)
         if user_id != self.telegram_allowed_user_id:
             await update.message.reply_text("❌ У вас нет доступа к этому боту.")
@@ -4755,42 +5061,44 @@ class AIOrchestrator:
 
     async def _telegram_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
+        if update is None or update.message is None or update.effective_user is None or update.effective_chat is None:
+            return
         user_id = str(update.effective_user.id)
         if user_id != self.telegram_allowed_user_id:
             await update.message.reply_text("❌ У вас нет доступа к этому боту.")
             return
         
-        text = update.message.text
+        text = update.message.text if update.message and update.message.text else ""
         await update.message.reply_text("🔄 Обрабатываю ваше сообщение...")
-        
+
         try:
             # Отправляем в мозг
-            ai_response = self.call_brain_model(text)
-            
+            ai_response = self.call_brain_model(text or "")
+
             # Обрабатываем ответ AI
             continue_dialog = self.process_ai_response(ai_response)
-            
+
             if not continue_dialog:
                 # Если диалог завершен, отправляем финальный ответ
                 if hasattr(self, 'last_final_response') and self.last_final_response:
                     await update.message.reply_text(self.last_final_response)
-                    
+
                     # Если есть сгенерированное изображение, отправляем его
                     if hasattr(self, 'last_generated_image_b64') and self.last_generated_image_b64:
                         try:
                             # Конвертируем base64 в bytes
                             img_bytes = base64.b64decode(self.last_generated_image_b64)
-                            
+
                             # Отправляем изображение
                             await context.bot.send_photo(
                                 chat_id=update.effective_chat.id,
                                 photo=img_bytes,
                                 caption="🎨 Сгенерированное изображение"
                             )
-                            
+
                             # Очищаем
                             self.last_generated_image_b64 = None
-                            
+
                         except Exception as e:
                             # В веб-режиме логируем тихо
                             if not getattr(self, 'show_images_locally', True):
@@ -4803,9 +5111,9 @@ class AIOrchestrator:
             else:
                 # Если диалог продолжается, отправляем промежуточный ответ
                 await update.message.reply_text("🔄 Обрабатываю... Пожалуйста, подождите.")
-                
+
         except Exception as e:
-            # В веб-режиме логируем тихо
+            # Веб-режим: логируем тихо
             if getattr(self, 'show_images_locally', True):
                 logger.error(f"❌ Ошибка обработки текстового сообщения: {e}")
             else:
@@ -4814,6 +5122,8 @@ class AIOrchestrator:
 
     async def _telegram_photo_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик фотографий"""
+        if update is None or update.message is None or update.effective_user is None or update.effective_chat is None:
+            return
         user_id = str(update.effective_user.id)
         if user_id != self.telegram_allowed_user_id:
             await update.message.reply_text("❌ У вас нет доступа к этому боту.")
@@ -4849,6 +5159,8 @@ class AIOrchestrator:
 
     async def _telegram_audio_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик аудио сообщений"""
+        if update is None or update.message is None or update.effective_user is None or update.effective_chat is None:
+            return
         user_id = str(update.effective_user.id)
         if user_id != self.telegram_allowed_user_id:
             await update.message.reply_text("❌ У вас нет доступа к этому бота.")
@@ -4862,6 +5174,10 @@ class AIOrchestrator:
                 audio = update.message.audio
             else:
                 audio = update.message.voice
+
+            if audio is None:
+                await update.message.reply_text("❌ В сообщении нет аудиофайла")
+                return
             
             file = await context.bot.get_file(audio.file_id)
             
@@ -4912,7 +5228,7 @@ class AIOrchestrator:
             True если воспроизведение запущено успешно, False при ошибке
         """
         try:
-            import pygame
+            import pygame  # type: ignore
             import time
             
             logger.info(f"🔊 Воспроизводим аудио: {os.path.basename(audio_path)}")
@@ -5063,7 +5379,7 @@ class AIOrchestrator:
             return f"{system_prompt}\n\nТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
     
     def auto_save_conversation(self, user_message: str, ai_response: str, 
-                              context: str = "", metadata: Dict[str, Any] = None):
+                              context: str = "", metadata: Optional[Dict[str, Any]] = None):
         """
         Автоматически сохраняет диалог в память
         
@@ -5148,7 +5464,7 @@ class AIOrchestrator:
     ### МЕТОДЫ ДЛЯ РАБОТЫ С CHROMADB ###
     
     def add_to_memory(self, user_message: str, ai_response: str, context: str = "", 
-                     metadata: Dict[str, Any] = None) -> bool:
+                     metadata: Optional[Dict[str, Any]] = None) -> bool:
         """
         Добавляет диалог в векторное хранилище памяти
         
@@ -5170,7 +5486,7 @@ class AIOrchestrator:
             return False
     
     def add_user_preference(self, preference_text: str, category: str = "general", 
-                           metadata: Dict[str, Any] = None) -> bool:
+                           metadata: Optional[Dict[str, Any]] = None) -> bool:
         """
         Добавляет предпочтение пользователя в векторное хранилище
         
@@ -5207,7 +5523,7 @@ class AIOrchestrator:
             logger.error(f"❌ Ошибка получения контекста: {e}")
             return ""
     
-    def get_user_preferences(self, query: str = None) -> str:
+    def get_user_preferences(self, query: Optional[str] = None) -> str:
         """
         Получает предпочтения пользователя
         
@@ -5289,7 +5605,7 @@ class AIOrchestrator:
             logger.error(f"❌ Ошибка получения информации о GPU: {e}")
             return {"error": str(e)}
 
-def ensure_wav(audio_path: str) -> str:
+def ensure_wav(audio_path: str) -> Optional[str]:
     """Конвертирует аудиофайл в WAV формат если он не WAV"""
     try:
         if audio_path.lower().endswith('.wav'):
