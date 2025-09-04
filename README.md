@@ -79,7 +79,7 @@ p.s. **abliterated** по причине того, что она будет ме
 #### Audio модель
 
 - **[whisper-large-v3-q8_0](https://huggingface.co/vonjack/whisper-large-v3-gguf)** (Использовал Q8)
-
+- Требования: ~4GB VRAM
 #### Vision модель
 
 - **[moondream2-050824](https://huggingface.co/cjpais/moondream2-llamafile/blob/main/moondream2-050824-q8.gguf)**
