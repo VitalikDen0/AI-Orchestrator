@@ -437,14 +437,14 @@ class ChromaDBManager:
             return False
     
     def search_similar_conversations(self, query: str, n_results: int = 5,
-                                   similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
+                                   similarity_threshold: float = None) -> List[Dict[str, Any]]:
         """
         Ищет похожие диалоги в векторном хранилище
         
         Args:
             query: Поисковый запрос
             n_results: Количество результатов
-            similarity_threshold: Порог схожести (0-1)
+            similarity_threshold: Порог схожести (автоматический если None)
             
         Returns:
             Список найденных диалогов с метаданными
@@ -457,20 +457,27 @@ class ChromaDBManager:
             if not self.initialized or self.embedding_model_obj is None:
                 logger.warning("⚠️ Эмбеддинговая модель не инициализирована, поиск невозможен")
                 return []
+            
+            logger.info(f"🔍 Ищем похожие диалоги для запроса: '{query}'")
             query_embedding = self.embedding_model_obj.encode(query).tolist()
             
             # Ищем похожие записи (если коллекция доступна)
             if self.collection is None:
                 logger.warning("⚠️ Коллекция ChromaDB не доступна, поиск невозможен")
                 return []
+            
+            # Увеличиваем количество результатов для лучшего поиска
+            search_results = max(n_results * 3, 15)
             results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=n_results,
+                n_results=search_results,
                 where={"type": "conversation"}  # type: ignore[arg-type]
             )
             
-            # Фильтруем по порогу схожести
+            # Анализируем результаты для определения адаптивного порога
             filtered_results = []
+            found_count = 0
+            
             # Защищаемся от отсутствия ключей или пустых результатов
             if isinstance(results, dict) and results:
                 distances = results.get('distances')
@@ -479,10 +486,36 @@ class ChromaDBManager:
                 metadatas = results.get('metadatas')
 
                 if distances and isinstance(distances, list) and distances and distances[0]:
+                    logger.info(f"📊 Обработка {len(distances[0])} результатов поиска")
+                    
+                    # Вычисляем адаптивный порог если не задан
+                    if similarity_threshold is None:
+                        similarities = [1 - d for d in distances[0]]
+                        if similarities:
+                            max_sim = max(similarities)
+                            avg_sim = sum(similarities) / len(similarities)
+                            
+                            # Адаптивный порог: берем результаты выше среднего, но не выше 0.5
+                            if max_sim > 0.1:
+                                adaptive_threshold = min(avg_sim + 0.1, 0.3, max_sim - 0.05)
+                            else:
+                                adaptive_threshold = -0.2  # Очень низкий порог для слабых совпадений
+                            
+                            logger.info(f"🎯 Адаптивный порог схожести: {adaptive_threshold:.3f} (макс: {max_sim:.3f}, средн: {avg_sim:.3f})")
+                        else:
+                            adaptive_threshold = 0.1
+                    else:
+                        adaptive_threshold = similarity_threshold
+                    
                     for i, distance in enumerate(distances[0]):
                         # ChromaDB возвращает расстояния, конвертируем в схожесть
                         similarity = 1 - distance
-                        if similarity >= similarity_threshold:
+                        
+                        # Логируем для отладки
+                        if i < 3:  # Показываем первые 3 результата
+                            logger.info(f"   Результат {i+1}: схожесть={similarity:.3f}, расстояние={distance:.3f}")
+                        
+                        if similarity >= adaptive_threshold:
                             # Проверяем, что остальные структуры содержат нужные элементы
                             doc = None
                             meta = None
@@ -491,10 +524,9 @@ class ChromaDBManager:
                                 idv = ids[0][i] if ids and ids[0] and len(ids[0]) > i else None
                                 doc = documents[0][i] if documents and documents[0] and len(documents[0]) > i else None
                                 meta = metadatas[0][i] if metadatas and metadatas[0] and len(metadatas[0]) > i else None
-                            except Exception:
-                                idv = None
-                                doc = None
-                                meta = None
+                            except Exception as e:
+                                logger.warning(f"⚠️ Ошибка извлечения данных для результата {i}: {e}")
+                                continue
 
                             result = {
                                 'id': idv,
@@ -504,8 +536,41 @@ class ChromaDBManager:
                                 'distance': distance
                             }
                             filtered_results.append(result)
+                            found_count += 1
+                            
+                            # Ограничиваем количество результатов
+                            if found_count >= n_results:
+                                break
+                    
+                    # Если ничего не найдено даже с адаптивным порогом, берем лучшие результаты
+                    if not filtered_results and distances[0]:
+                        logger.info(f"⚠️ Ничего не найдено с порогом {adaptive_threshold:.3f}, берем {min(3, len(distances[0]))} лучших результата")
+                        best_results = min(3, len(distances[0]))
+                        for i in range(best_results):
+                            distance = distances[0][i]
+                            similarity = 1 - distance
+                            
+                            try:
+                                idv = ids[0][i] if ids and ids[0] and len(ids[0]) > i else None
+                                doc = documents[0][i] if documents and documents[0] and len(documents[0]) > i else None
+                                meta = metadatas[0][i] if metadatas and metadatas[0] and len(metadatas[0]) > i else None
+                                
+                                result = {
+                                    'id': idv,
+                                    'document': doc,
+                                    'metadata': meta,
+                                    'similarity': similarity,
+                                    'distance': distance
+                                }
+                                filtered_results.append(result)
+                            except Exception as e:
+                                logger.warning(f"⚠️ Ошибка извлечения лучшего результата {i}: {e}")
+                else:
+                    logger.warning("⚠️ Пустые результаты поиска в ChromaDB")
+            else:
+                logger.warning("⚠️ Некорректный формат результатов поиска")
             
-            logger.info(f"🔍 Найдено {len(filtered_results)} похожих диалогов")
+            logger.info(f"✅ Найдено {len(filtered_results)} похожих диалогов")
             return filtered_results
             
         except Exception as e:
@@ -595,29 +660,59 @@ class ChromaDBManager:
             return ""
         
         try:
-            # Ищем похожие диалоги
+            # Ищем похожие диалоги с адаптивным порогом
             similar_conversations = self.search_similar_conversations(
-                query, n_results=3, similarity_threshold=0.6
+                query, n_results=5, similarity_threshold=None  # Автоматический порог
             )
             
             if not similar_conversations:
+                logger.info("📚 Релевантный контекст не найден")
                 return ""
+            
+            logger.info(f"📚 Найдено {len(similar_conversations)} релевантных диалогов для контекста")
             
             # Формируем контекст
             context_parts = []
             current_length = 0
             
-            for conv in similar_conversations:
-                conv_text = f"Предыдущий диалог (схожесть {conv['similarity']:.2f}):\n{conv['document']}\n"
+            for i, conv in enumerate(similar_conversations):
+                # Извлекаем пользовательское сообщение из метаданных если доступно
+                user_msg = ""
+                ai_resp = ""
                 
-                if current_length + len(conv_text) <= max_context_length:
-                    context_parts.append(conv_text)
-                    current_length += len(conv_text)
-                else:
-                    break
+                if conv.get('metadata') and isinstance(conv['metadata'], dict):
+                    user_msg = conv['metadata'].get('user_message', '')
+                    ai_resp = conv['metadata'].get('ai_response', '')
+                
+                # Если метаданные недоступны, пытаемся извлечь из документа
+                if not user_msg and conv.get('document'):
+                    doc = conv['document']
+                    if 'User:' in doc and 'AI:' in doc:
+                        parts = doc.split('AI:', 1)
+                        if len(parts) >= 2:
+                            user_part = parts[0].replace('User:', '').strip()
+                            user_msg = user_part
+                
+                if user_msg:
+                    conv_text = f"Похожий запрос #{i+1} (схожесть: {conv['similarity']:.3f}):\n"
+                    conv_text += f"Пользователь: {user_msg[:200]}{'...' if len(user_msg) > 200 else ''}\n"
+                    
+                    if ai_resp and len(ai_resp) < 300:  # Включаем короткие ответы
+                        clean_ai_resp = ai_resp.replace('<think>', '').replace('</think>', '')
+                        if len(clean_ai_resp) < 200:
+                            conv_text += f"Ответ: {clean_ai_resp[:150]}{'...' if len(clean_ai_resp) > 150 else ''}\n"
+                    
+                    conv_text += "\n"
+                    
+                    if current_length + len(conv_text) <= max_context_length:
+                        context_parts.append(conv_text)
+                        current_length += len(conv_text)
+                    else:
+                        break
             
-            context = "\n".join(context_parts)
-            logger.info(f"📚 Получен контекст длиной {len(context)} символов")
+            context = "".join(context_parts)
+            if context:
+                logger.info(f"✅ Сформирован контекст длиной {len(context)} символов из {len(context_parts)} диалогов")
             return context
             
         except Exception as e:
