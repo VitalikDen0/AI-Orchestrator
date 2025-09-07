@@ -121,10 +121,16 @@ p.s. **abliterated** по причине того, что она будет ме
 - **Альтернативная улучшенная**: [CivitAI](https://civitai.com/models/827184) (~8GB VRAM) (мой личный фаворит, очень нравится, SDXL)
 - **LoRA для улучшения**: [Detail Tweaker LoRA](https://civitai.com/models/58390) (настройки: strength=2) (можно и без нее, результат вряд ли заметите, используйте еще LoRA на фикс пальцев)
 
-<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/e21db971-0cfa-4d7f-969d-589ce1f42030" />
-<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/bbe62c62-8570-49cc-9186-9d428099aa8f" />
-<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/667ad7b2-7d4a-4ff2-9b26-74d3967f2228" />
-<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/83966705-d90a-4235-9719-504963ad9bff" />
+<table>
+  <tr>
+    <td><img src="https://github.com/user-attachments/assets/e21db971-0cfa-4d7f-969d-589ce1f42030" width="100%"/></td>
+    <td><img src="https://github.com/user-attachments/assets/bbe62c62-8570-49cc-9186-9d428099aa8f" width="100%"/></td>
+  </tr>
+  <tr>
+    <td><img src="https://github.com/user-attachments/assets/667ad7b2-7d4a-4ff2-9b26-74d3967f2228" width="100%"/></td>
+    <td><img src="https://github.com/user-attachments/assets/83966705-d90a-4235-9719-504963ad9bff" width="100%"/></td>
+  </tr>
+</table>
 
 Это примеры генерации novaAnime_v20 без явного указания деталей (нейросеть сама поставит нужное)
 
