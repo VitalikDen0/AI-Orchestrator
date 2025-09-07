@@ -8,7 +8,7 @@ AI PowerShell Orchestrator with Google Search Integration
 ОБНОВЛЕНО: Добавлено векторное хранилище ChromaDB для преодоления ограничений контекста
 
 ТРЕБУЕМЫЕ БИБЛИОТЕКИ:
-pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors chromadb sentence-transformers
+pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors chromadb sentence-transformers python-docx openpyxl pandas
 """
 
 import requests
@@ -48,6 +48,48 @@ SentenceTransformer: _Any = None
 torch: _Any = None
 _imageio: _Any = None
 _pygame: _Any = None
+
+# Импорты для работы с документами
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    Document = None
+
+try:
+    import pandas as pd
+    import openpyxl
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+
+# Импорты для работы с PDF
+try:
+    import PyPDF2
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    PyPDF2 = None
+
+# Импорты для генерации файлов
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.units import inch
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+try:
+    import markdown
+    MARKDOWN_AVAILABLE = True
+except ImportError:
+    MARKDOWN_AVAILABLE = False
+    pd = None
+    openpyxl = None
 
 # Импорты для ChromaDB и векторного поиска
 try:
@@ -3199,6 +3241,29 @@ class AIOrchestrator:
   "content": "Полноый текст ответа, не будет озвучен, нужен как менее важный текст"
 }
 
+Пример с просмотром папки:
+{
+  "action": "list_files",
+  "folder": "Excel",
+  "description": "Просматриваю содержимое папки Excel"
+}
+
+Пример с обработкой документа:
+{
+  "action": "process_document",
+  "file_path": "document.docx",
+  "description": "Обрабатываю DOCX документ"
+}
+
+Пример с генерацией файла:
+{
+  "action": "generate_file",
+  "content": "Содержимое файла...",
+  "filename": "report.docx",
+  "file_type": "docx",
+  "description": "Создаю отчёт в формате DOCX"
+}
+
 11. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ: Если пользователь использует слова "сгенерируй", "нарисуй", "создай изображение", "покажи как выглядит", "визуализируй", "изобрази" или подобные по смыслу, И генерация изображений включена, используй действие "generate_image" с подробным описанием. ВАЖНО: После успешной генерации изображения система автоматически завершит диалог - НЕ пытайся генерировать повторно!
 12. Если задача требует несколько шагов (например, поиск + создание файла), всегда строй цепочку действий: сначала "search", затем обработай результат и только потом "powershell" для создания/записи файла, и только после этого — "response".
 13. После каждого шага жди результат и только потом предлагай следующий JSON-действие.
@@ -3211,6 +3276,22 @@ class AIOrchestrator:
 20. Не повторяй одни и те же действия без необходимости.
 21. Если не уверен, уточни у пользователя.
 22. Директория Desktop: C:\\Users\\vital\\Desktop
+
+ДОСТУПНЫЕ ПАПКИ И ФАЙЛЫ:
+- Audio/ - аудиофайлы (MP3, WAV, OGG, FLAC, M4A)
+- Photos/ - изображения (JPG, PNG, GIF, BMP, WEBP)
+- Video/ - видеофайлы (MP4, AVI, MKV, MOV, WMV)
+- Excel/ - таблицы Excel (XLSX, XLS, CSV)
+- Docx/ - документы Word (DOCX, DOC)
+- PDF/ - PDF документы
+- output/ - создаваемые файлы
+
+РАБОТА С ДОКУМЕНТАМИ И ФАЙЛАМИ:
+- Используй действие "list_files" с параметром folder для просмотра содержимого папки
+- Для обработки DOCX/Excel/PDF файлов используй действие "process_document"
+- Для создания файлов используй действие "generate_file" (создаст файл в папке output)
+- Система автоматически применяет RAG для больших документов
+- Аудио обрабатывается только по запросу пользователя
 
 НОВЫЕ ПРАВИЛА ДЛЯ РАБОТЫ С ИЗОБРАЖЕНИЯМИ И ВИДЕО:
 23. Если тебе предоставлено изображение, детально опиши его содержимое в начале ответа.
@@ -3225,6 +3306,504 @@ class AIOrchestrator:
 
 ПОМНИ: Ты не просто исполнитель команд, а интеллектуальный помощник, который думает, планирует и адаптируется!
 """
+
+    def list_folder_contents(self, folder_name: str) -> str:
+        """
+        Получение списка файлов в указанной папке
+        
+        Args:
+            folder_name: Имя папки (Audio, Photos, Video, Excel, Docx, PDF)
+        
+        Returns:
+            Строка со списком файлов или сообщение об ошибке
+        """
+        try:
+            folder_path = os.path.join(self.base_dir, folder_name)
+            
+            if not os.path.exists(folder_path):
+                return f"Папка {folder_name} не существует"
+            
+            files = os.listdir(folder_path)
+            if not files:
+                return f"Папка {folder_name} пуста"
+            
+            # Группируем файлы по типу
+            file_types = {
+                'Документы DOCX': [],
+                'Таблицы Excel': [],
+                'Документы PDF': [],
+                'Изображения': [],
+                'Аудио': [],
+                'Видео': [],
+                'Другие': []
+            }
+            
+            for file in files:
+                file_lower = file.lower()
+                if file_lower.endswith(('.docx', '.doc')):
+                    file_types['Документы DOCX'].append(file)
+                elif file_lower.endswith(('.xlsx', '.xls', '.csv')):
+                    file_types['Таблицы Excel'].append(file)
+                elif file_lower.endswith('.pdf'):
+                    file_types['Документы PDF'].append(file)
+                elif file_lower.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
+                    file_types['Изображения'].append(file)
+                elif file_lower.endswith(('.mp3', '.wav', '.ogg', '.flac', '.m4a')):
+                    file_types['Аудио'].append(file)
+                elif file_lower.endswith(('.mp4', '.avi', '.mkv', '.mov', '.wmv')):
+                    file_types['Видео'].append(file)
+                else:
+                    file_types['Другие'].append(file)
+            
+            result = f"Содержимое папки {folder_name}:\n"
+            for file_type, file_list in file_types.items():
+                if file_list:
+                    result += f"\n{file_type}:\n"
+                    for file in sorted(file_list):
+                        result += f"  - {file}\n"
+            
+            return result
+            
+        except Exception as e:
+            return f"Ошибка при чтении папки {folder_name}: {str(e)}"
+
+    def extract_docx_content(self, file_path: str) -> tuple[str, str]:
+        """
+        Извлечение текста из DOCX файла
+        
+        Args:
+            file_path: Путь к DOCX файлу
+        
+        Returns:
+            Кортеж (текст, сообщение_об_ошибке)
+        """
+        try:
+            from docx import Document
+            
+            if not os.path.exists(file_path):
+                return "", f"Файл {file_path} не найден"
+            
+            doc = Document(file_path)
+            text_content = []
+            
+            # Извлекаем текст из параграфов
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    text_content.append(paragraph.text.strip())
+            
+            # Извлекаем текст из таблиц
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            text_content.append(cell.text.strip())
+            
+            full_text = '\n'.join(text_content)
+            
+            if not full_text.strip():
+                return "", "Документ не содержит текста"
+            
+            return full_text, ""
+            
+        except ImportError:
+            return "", "Библиотека python-docx не установлена. Установите: pip install python-docx"
+        except Exception as e:
+            return "", f"Ошибка при чтении DOCX файла: {str(e)}"
+
+    def extract_excel_content(self, file_path: str) -> tuple[str, str]:
+        """
+        Извлечение данных из Excel файла
+        
+        Args:
+            file_path: Путь к Excel файлу
+        
+        Returns:
+            Кортеж (данные_в_текстовом_формате, сообщение_об_ошибке)
+        """
+        try:
+            import pandas as pd
+            
+            if not os.path.exists(file_path):
+                return "", f"Файл {file_path} не найден"
+            
+            # Читаем все листы Excel файла
+            excel_data = pd.read_excel(file_path, sheet_name=None)
+            
+            content_parts = []
+            
+            for sheet_name, df in excel_data.items():
+                content_parts.append(f"=== Лист: {sheet_name} ===\n")
+                
+                # Проверяем, есть ли данные
+                if df.empty:
+                    content_parts.append("Лист пуст\n")
+                    continue
+                
+                # Конвертируем DataFrame в текстовое представление
+                content_parts.append(df.to_string(index=False))
+                content_parts.append("\n")
+            
+            full_content = '\n'.join(content_parts)
+            
+            if not full_content.strip():
+                return "", "Excel файл не содержит данных"
+            
+            return full_content, ""
+            
+        except ImportError:
+            return "", "Библиотеки pandas/openpyxl не установлены. Установите: pip install pandas openpyxl"
+        except Exception as e:
+            return "", f"Ошибка при чтении Excel файла: {str(e)}"
+
+    def extract_pdf_content(self, file_path: str) -> tuple[str, str]:
+        """
+        Извлечение текста из PDF файла
+        
+        Args:
+            file_path: Путь к PDF файлу
+        
+        Returns:
+            Кортеж (текст, сообщение_об_ошибке)
+        """
+        try:
+            if not PDF_AVAILABLE:
+                return "", "Библиотека PyPDF2 не установлена. Установите: pip install PyPDF2"
+            
+            if not os.path.exists(file_path):
+                return "", f"Файл {file_path} не найден"
+            
+            text_content = []
+            
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                # Проверяем, есть ли страницы
+                if len(pdf_reader.pages) == 0:
+                    return "", "PDF файл не содержит страниц"
+                
+                # Извлекаем текст со всех страниц
+                for page_num, page in enumerate(pdf_reader.pages, 1):
+                    try:
+                        page_text = page.extract_text()
+                        if page_text.strip():
+                            text_content.append(f"=== Страница {page_num} ===\n{page_text.strip()}")
+                    except Exception as e:
+                        text_content.append(f"=== Страница {page_num} ===\n[Ошибка извлечения текста: {str(e)}]")
+            
+            full_text = '\n\n'.join(text_content)
+            
+            if not full_text.strip():
+                return "", "PDF файл не содержит извлекаемого текста"
+            
+            return full_text, ""
+            
+        except Exception as e:
+            return "", f"Ошибка при чтении PDF файла: {str(e)}"
+
+    def rag_process_large_content(self, content: str, max_tokens: int = 4000) -> str:
+        """
+        RAG-обработка больших документов с разделением на части
+        
+        Args:
+            content: Содержимое документа
+            max_tokens: Максимальное количество токенов на часть
+        
+        Returns:
+            Обработанное содержимое (сжатое или разделенное)
+        """
+        try:
+            # Приблизительная оценка токенов (1 токен ≈ 4 символа для русского текста)
+            estimated_tokens = len(content) // 4
+            
+            if estimated_tokens <= max_tokens:
+                return content
+            
+            # Если документ слишком большой, разделяем на части
+            chunk_size = max_tokens * 4  # Размер части в символах
+            chunks = []
+            
+            # Разделяем по предложениям, чтобы сохранить смысл
+            sentences = content.split('.')
+            current_chunk = ""
+            
+            for sentence in sentences:
+                if len(current_chunk + sentence) < chunk_size:
+                    current_chunk += sentence + "."
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = sentence + "."
+                    else:
+                        # Если одно предложение больше chunk_size, берем как есть
+                        chunks.append(sentence.strip())
+            
+            # Добавляем последнюю часть
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            
+            # Возвращаем первые 3 части с указанием общего количества
+            if len(chunks) <= 3:
+                if len(chunks) > 1:
+                    return f"=== ДОКУМЕНТ РАЗДЕЛЕН НА {len(chunks)} ЧАСТЕЙ ===\n\n" + '\n\n=== ЧАСТЬ ДОКУМЕНТА ===\n\n'.join(chunks)
+                else:
+                    return chunks[0] if chunks else content[:max_tokens * 4]
+            else:
+                result = f"=== ДОКУМЕНТ РАЗДЕЛЕН НА {len(chunks)} ЧАСТЕЙ ===\n\n"
+                result += '\n\n=== ЧАСТЬ ДОКУМЕНТА ===\n\n'.join(chunks[:3])
+                result += f"\n\n[ПОКАЗАНЫ ПЕРВЫЕ 3 ЧАСТИ ИЗ {len(chunks)}. СПРОСИТЕ, ЕСЛИ НУЖНО БОЛЬШЕ ИНФОРМАЦИИ]"
+                return result
+                
+        except Exception as e:
+            logger.error(f"Ошибка RAG обработки: {e}")
+            return content[:max_tokens * 4] + "\n\n[СОДЕРЖИМОЕ ОБРЕЗАНО ДУЕ К РАЗМЕРУ]"
+
+    def process_document_request(self, file_path: str) -> str:
+        """
+        Обработка запроса на работу с документом
+        
+        Args:
+            file_path: Путь к файлу
+        
+        Returns:
+            Обработанное содержимое документа
+        """
+        try:
+            file_lower = file_path.lower()
+            
+            if file_lower.endswith(('.docx', '.doc')):
+                content, error = self.extract_docx_content(file_path)
+                if error:
+                    return f"Ошибка при обработке DOCX: {error}"
+                
+                # RAG обработка для больших документов
+                processed_content = self.rag_process_large_content(content)
+                return f"Содержимое DOCX документа:\n\n{processed_content}"
+                
+            elif file_lower.endswith(('.xlsx', '.xls')):
+                content, error = self.extract_excel_content(file_path)
+                if error:
+                    return f"Ошибка при обработке Excel: {error}"
+                
+                # RAG обработка для больших таблиц
+                processed_content = self.rag_process_large_content(content)
+                return f"Содержимое Excel файла:\n\n{processed_content}"
+                
+            elif file_lower.endswith('.pdf'):
+                content, error = self.extract_pdf_content(file_path)
+                if error:
+                    return f"Ошибка при обработке PDF: {error}"
+                
+                # RAG обработка для больших PDF документов
+                processed_content = self.rag_process_large_content(content)
+                return f"Содержимое PDF документа:\n\n{processed_content}"
+                
+            elif file_lower.endswith('.csv'):
+                # Для CSV используем pandas
+                try:
+                    import pandas as pd
+                    df = pd.read_csv(file_path)
+                    content = df.to_string(index=False)
+                    processed_content = self.rag_process_large_content(content)
+                    return f"Содержимое CSV файла:\n\n{processed_content}"
+                except Exception as e:
+                    return f"Ошибка при чтении CSV: {str(e)}"
+                    
+            else:
+                return f"Неподдерживаемый формат файла: {file_path}"
+                
+        except Exception as e:
+            return f"Ошибка при обработке документа: {str(e)}"
+
+    def generate_docx_file(self, content: str, filename: str) -> str:
+        """
+        Генерация DOCX файла
+        
+        Args:
+            content: Содержимое документа
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            if not DOCX_AVAILABLE:
+                return "Ошибка: Библиотека python-docx не установлена"
+            
+            # Создаем документ
+            doc = Document()
+            
+            # Разделяем контент на параграфы
+            paragraphs = content.split('\n')
+            
+            for paragraph_text in paragraphs:
+                if paragraph_text.strip():
+                    # Проверяем, является ли строка заголовком (начинается с #)
+                    if paragraph_text.strip().startswith('#'):
+                        # Убираем # и создаем заголовок
+                        title_text = paragraph_text.strip().lstrip('#').strip()
+                        heading = doc.add_heading(title_text, level=1)
+                    else:
+                        doc.add_paragraph(paragraph_text.strip())
+            
+            # Сохраняем файл - убираем расширение если есть и добавляем .docx
+            base_name = filename.replace('.docx', '').replace('.doc', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.docx")
+            doc.save(output_path)
+            
+            return f"Документ успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании DOCX файла: {str(e)}"
+
+    def generate_excel_file(self, content: str, filename: str) -> str:
+        """
+        Генерация Excel файла
+        
+        Args:
+            content: Содержимое в формате таблицы (разделители - табуляция или запятые)
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            if not EXCEL_AVAILABLE:
+                return "Ошибка: Библиотеки pandas/openpyxl не установлены"
+            
+            # Пытаемся разобрать контент как табличные данные
+            lines = content.strip().split('\n')
+            if not lines:
+                return "Ошибка: Пустое содержимое для Excel файла"
+            
+            # Определяем разделитель (табуляция или запятая)
+            delimiter = '\t' if '\t' in lines[0] else ','
+            
+            # Создаем DataFrame
+            import io
+            data_string = '\n'.join(lines)
+            df = pd.read_csv(io.StringIO(data_string), delimiter=delimiter)
+            
+            # Сохраняем файл - убираем расширение если есть и добавляем .xlsx
+            base_name = filename.replace('.xlsx', '').replace('.xls', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.xlsx")
+            df.to_excel(output_path, index=False)
+            
+            return f"Excel файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании Excel файла: {str(e)}"
+
+    def generate_markdown_file(self, content: str, filename: str) -> str:
+        """
+        Генерация Markdown файла
+        
+        Args:
+            content: Содержимое в формате Markdown
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            # Сохраняем файл - убираем расширение если есть и добавляем .md
+            base_name = filename.replace('.md', '').replace('.markdown', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.md")
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            return f"Markdown файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании Markdown файла: {str(e)}"
+
+    def generate_pdf_file(self, content: str, filename: str) -> str:
+        """
+        Генерация PDF файла
+        
+        Args:
+            content: Содержимое документа
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            if not REPORTLAB_AVAILABLE:
+                return "Ошибка: Библиотека reportlab не установлена"
+            
+            # Сохраняем файл - убираем расширение если есть и добавляем .pdf
+            base_name = filename.replace('.pdf', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.pdf")
+            
+            # Создаем PDF документ
+            doc = SimpleDocTemplate(output_path, pagesize=A4)
+            styles = getSampleStyleSheet()
+            story = []
+            
+            # Разделяем контент на параграфы
+            paragraphs = content.split('\n')
+            
+            for paragraph_text in paragraphs:
+                if paragraph_text.strip():
+                    # Проверяем, является ли строка заголовком
+                    if paragraph_text.strip().startswith('#'):
+                        title_text = paragraph_text.strip().lstrip('#').strip()
+                        p = Paragraph(title_text, styles['Heading1'])
+                    else:
+                        p = Paragraph(paragraph_text.strip(), styles['Normal'])
+                    story.append(p)
+                    story.append(Spacer(1, 12))
+            
+            # Строим документ
+            doc.build(story)
+            
+            return f"PDF файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании PDF файла: {str(e)}"
+            
+        except Exception as e:
+            return f"Ошибка при создании PDF файла: {str(e)}"
+
+    def generate_file(self, content: str, filename: str, file_format: str) -> bool:
+        """
+        Универсальный метод генерации файлов
+        
+        Args:
+            content: Содержимое файла
+            filename: Полное имя файла с расширением
+            file_format: Формат файла (docx, excel, md, pdf)
+        
+        Returns:
+            True если файл создан успешно, False иначе
+        """
+        try:
+            # Создаем папку output если её нет
+            output_dir = os.path.join(self.base_dir, "output")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            format_lower = file_format.lower()
+            
+            if format_lower in ['docx', 'doc', 'word']:
+                result = self.generate_docx_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['excel', 'xlsx', 'xls']:
+                result = self.generate_excel_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['md', 'markdown']:
+                result = self.generate_markdown_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['pdf']:
+                result = self.generate_pdf_file(content, filename)
+                return "успешно создан" in result.lower()
+            else:
+                logger.error(f"Неподдерживаемый формат файла: {file_format}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Ошибка при генерации файла: {str(e)}")
+            return False
 
     def auto_disable_tools(self, tool_name: Optional[str] = None):
         """Автоматически выключает инструмент через заданное время после использования"""
@@ -4049,6 +4628,93 @@ class AIOrchestrator:
         logger.info(content)
         return False
 
+    def _handle_list_files(self, action_data: Dict[str, Any]) -> Union[bool, str]:
+        """
+        Обработчик для просмотра содержимого папок
+        """
+        folder = action_data.get("folder", "")
+        description = action_data.get("description", f"Просмотр содержимого папки {folder}")
+        
+        logger.info(f"\n📁 ПРОСМОТР ПАПКИ: {description}")
+        logger.info(f"📂 Папка: {folder}")
+        
+        result = self.list_folder_contents(folder)
+        
+        logger.info(f"📋 Результат:\n{result}")
+        
+        follow_up = self.call_brain_model(f"Содержимое папки '{folder}': {result}")
+        return follow_up
+
+    def _handle_process_document(self, action_data: Dict[str, Any]) -> Union[bool, str]:
+        """
+        Обработчик для обработки документов (DOCX, Excel, PDF)
+        """
+        file_path = action_data.get("file_path", "")
+        description = action_data.get("description", f"Обработка документа {file_path}")
+        
+        logger.info(f"\n📄 ОБРАБОТКА ДОКУМЕНТА: {description}")
+        logger.info(f"📁 Файл: {file_path}")
+        
+        # Проверяем, является ли путь относительным и добавляем базовую директорию
+        if not os.path.isabs(file_path):
+            # Определяем папку по расширению файла
+            file_lower = file_path.lower()
+            if file_lower.endswith(('.docx', '.doc')):
+                full_path = os.path.join(self.base_dir, "Docx", file_path)
+            elif file_lower.endswith(('.xlsx', '.xls', '.csv')):
+                full_path = os.path.join(self.base_dir, "Excel", file_path)
+            elif file_lower.endswith('.pdf'):
+                full_path = os.path.join(self.base_dir, "PDF", file_path)
+            else:
+                full_path = os.path.join(self.base_dir, file_path)
+        else:
+            full_path = file_path
+        
+        result = self.process_document_request(full_path)
+        
+        logger.info(f"📋 Результат обработки:\n{result[:500]}...")
+        
+        follow_up = self.call_brain_model(f"Результат обработки документа '{file_path}': {result}")
+        return follow_up
+
+    def _handle_generate_file(self, action_data: Dict[str, Any]) -> Union[bool, str]:
+        """
+        Обработчик для генерации файлов (DOCX, Excel, PDF, Markdown)
+        """
+        content = action_data.get("content", "")
+        filename = action_data.get("filename", "")
+        file_type = action_data.get("file_type", "").lower()
+        description = action_data.get("description", f"Генерация файла {filename}")
+        
+        logger.info(f"\n📝 ГЕНЕРАЦИЯ ФАЙЛА: {description}")
+        logger.info(f"📁 Имя файла: {filename}")
+        logger.info(f"📄 Тип файла: {file_type}")
+        
+        if not content:
+            follow_up = self.call_brain_model("Ошибка: не указано содержимое для генерации файла")
+            return follow_up
+        
+        if not filename:
+            follow_up = self.call_brain_model("Ошибка: не указано имя файла")
+            return follow_up
+        
+        # Определяем путь в папку output
+        output_path = os.path.join(self.base_dir, "output", filename)
+        
+        try:
+            success = self.generate_file(content, output_path, file_type)
+            if success:
+                logger.info(f"✅ Файл успешно создан: {output_path}")
+                follow_up = self.call_brain_model(f"Файл '{filename}' успешно создан в папке output")
+            else:
+                logger.error(f"❌ Ошибка при создании файла: {output_path}")
+                follow_up = self.call_brain_model(f"Ошибка при создании файла '{filename}'")
+        except Exception as e:
+            logger.error(f"❌ Исключение при создании файла: {e}")
+            follow_up = self.call_brain_model(f"Ошибка при создании файла '{filename}': {str(e)}")
+        
+        return follow_up
+
     def _process_ai_response_impl(self, ai_response: str) -> bool:
         """
         Подробная реализация обработки ответа AI (перенесена из original `process_ai_response`).
@@ -4165,6 +4831,12 @@ class AIOrchestrator:
                     handler_result = self._handle_generate_video(action_data)
                 elif action == "speak":
                     handler_result = self._handle_speak(action_data)
+                elif action == "list_files":
+                    handler_result = self._handle_list_files(action_data)
+                elif action == "process_document":
+                    handler_result = self._handle_process_document(action_data)
+                elif action == "generate_file":
+                    handler_result = self._handle_generate_file(action_data)
                 elif action == "response":
                     handler_result = self._handle_response(action_data)
                 else:
@@ -4198,7 +4870,10 @@ class AIOrchestrator:
         # Показываем сообщения только в консольном режиме
         if getattr(self, 'show_images_locally', True):
             logger.info("🚀 AI PowerShell Оркестратор запущен!")
-            logger.info("💡 Если в папке Photos есть изображение или в Audio есть аудиофайл, сначала будет анализ глазами/ушами, затем вы сможете задать вопрос для мозга.")
+            logger.info("💡 Используйте новые команды для работы с файлами:")
+            logger.info("   - list_files: просмотр содержимого папок (Audio, Photos, Video, Excel, Docx, PDF)")
+            logger.info("   - process_document: обработка DOCX, Excel и PDF файлов с RAG поддержкой")
+            logger.info("   - generate_file: создание файлов (DOCX, Excel, PDF, Markdown) в папке output")
             logger.info(f"🧠 Модель: {os.path.basename(self.brain_model)}")
             logger.info(f"📊 {self.get_context_info()}")
             logger.info("💻 Доступные команды: 'stats' (метрики), 'reset' (сброс), 'logs' (логи), 'export' (экспорт), 'memory' (память), 'gpu' (видеокарта), 'search' (поиск), 'preferences' (предпочтения), 'cleanup' (очистка), 'exit' (выход)")
@@ -4208,53 +4883,12 @@ class AIOrchestrator:
         audio_text = ""
         while True:
             try:
-                # 1. Проверяем наличие нового изображения
-                image_path = self.find_new_image()
-                image_base64 = ""
-                if image_path:
-                    # Показываем сообщения только в консольном режиме
-                    if getattr(self, 'show_images_locally', True):
-                        logger.info(f"📸 Найдено изображение: {os.path.basename(image_path)}")
-                    image_base64 = image_to_base64_balanced(image_path)
-                    if image_base64:
-                        if getattr(self, 'show_images_locally', True):
-                            logger.info(f"✅ Изображение обработано (размер: {len(image_base64)} символов)")
-                        # Сохраняем копию base64-изображения в корень проекта
-                        try:
-                            # base64 и io уже импортированы в начале файла
-                            img_bytes = base64.b64decode(image_base64)
-                            with open(os.path.join(os.path.dirname(__file__), "last_sent_image.png"), "wb") as f:
-                                f.write(img_bytes)
-                            if getattr(self, 'show_images_locally', True):
-                                logger.info("🖼️ Сжатое изображение сохранено как last_sent_image.png")
-                        except Exception as e:
-                            if getattr(self, 'show_images_locally', True):
-                                logger.warning(f"⚠️ Не удалось сохранить last_sent_image.png: {e}")
-                        # Отправляем изображение в vision-модель
-                        vision_desc = self.call_vision_model(image_base64)
-                        if getattr(self, 'show_images_locally', True):
-                            logger.info("\n👁️ Описание изображения (глаза):\n" + vision_desc)
-                        self.mark_image_used(image_path)
-                    else:
-                        if getattr(self, 'show_images_locally', True):
-                            logger.error("❌ Ошибка обработки изображения")
-                else:
-                    vision_desc = ""
-
-                audio_path = self.find_new_audio()
-                if audio_path:
-                    # Показываем сообщения только в консольном режиме
-                    if getattr(self, 'show_images_locally', True):
-                        logger.info(f"🔊 Найден аудиофайл: {os.path.basename(audio_path)}")
-                        # Запросить язык у пользователя
-                        lang = input("�� Введите язык аудиофайла (например, ru, en, etc..) или Enter для ru: ").strip() or "ru"
-                    else:
-                        # В веб-режиме используем русский по умолчанию
-                        lang = "ru"
-                    audio_text = self.transcribe_audio_whisper(audio_path, lang=lang, use_separator=getattr(self, 'use_separator', True))
-                    # Транскрипт уже выведен внутри transcribe_audio_whisper, не дублируем
-                else:
-                    audio_text = ""
+                # АВТОМАТИЧЕСКАЯ ОБРАБОТКА ФАЙЛОВ ОТКЛЮЧЕНА - ТЕПЕРЬ ТОЛЬКО ПО ЗАПРОСУ
+                # Автоматический поиск и обработка изображений/аудио удалена
+                # Используйте новые действия: list_files и process_document
+                
+                vision_desc = ""
+                audio_text = ""
 
                 # 3. Запрашиваем у пользователя текстовый вопрос
                 try:
