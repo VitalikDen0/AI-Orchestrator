@@ -58,11 +58,14 @@
 ### Библиотеки Python
 
 ```bash
-pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors fastapi uvicorn pydantic python-telegram-bot python-dotenv gtts huggingface_hub audio-separator
-```
-Рекомендую установить torch torchvision с помощью:
-```bash
-pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128 # Я использую CUDA 12.8
+# Создание виртуальной среды
+python -m venv env
+
+# Активация (Windows)
+env\Scripts\activate
+
+# Установка зависимостей
+pip install -r requirements.txt
 ```
 
 ## 🚀 Установка и настройка
