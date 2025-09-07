@@ -116,11 +116,11 @@ p.s. **abliterated** по причине того, что она будет ме
 - Требования: ~2GB VRAM
 
 
-#### Stable Diffusion модель
+#### Stable Diffusion модель (аниме модели)
 
-- **novaAnime_v20**: [CivitAI](https://civitai.com/models/328365) (~4GB VRAM)
-- **Альтернативная улучшенная**: [CivitAI](https://civitai.com/models/827184) (~8GB VRAM)
-- **LoRA для улучшения пальцев**: [Detail Tweaker LoRA](https://civitai.com/models/58390) (настройки: strength=2)
+- **novaAnime_v20**: [CivitAI](https://civitai.com/models/328365) (~4GB VRAM) (проблема с пальцами, SD 1.5)
+- **Альтернативная улучшенная**: [CivitAI](https://civitai.com/models/827184) (~8GB VRAM) (мой личный фаворит, очень нравится, SDXL)
+- **LoRA для улучшения**: [Detail Tweaker LoRA](https://civitai.com/models/58390) (настройки: strength=2) (можно и без нее, результат вряд ли заметите, используйте еще LoRA на фикс пальцев)
 
 
 ### 2. Настройка переменных окружения
