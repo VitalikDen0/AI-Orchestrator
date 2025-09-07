@@ -59,10 +59,10 @@
 
 ```bash
 # Создание виртуальной среды
-python -m venv env
+python -m venv venv
 
 # Активация (Windows)
-env\Scripts\activate
+venv\Scripts\activate
 
 # Установка зависимостей
 pip install -r requirements.txt
