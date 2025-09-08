@@ -3306,11 +3306,25 @@ class AIOrchestrator:
   "description": "Извлекаю текст с изображения"
 }
 
-11. ИЗВЛЕЧЕНИЕ ТЕКСТА (OCR): Если пользователь просит "прочитать текст с изображения", "извлечь текст", "что написано на картинке" или подобное, используй действие "extract_text". Система автоматически применяет OCR если vision модель обнаружит текст на изображении, или принудительно при force_ocr=true.
+11. ИЗВЛЕЧЕНИЕ ТЕКСТА (OCR): Если пользователь ПРЯМО просит "прочитать текст с изображения", "извлечь текст", "что написано на картинке" или подобное, используй действие "extract_text". Это действие принудительно применяет OCR и возвращает только текст.
+
+Пример анализа изображения с возможным OCR:
+{
+  "action": "analyze_image",
+  "image_path": "photo.jpg", 
+  "check_for_text": true,
+  "description": "Анализирую изображение и проверяю наличие текста"
+}
+
+12. АНАЛИЗ ИЗОБРАЖЕНИЙ: Используй действие "analyze_image" для общего анализа изображений, когда пользователь НЕ просит конкретно извлечь текст. Установи check_for_text=true если подозреваешь наличие текста (документы, скриншоты, вывески, интерфейсы и т.д.). Система интеллектуально решит, нужен ли OCR, на основе vision анализа.
+
+РАЗЛИЧИЕ ДЕЙСТВИЙ:
+- extract_text: Для прямых запросов извлечения текста, всегда применяет OCR
+- analyze_image: Для общего анализа изображений, умно решает нужен ли OCR
 
 ВАЖНО: Если при извлечении текста произошла ошибка (файл не найден, OCR не удался и т.д.), НЕ выдумывай описание изображения или текст! Честно сообщи пользователю о реальной проблеме, основываясь на полученном сообщении об ошибке.
 
-13. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ: Если пользователь использует слова "сгенерируй", "нарисуй", "создай изображение", "покажи как выглядит", "визуализируй", "изобрази" или подобные по смыслу, И генерация изображений включена, используй действие "generate_image" с подробным описанием. ВАЖНО: После успешной генерации изображения система автоматически завершит диалог - НЕ пытайся генерировать повторно!
+14. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ: Если пользователь использует слова "сгенерируй", "нарисуй", "создай изображение", "покажи как выглядит", "визуализируй", "изобрази" или подобные по смыслу, И генерация изображений включена, используй действие "generate_image" с подробным описанием. ВАЖНО: После успешной генерации изображения система автоматически завершит диалог - НЕ пытайся генерировать повторно!
 14. Если задача требует несколько шагов (например, поиск + создание файла), всегда строй цепочку действий: сначала "search", затем обработай результат и только потом "powershell" для создания/записи файла, и только после этого — "response".
 15. После каждого шага жди результат и только потом предлагай следующий JSON-действие.
 16. Если пользователь просит сохранить или обработать результат поиска, обязательно сгенерируй команду для создания/записи файла через PowerShell.
@@ -3324,11 +3338,11 @@ class AIOrchestrator:
 22. Директория Desktop: C:\\Users\\vital\\Desktop
 
 ДОСТУПНЫЕ ПАПКИ И ФАЙЛЫ:
-- Audio/ - аудиофайлы (MP3, WAV, OGG, FLAC, M4A)
-- Photos/ - изображения (JPG, PNG, GIF, BMP, WEBP)
-- Video/ - видеофайлы (MP4, AVI, MKV, MOV, WMV)
+- Audio/ - аудиофайлы (MP3, WAV, OGG, FLAC, M4A, AAC, WMA)
+- Photos/ - изображения (JPG, PNG, GIF, BMP, WEBP) + OCR извлечение текста
+- Video/ - видеофайлы (MP4, AVI, MKV, MOV, WMV, FLV, WEBM) + анализ кадров + OCR
 - Excel/ - таблицы Excel (XLSX, XLS, CSV)
-- Docx/ - документы Word (DOCX, DOC)
+- Docx/ - документы Word (DOCX, DOC, TXT, MD, RTF, JSON, XML, HTML)
 - PDF/ - PDF документы
 - output/ - создаваемые файлы
 
@@ -3661,6 +3675,87 @@ class AIOrchestrator:
                 except Exception as e:
                     return f"Ошибка при чтении CSV: {str(e)}"
                     
+            elif file_lower.endswith(('.txt', '.md')):
+                # Текстовые файлы
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    processed_content = self.rag_process_large_content(content)
+                    file_type = "Markdown" if file_lower.endswith('.md') else "текстового"
+                    return f"Содержимое {file_type} файла:\n\n{processed_content}"
+                except UnicodeDecodeError:
+                    # Попробуем другие кодировки
+                    for encoding in ['cp1251', 'latin1']:
+                        try:
+                            with open(file_path, 'r', encoding=encoding) as f:
+                                content = f.read()
+                            processed_content = self.rag_process_large_content(content)
+                            return f"Содержимое текстового файла (кодировка {encoding}):\n\n{processed_content}"
+                        except:
+                            continue
+                    return f"Ошибка: не удалось определить кодировку файла {file_path}"
+                except Exception as e:
+                    return f"Ошибка при чтении текстового файла: {str(e)}"
+                    
+            elif file_lower.endswith(('.rtf')):
+                # RTF файлы
+                try:
+                    # Простое извлечение текста из RTF (базовое)
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    # Удаляем RTF команды (очень упрощенно)
+                    import re
+                    content = re.sub(r'\\[a-z]+\d*', '', content)  # Убираем команды типа \par, \b1 и т.д.
+                    content = re.sub(r'[{}]', '', content)  # Убираем фигурные скобки
+                    content = content.strip()
+                    processed_content = self.rag_process_large_content(content)
+                    return f"Содержимое RTF файла:\n\n{processed_content}"
+                except Exception as e:
+                    return f"Ошибка при обработке RTF: {str(e)}"
+                    
+            elif file_lower.endswith('.json'):
+                # JSON файлы
+                try:
+                    import json
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    # Преобразуем JSON в читаемый формат
+                    content = json.dumps(data, indent=2, ensure_ascii=False)
+                    processed_content = self.rag_process_large_content(content)
+                    return f"Содержимое JSON файла:\n\n{processed_content}"
+                except json.JSONDecodeError as e:
+                    return f"Ошибка в формате JSON: {str(e)}"
+                except Exception as e:
+                    return f"Ошибка при обработке JSON: {str(e)}"
+                    
+            elif file_lower.endswith(('.xml', '.html', '.htm')):
+                # XML/HTML файлы
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    # Для HTML попробуем извлечь только текст
+                    if file_lower.endswith(('.html', '.htm')):
+                        try:
+                            from bs4 import BeautifulSoup
+                            soup = BeautifulSoup(content, 'html.parser')
+                            # Удаляем скрипты и стили
+                            for script in soup(["script", "style"]):
+                                script.decompose()
+                            content = soup.get_text()
+                            # Очищаем лишние пробелы
+                            content = '\n'.join(line.strip() for line in content.splitlines() if line.strip())
+                        except ImportError:
+                            # Если BeautifulSoup не установлен, используем простое удаление тегов
+                            import re
+                            content = re.sub('<[^<]+?>', '', content)
+                    
+                    processed_content = self.rag_process_large_content(content)
+                    file_type = "HTML" if file_lower.endswith(('.html', '.htm')) else "XML"
+                    return f"Содержимое {file_type} файла:\n\n{processed_content}"
+                except Exception as e:
+                    return f"Ошибка при обработке XML/HTML: {str(e)}"
+                    
             else:
                 return f"Неподдерживаемый формат файла: {file_path}"
                 
@@ -3952,33 +4047,16 @@ class AIOrchestrator:
 
     def should_use_ocr_on_image(self, vision_description: str) -> bool:
         """
-        Определяет, стоит ли применять OCR на основе описания от vision модели
+        Определяет, нужно ли применять OCR на основе описания изображения.
+        Теперь использует интеллектуальную логику вместо простого поиска ключевых слов.
         
         Args:
             vision_description: Описание изображения от vision модели
-        
+            
         Returns:
-            bool: True если стоит применить OCR
+            bool: True если нужно применить OCR, False если нет
         """
-        # Ключевые слова, указывающие на наличие текста
-        text_indicators = [
-            'текст', 'надпись', 'подпись', 'заголовок', 'text', 'writing', 'sign',
-            'document', 'документ', 'страница', 'page', 'книга', 'book', 'статья',
-            'article', 'буквы', 'letters', 'слова', 'words', 'цифры', 'numbers',
-            'таблица', 'table', 'список', 'list', 'меню', 'menu', 'интерфейс',
-            'interface', 'экран', 'screen', 'веб-страница', 'webpage', 'сайт',
-            'website', 'приложение', 'app', 'программа', 'program'
-        ]
-        
-        vision_lower = vision_description.lower()
-        
-        # Проверяем наличие ключевых слов
-        for indicator in text_indicators:
-            if indicator in vision_lower:
-                logger.info(f"🔍 Обнаружен индикатор текста: '{indicator}'")
-                return True
-        
-        return False
+        return self.should_use_ocr_intelligently(vision_description)
 
     def process_image_with_smart_ocr(self, image_path: str, vision_description: str = "", force_ocr: bool = False) -> Tuple[str, str, str]:
         """
@@ -4996,6 +5074,141 @@ class AIOrchestrator:
         follow_up = self.call_brain_model(result_text)
         return follow_up
 
+    def _handle_analyze_image(self, action_data: Dict[str, Any]) -> Union[bool, str]:
+        """
+        Обработчик для анализа изображения с возможностью интеллектуального OCR.
+        
+        Args:
+            action_data: Данные действия с полями:
+                - image_path: Путь к изображению  
+                - check_for_text: Нужно ли проверять наличие текста (bool)
+                - description: Описание задачи (optional)
+        
+        Returns:
+            str: Follow-up для модели с результатами анализа
+        """
+        try:
+            image_path = action_data.get("image_path", "").strip()
+            check_for_text = action_data.get("check_for_text", False)
+            description = action_data.get("description", "")
+            
+            if not image_path:
+                logger.error("❌ Не указан путь к изображению")
+                return self.call_brain_model("❌ Ошибка: не указан путь к изображению")
+                
+            # Разрешаем путь
+            full_path = self.resolve_path(image_path)
+            if not os.path.exists(full_path):
+                logger.error(f"❌ Изображение не найдено: {full_path}")
+                return self.call_brain_model(f"❌ Изображение не найдено: {image_path}")
+            
+            logger.info(f"🔍 Анализирую изображение: {image_path}")
+            if description:
+                logger.info(f"📝 Задача: {description}")
+            
+            # Получаем vision описание
+            vision_description = ""
+            try:
+                vision_description = self.analyze_image_with_vision(full_path)
+                logger.info(f"👁️ Vision описание: {vision_description}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось получить vision описание: {e}")
+                vision_description = f"Ошибка анализа изображения: {e}"
+            
+            # Если запрошена проверка текста, принимаем решение об OCR
+            extracted_text = ""
+            ocr_info = ""
+            
+            if check_for_text:
+                logger.info("🔍 Проверяю наличие текста на изображении...")
+                
+                # Интеллектуальное решение об OCR на основе vision описания
+                should_use_ocr = self.should_use_ocr_intelligently(vision_description, description)
+                
+                if should_use_ocr:
+                    logger.info("✅ Применяю OCR для извлечения текста")
+                    try:
+                        extracted_text = self.extract_text_from_image(full_path)
+                        if extracted_text:
+                            ocr_info = f"\n\n📋 Извлеченный текст:\n{extracted_text}"
+                        else:
+                            ocr_info = "\n\n❌ OCR не обнаружил текст на изображении"
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка OCR: {e}")
+                        ocr_info = f"\n\n❌ Ошибка при извлечении текста: {e}"
+                else:
+                    logger.info("❌ OCR не требуется для данного изображения")
+                    ocr_info = "\n\n📝 OCR не применялся - на изображении не обнаружено значимого текста"
+            
+            # Формируем результат анализа
+            result_text = f"Анализ изображения '{image_path}':\n\n📸 Описание:\n{vision_description}{ocr_info}"
+            
+            logger.info(f"✅ Анализ завершен")
+            
+            follow_up = self.call_brain_model(result_text)
+            return follow_up
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при анализе изображения: {e}")
+            return self.call_brain_model(f"❌ Ошибка при анализе изображения: {e}")
+
+    def should_use_ocr_intelligently(self, vision_description: str, task_description: str = "") -> bool:
+        """
+        Интеллектуальное решение о необходимости OCR на основе контекста.
+        
+        Args:
+            vision_description: Описание изображения от vision модели
+            task_description: Описание задачи пользователя
+            
+        Returns:
+            bool: True если OCR нужен, False если нет
+        """
+        vision_lower = vision_description.lower()
+        task_lower = task_description.lower()
+        
+        # Явные индикаторы необходимости OCR
+        text_indicators = [
+            "text", "writing", "words", "letters", "document", "page", "book", "sign", 
+            "label", "caption", "title", "heading", "paragraph", "sentence", "line",
+            "screen", "display", "interface", "menu", "button", "dialog", "window",
+            "newspaper", "article", "magazine", "poster", "banner", "billboard",
+            "form", "table", "chart", "graph", "spreadsheet", "invoice", "receipt",
+            "card", "certificate", "license", "passport", "id", "ticket",
+            "текст", "надпись", "слова", "буквы", "документ", "страница", "книга",
+            "вывеска", "подпись", "заголовок", "строка", "экран", "интерфейс",
+            "меню", "кнопка", "окно", "газета", "статья", "плакат", "форма",
+            "таблица", "график", "чек", "карта", "сертификат", "билет"
+        ]
+        
+        # Индикаторы отсутствия текста
+        no_text_indicators = [
+            "landscape", "nature", "animal", "person", "face", "building", "car",
+            "food", "flower", "tree", "sky", "mountain", "water", "art", "painting",
+            "photo", "picture", "image", "scenery", "portrait", "selfie",
+            "пейзаж", "природа", "животное", "человек", "лицо", "здание", "машина",
+            "еда", "цветок", "дерево", "небо", "гора", "вода", "искусство", "картина",
+            "фото", "изображение", "портрет"
+        ]
+        
+        # Проверяем явные запросы OCR в задаче
+        if any(keyword in task_lower for keyword in ["текст", "text", "прочита", "read", "извлеч", "extract"]):
+            return True
+        
+        # Считаем индикаторы в vision описании
+        text_score = sum(1 for indicator in text_indicators if indicator in vision_lower)
+        no_text_score = sum(1 for indicator in no_text_indicators if indicator in vision_lower)
+        
+        # Решение на основе баланса индикаторов
+        if text_score >= 2:  # Несколько индикаторов текста
+            return True
+        elif text_score >= 1 and no_text_score == 0:  # Есть индикатор текста, нет противопоказаний
+            return True
+        elif no_text_score >= 2:  # Явно не текстовое изображение
+            return False
+        else:
+            # Граничный случай - OCR может быть полезен
+            return text_score > no_text_score
+
     def _process_ai_response_impl(self, ai_response: str) -> bool:
         """
         Подробная реализация обработки ответа AI (перенесена из original `process_ai_response`).
@@ -5120,6 +5333,8 @@ class AIOrchestrator:
                     handler_result = self._handle_generate_file(action_data)
                 elif action == "extract_text":
                     handler_result = self._handle_extract_text(action_data)
+                elif action == "analyze_image":
+                    handler_result = self._handle_analyze_image(action_data)
                 elif action == "response":
                     handler_result = self._handle_response(action_data)
                 else:
@@ -5155,8 +5370,14 @@ class AIOrchestrator:
             logger.info("🚀 AI PowerShell Оркестратор запущен!")
             logger.info("💡 Используйте новые команды для работы с файлами:")
             logger.info("   - list_files: просмотр содержимого папок (Audio, Photos, Video, Excel, Docx, PDF)")
-            logger.info("   - process_document: обработка DOCX, Excel и PDF файлов с RAG поддержкой")
+            logger.info("   - process_document: обработка всех типов документов (DOCX, DOC, PDF, XLSX, XLS, CSV, TXT, MD, RTF)")
+            logger.info("   - extract_text: OCR распознавание текста с изображений (с поддержкой русского и английского)")
             logger.info("   - generate_file: создание файлов (DOCX, Excel, PDF, Markdown) в папке output")
+            logger.info("📱 Telegram бот поддерживает:")
+            logger.info("   - Изображения: автоматический OCR + vision анализ")
+            logger.info("   - Документы: полная обработка всех поддерживаемых форматов")
+            logger.info("   - Аудио: транскрипция через Whisper")
+            logger.info("   - Видео: анализ кадров + OCR + извлечение аудио")
             logger.info(f"🧠 Модель: {os.path.basename(self.brain_model)}")
             logger.info(f"📊 {self.get_context_info()}")
             logger.info("💻 Доступные команды: 'stats' (метрики), 'reset' (сброс), 'logs' (логи), 'export' (экспорт), 'memory' (память), 'gpu' (видеокарта), 'search' (поиск), 'preferences' (предпочтения), 'cleanup' (очистка), 'exit' (выход)")
@@ -5618,6 +5839,7 @@ class AIOrchestrator:
             self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._telegram_text_message))
             self.telegram_app.add_handler(MessageHandler(filters.PHOTO, self._telegram_photo_message))
             self.telegram_app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, self._telegram_audio_message))
+            self.telegram_app.add_handler(MessageHandler(filters.Document, self._telegram_document_message))
             
             # Запускаем бота в фоне в отдельном потоке
             import threading
@@ -5691,6 +5913,41 @@ class AIOrchestrator:
             return
         
         text = update.message.text if update.message and update.message.text else ""
+        
+        # Проверяем специальные команды OCR
+        if any(keyword in text.lower() for keyword in ['ocr', 'распознай текст', 'извлеки текст', 'что написано']):
+            # Если есть последнее изображение, применяем к нему OCR
+            if hasattr(self, 'last_telegram_image') and self.last_telegram_image:
+                await update.message.reply_text("🔄 Применяю OCR к последнему изображению...")
+                try:
+                    if getattr(self, 'use_ocr', False):
+                        # Конвертируем base64 в PIL Image
+                        import base64
+                        from PIL import Image
+                        import io
+                        
+                        image_data = base64.b64decode(self.last_telegram_image)
+                        image = Image.open(io.BytesIO(image_data))
+                        
+                        # Извлекаем текст принудительно
+                        ocr_text, ocr_error = self.extract_text_from_image_object(image)
+                        
+                        if ocr_text and ocr_text.strip():
+                            await update.message.reply_text(f"📖 Извлеченный текст:\n\n{ocr_text.strip()}")
+                        elif ocr_error:
+                            await update.message.reply_text(f"❌ Ошибка OCR: {ocr_error}")
+                        else:
+                            await update.message.reply_text("⚠️ Текст в изображении не найден")
+                    else:
+                        await update.message.reply_text("❌ OCR отключен в системе")
+                        
+                except Exception as e:
+                    await update.message.reply_text(f"❌ Ошибка OCR: {str(e)}")
+                return
+            else:
+                await update.message.reply_text("❌ Нет изображения для OCR. Отправьте сначала изображение.")
+                return
+        
         await update.message.reply_text("🔄 Обрабатываю ваше сообщение...")
 
         try:
@@ -5762,11 +6019,40 @@ class AIOrchestrator:
             photo_bytes = await file.download_as_bytearray()
             photo_b64 = base64.b64encode(photo_bytes).decode('ascii')
             
-            # Анализируем изображение
+            # Анализируем изображение с vision моделью
             vision_desc = self.call_vision_model(photo_b64)
             
-            # Отправляем описание
-            await update.message.reply_text(f"👁️ Описание изображения:\n{vision_desc}")
+            # Применяем умный OCR
+            result_message = f"👁️ Описание изображения:\n{vision_desc}"
+            
+            if getattr(self, 'use_ocr', False):
+                try:
+                    # Конвертируем байты в PIL Image для OCR
+                    from PIL import Image
+                    import io
+                    
+                    image = Image.open(io.BytesIO(photo_bytes))
+                    
+                    # Проверяем, нужно ли применять OCR
+                    should_use_ocr = self.should_use_ocr_on_image(vision_desc)
+                    
+                    if should_use_ocr:
+                        # Извлекаем текст с помощью OCR
+                        ocr_text, ocr_error = self.extract_text_from_image_object(image)
+                        
+                        if ocr_text and ocr_text.strip():
+                            result_message += f"\n\n📖 Извлеченный текст:\n{ocr_text.strip()}"
+                            await update.message.reply_text("✅ Обнаружен текст на изображении!")
+                        elif ocr_error:
+                            result_message += f"\n\n⚠️ OCR ошибка: {ocr_error}"
+                    else:
+                        await update.message.reply_text("ℹ️ Текст на изображении не обнаружен")
+                        
+                except Exception as ocr_exception:
+                    result_message += f"\n\n⚠️ Ошибка OCR: {str(ocr_exception)}"
+                    
+            # Отправляем полное описание
+            await update.message.reply_text(result_message)
             
             # Сохраняем для возможного использования в диалоге
             self.last_telegram_image = photo_b64
@@ -5838,6 +6124,267 @@ class AIOrchestrator:
             else:
                 logger.debug(f"Telegram audio processing error: {e}")
             await update.message.reply_text(f"❌ Ошибка обработки аудио: {str(e)}")
+
+    async def _telegram_document_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик документов"""
+        if update is None or update.message is None or update.effective_user is None or update.effective_chat is None:
+            return
+        user_id = str(update.effective_user.id)
+        if user_id != self.telegram_allowed_user_id:
+            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+            return
+        
+        await update.message.reply_text("📄 Обрабатываю документ...")
+        
+        try:
+            # Получаем документ
+            document = update.message.document
+            if document is None:
+                await update.message.reply_text("❌ В сообщении нет документа")
+                return
+            
+            file_name = document.file_name or "unknown_file"
+            file_size = document.file_size
+            
+            # Проверяем размер файла (максимум 20MB)
+            if file_size and file_size > 20 * 1024 * 1024:
+                await update.message.reply_text("❌ Файл слишком большой (максимум 20MB)")
+                return
+            
+            file = await context.bot.get_file(document.file_id)
+            
+            # Определяем тип файла и обработку
+            file_lower = file_name.lower()
+            
+            if file_lower.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
+                # Обрабатываем как изображение с OCR
+                await self._process_telegram_image_document(update, file, file_name)
+            elif file_lower.endswith(('.docx', '.doc', '.pdf', '.xlsx', '.xls', '.csv', '.txt', '.md', '.rtf', '.json', '.xml', '.html', '.htm')):
+                # Обрабатываем как документ
+                await self._process_telegram_text_document(update, file, file_name)
+            elif file_lower.endswith(('.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.wma')):
+                # Обрабатываем как аудио
+                await self._process_telegram_audio_document(update, file, file_name)
+            elif file_lower.endswith(('.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm')):
+                # Обрабатываем как видео
+                await self._process_telegram_video_document(update, file, file_name)
+            else:
+                await update.message.reply_text(f"❌ Неподдерживаемый тип файла: {file_name}\n\nПоддерживаются:\n• Изображения: JPG, PNG, GIF, BMP, WEBP\n• Документы: DOCX, DOC, PDF, XLSX, XLS, CSV, TXT, MD, RTF, JSON, XML, HTML\n• Аудио: MP3, WAV, OGG, M4A, FLAC, AAC, WMA\n• Видео: MP4, AVI, MKV, MOV, WMV, FLV, WEBM")
+                
+        except Exception as e:
+            # В веб-режиме логируем тихо
+            if getattr(self, 'show_images_locally', True):
+                logger.error(f"❌ Ошибка обработки документа: {e}")
+            else:
+                logger.debug(f"Telegram document processing error: {e}")
+            await update.message.reply_text(f"❌ Ошибка обработки документа: {str(e)}")
+
+    async def _process_telegram_image_document(self, update: Update, file, file_name: str):
+        """Обработка изображений через документы с OCR"""
+        try:
+            # Скачиваем изображение
+            image_bytes = await file.download_as_bytearray()
+            image_b64 = base64.b64encode(image_bytes).decode('ascii')
+            
+            # Анализируем изображение с vision моделью
+            vision_desc = self.call_vision_model(image_b64)
+            
+            result_message = f"🖼️ Анализ изображения '{file_name}':\n\n👁️ Описание:\n{vision_desc}"
+            
+            # Применяем OCR
+            if getattr(self, 'use_ocr', False):
+                try:
+                    from PIL import Image
+                    import io
+                    
+                    image = Image.open(io.BytesIO(image_bytes))
+                    
+                    # Всегда применяем OCR для документов (более вероятно содержат текст)
+                    ocr_text, ocr_error = self.extract_text_from_image_object(image)
+                    
+                    if ocr_text and ocr_text.strip():
+                        result_message += f"\n\n📖 Извлеченный текст:\n{ocr_text.strip()}"
+                        await update.message.reply_text("✅ Текст успешно извлечен из документа!")
+                    elif ocr_error:
+                        result_message += f"\n\n⚠️ OCR ошибка: {ocr_error}"
+                    else:
+                        result_message += f"\n\n⚠️ Текст в изображении не найден"
+                        
+                except Exception as ocr_exception:
+                    result_message += f"\n\n⚠️ Ошибка OCR: {str(ocr_exception)}"
+            else:
+                result_message += f"\n\n📖 OCR отключен. Используйте vision описание выше."
+            
+            await update.message.reply_text(result_message)
+            
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка обработки изображения: {str(e)}")
+
+    async def _process_telegram_text_document(self, update: Update, file, file_name: str):
+        """Обработка текстовых документов (DOCX, PDF, Excel)"""
+        try:
+            # Скачиваем документ
+            doc_bytes = await file.download_as_bytearray()
+            
+            # Сохраняем во временный файл
+            temp_dir = os.path.join(os.path.dirname(__file__), "temp_docs")
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file = os.path.join(temp_dir, f"telegram_doc_{int(time.time())}_{file_name}")
+            
+            with open(temp_file, 'wb') as f:
+                f.write(doc_bytes)
+            
+            # Обрабатываем документ
+            result = self.process_document_request(temp_file)
+            
+            await update.message.reply_text(f"📄 Анализ документа '{file_name}':\n\n{result}")
+            
+            # Удаляем временный файл
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка обработки документа: {str(e)}")
+
+    async def _process_telegram_audio_document(self, update: Update, file, file_name: str):
+        """Обработка аудио файлов через документы"""
+        try:
+            # Скачиваем аудио
+            audio_bytes = await file.download_as_bytearray()
+            
+            # Сохраняем во временный файл
+            temp_dir = os.path.join(os.path.dirname(__file__), "temp_audio")
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file = os.path.join(temp_dir, f"telegram_audio_{int(time.time())}_{file_name}")
+            
+            with open(temp_file, 'wb') as f:
+                f.write(audio_bytes)
+            
+            # Транскрибируем аудио
+            transcript = self.transcribe_audio_whisper(temp_file, use_separator=False)
+            
+            if transcript and not transcript.startswith("[Whisper error]"):
+                await update.message.reply_text(f"🎤 Транскрипция аудио '{file_name}':\n\n{transcript}")
+            else:
+                await update.message.reply_text("❌ Не удалось распознать аудио")
+            
+            # Удаляем временный файл
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка обработки аудио: {str(e)}")
+
+    async def _process_telegram_video_document(self, update: Update, file, file_name: str):
+        """Обработка видео файлов через документы"""
+        try:
+            await update.message.reply_text("🎬 Загружаю видео и извлекаю кадры для анализа...")
+            
+            # Скачиваем видео
+            video_bytes = await file.download_as_bytearray()
+            
+            # Сохраняем во временный файл
+            temp_dir = os.path.join(os.path.dirname(__file__), "temp_video")
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file = os.path.join(temp_dir, f"telegram_video_{int(time.time())}_{file_name}")
+            
+            with open(temp_file, 'wb') as f:
+                f.write(video_bytes)
+            
+            # Извлекаем кадры для анализа
+            frames = self.extract_video_frames(temp_file, fps=1)
+            
+            if frames:
+                await update.message.reply_text(f"🎬 Анализирую {len(frames)} кадров из видео...")
+                
+                result_message = f"🎬 Анализ видео '{file_name}':\n\n"
+                
+                # Анализируем несколько кадров (максимум 3, чтобы не перегружать)
+                frames_to_analyze = frames[:3]
+                
+                for idx, (timecode, b64) in enumerate(frames_to_analyze):
+                    if not b64:
+                        continue
+                    
+                    # Vision анализ кадра
+                    if getattr(self, 'use_vision', False):
+                        vision_desc = self.call_vision_model(b64)
+                        result_message += f"🕐 {timecode}: {vision_desc}\n\n"
+                        
+                        # OCR для кадра
+                        if getattr(self, 'use_ocr', False):
+                            try:
+                                import base64
+                                from PIL import Image
+                                import io
+                                
+                                image_data = base64.b64decode(b64)
+                                image = Image.open(io.BytesIO(image_data))
+                                
+                                # Проверяем, нужно ли применять OCR
+                                if self.should_use_ocr_on_image(vision_desc):
+                                    ocr_text, ocr_error = self.extract_text_from_image_object(image)
+                                    if ocr_text and ocr_text.strip():
+                                        result_message += f"📖 Текст в кадре {timecode}: {ocr_text.strip()}\n\n"
+                            except Exception:
+                                pass  # Игнорируем ошибки OCR для видео
+                    
+                    # Прогресс для пользователя
+                    if idx == 0:
+                        await update.message.reply_text("🔄 Анализ первого кадра завершен...")
+                
+                # Проверяем, есть ли аудио дорожка для транскрипции
+                try:
+                    # Попробуем извлечь аудио и транскрибировать
+                    audio_file = temp_file.replace(os.path.splitext(temp_file)[1], '.wav')
+                    
+                    # Используем ffmpeg для извлечения аудио
+                    import subprocess
+                    cmd = ['ffmpeg', '-i', temp_file, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', audio_file, '-y']
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    
+                    if result.returncode == 0 and os.path.exists(audio_file):
+                        await update.message.reply_text("🎤 Транскрибирую аудио из видео...")
+                        transcript = self.transcribe_audio_whisper(audio_file, use_separator=False)
+                        
+                        if transcript and not transcript.startswith("[Whisper error]"):
+                            result_message += f"🎤 Аудио транскрипция:\n{transcript}\n\n"
+                        
+                        # Удаляем временный аудио файл
+                        try:
+                            os.remove(audio_file)
+                        except:
+                            pass
+                            
+                except Exception:
+                    pass  # Игнорируем ошибки аудио извлечения
+                
+                # Отправляем полный результат
+                if len(result_message) > 4000:  # Telegram лимит ~4096 символов
+                    # Разбиваем на части
+                    parts = [result_message[i:i+3500] for i in range(0, len(result_message), 3500)]
+                    for i, part in enumerate(parts):
+                        if i == 0:
+                            await update.message.reply_text(part)
+                        else:
+                            await update.message.reply_text(f"(продолжение {i+1}):\n{part}")
+                else:
+                    await update.message.reply_text(result_message)
+            else:
+                await update.message.reply_text("❌ Не удалось извлечь кадры из видео")
+            
+            # Удаляем временный файл
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка обработки видео: {str(e)}")
 
     def play_audio_file(self, audio_path: str) -> bool:
         """
