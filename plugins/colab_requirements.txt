@@ -1,0 +1,15 @@
+# Дополнительные библиотеки для Google Colab Plugin
+# Additional libraries for Google Colab Plugin
+
+# Google API библиотеки
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0
+
+# Jupyter notebook библиотеки
+nbformat>=5.0.0
+nbconvert>=6.0.0
+
+# Дополнительные зависимости
+requests>=2.25.0
