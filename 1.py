@@ -23,6 +23,9 @@ import re
 import threading
 import tempfile
 import shutil
+import queue
+import asyncio
+from pathlib import Path
 import math
 import pyautogui
 import mss
@@ -39,6 +42,17 @@ import telegram
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+
+# Система плагинов
+# Plugin system
+try:
+    from plugins import PluginManager, PluginError
+    PLUGINS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Система плагинов недоступна: {e}")
+    PLUGINS_AVAILABLE = False
+    PluginManager = None
+    PluginError = Exception
 
 # Помощь статическим анализаторам: явные объявления для опциональных внешних символов
 from typing import Any as _Any
@@ -63,6 +77,8 @@ try:
     EXCEL_AVAILABLE = True
 except ImportError:
     EXCEL_AVAILABLE = False
+    pd = None
+    openpyxl = None
 
 # Импорты для работы с PDF
 try:
@@ -82,14 +98,21 @@ try:
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
+    canvas = None
+    _letter = None
+    _A4 = None
+    getSampleStyleSheet = None
+    SimpleDocTemplate = None
+    Paragraph = None
+    Spacer = None
+    _inch = None
 
 try:
     import markdown
     MARKDOWN_AVAILABLE = True
 except ImportError:
     MARKDOWN_AVAILABLE = False
-    pd = None
-    openpyxl = None
+    markdown = None
 
 # Импорты для OCR
 try:
@@ -487,7 +510,7 @@ class ChromaDBManager:
             return False
     
     def search_similar_conversations(self, query: str, n_results: int = 5,
-                                   similarity_threshold: float = None) -> List[Dict[str, Any]]:
+                                   similarity_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
         """
         Ищет похожие диалоги в векторном хранилище
         
@@ -712,7 +735,7 @@ class ChromaDBManager:
         try:
             # Ищем похожие диалоги с адаптивным порогом
             similar_conversations = self.search_similar_conversations(
-                query, n_results=5, similarity_threshold=None  # Автоматический порог
+                query, n_results=5  # Автоматический порог
             )
             
             if not similar_conversations:
@@ -1407,7 +1430,7 @@ class AIOrchestrator:
     def _initialize_ocr(self):
         """Инициализирует OCR для распознавания текста на изображениях"""
         try:
-            if OCR_AVAILABLE:
+            if OCR_AVAILABLE and easyocr is not None:
                 self.logger.info("📖 Инициализирую EasyOCR для распознавания текста...")
                 # Создаем папку для моделей OCR если не существует
                 ocr_models_dir = os.path.join(self.base_dir, "models", "ocr")
@@ -2871,6 +2894,10 @@ class AIOrchestrator:
         self.last_generated_image_b64 = None
         self.last_final_response = ""
         
+        # Хранилище последнего сгенерированного файла для Telegram
+        self.last_generated_file_path = None
+        self.last_generated_file_name = None
+        
         # Динамическое управление контекстом
         self.max_context_length = 262144  # Максимальный контекст (временно)
         self.safe_context_length = 32768   # Безопасный контекст (временно)
@@ -2917,6 +2944,20 @@ class AIOrchestrator:
         # Telegram Bot настройки
         self.telegram_bot_token = ""
         self.telegram_allowed_user_id = ""
+        
+        # Инициализируем систему плагинов
+        # Initialize plugin system
+        self.plugin_manager = None
+        if PLUGINS_AVAILABLE and PluginManager is not None:
+            try:
+                self.plugin_manager = PluginManager(plugins_dir="plugins")
+                self.plugin_manager.load_all_plugins(orchestrator=self)
+                logger.info("✅ Система плагинов инициализирована")
+            except Exception as e:
+                logger.error(f"❌ Ошибка инициализации плагинов: {e}")
+                self.plugin_manager = None
+        else:
+            logger.warning("⚠️ Система плагинов недоступна")
         
 
         # Универсальный системный промпт для оркестратора
@@ -3325,17 +3366,29 @@ class AIOrchestrator:
 ВАЖНО: Если при извлечении текста произошла ошибка (файл не найден, OCR не удался и т.д.), НЕ выдумывай описание изображения или текст! Честно сообщи пользователю о реальной проблеме, основываясь на полученном сообщении об ошибке.
 
 14. ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ: Если пользователь использует слова "сгенерируй", "нарисуй", "создай изображение", "покажи как выглядит", "визуализируй", "изобрази" или подобные по смыслу, И генерация изображений включена, используй действие "generate_image" с подробным описанием. ВАЖНО: После успешной генерации изображения система автоматически завершит диалог - НЕ пытайся генерировать повторно!
-14. Если задача требует несколько шагов (например, поиск + создание файла), всегда строй цепочку действий: сначала "search", затем обработай результат и только потом "powershell" для создания/записи файла, и только после этого — "response".
-15. После каждого шага жди результат и только потом предлагай следующий JSON-действие.
-16. Если пользователь просит сохранить или обработать результат поиска, обязательно сгенерируй команду для создания/записи файла через PowerShell.
-17. Для файлов с русским текстом всегда используй кодировку utf-8 (encoding='utf-8' или 65001) и явно указывай это в PowerShell-команде (например, параметр -Encoding UTF8).
-17. В JSON-ответах ВСЕ обратные слэши (\\) должны быть экранированы (\\\\), особенно в путях файлов и строках PowerShell.
-18. Поисковые запросы делай максимально краткими и точными.
-19. Если результат команды или поиска очень большой, проси пользователя уточнить или обрезай вывод до 2000 символов.
-20. Если задача полностью решена, обязательно заверши цепочку действием "response".
-21. Не повторяй одни и те же действия без необходимости.
-22. Если не уверен, уточни у пользователя.
-22. Директория Desktop: C:\\Users\\vital\\Desktop
+
+15. ПЛАГИНЫ: Система поддерживает плагины для расширения функциональности. Для вызова действия плагина используй формат:
+{
+  "action": "plugin:plugin_name:action_name",
+  "data": {
+    "параметр1": "значение1",
+    "параметр2": "значение2"
+  }
+}
+Доступные плагины и их действия будут указаны в начале каждого диалога.
+
+16. Если задача требует несколько шагов (например, поиск + создание файла), всегда строй цепочку действий: сначала "search", затем обработай результат и только потом "powershell" для создания/записи файла, и только после этого — "response".
+16. Если задача требует несколько шагов (например, поиск + создание файла), всегда строй цепочку действий: сначала "search", затем обработай результат и только потом "powershell" для создания/записи файла, и только после этого — "response".
+17. После каждого шага жди результат и только потом предлагай следующий JSON-действие.
+18. Если пользователь просит сохранить или обработать результат поиска, обязательно сгенерируй команду для создания/записи файла через PowerShell.
+19. Для файлов с русским текстом всегда используй кодировку utf-8 (encoding='utf-8' или 65001) и явно указывай это в PowerShell-команде (например, параметр -Encoding UTF8).
+20. В JSON-ответах ВСЕ обратные слэши (\\) должны быть экранированы (\\\\), особенно в путях файлов и строках PowerShell.
+21. Поисковые запросы делай максимально краткими и точными.
+22. Если результат команды или поиска очень большой, проси пользователя уточнить или обрезай вывод до 2000 символов.
+23. Если задача полностью решена, обязательно заверши цепочку действием "response".
+24. Не повторяй одни и те же действия без необходимости.
+25. Если не уверен, уточни у пользователя.
+26. Директория Desktop: C:\\Users\\vital\\Desktop
 
 ДОСТУПНЫЕ ПАПКИ И ФАЙЛЫ:
 - Audio/ - аудиофайлы (MP3, WAV, OGG, FLAC, M4A, AAC, WMA)
@@ -3533,7 +3586,7 @@ class AIOrchestrator:
             Кортеж (текст, сообщение_об_ошибке)
         """
         try:
-            if not PDF_AVAILABLE:
+            if not PDF_AVAILABLE or PyPDF2 is None:
                 return "", "Библиотека PyPDF2 не установлена. Установите: pip install PyPDF2"
             
             if not os.path.exists(file_path):
@@ -3716,7 +3769,6 @@ class AIOrchestrator:
             elif file_lower.endswith('.json'):
                 # JSON файлы
                 try:
-                    import json
                     with open(file_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                     # Преобразуем JSON в читаемый формат
@@ -3774,7 +3826,7 @@ class AIOrchestrator:
             Сообщение о результате создания файла
         """
         try:
-            if not DOCX_AVAILABLE:
+            if not DOCX_AVAILABLE or Document is None:
                 return "Ошибка: Библиотека python-docx не установлена"
             
             # Создаем документ
@@ -3792,6 +3844,9 @@ class AIOrchestrator:
                         heading = doc.add_heading(title_text, level=1)
                     else:
                         doc.add_paragraph(paragraph_text.strip())
+            
+            # Создаем папку если не существует
+            os.makedirs(os.path.join(self.base_dir, "output"), exist_ok=True)
             
             # Сохраняем файл - убираем расширение если есть и добавляем .docx
             base_name = filename.replace('.docx', '').replace('.doc', '')
@@ -3815,7 +3870,7 @@ class AIOrchestrator:
             Сообщение о результате создания файла
         """
         try:
-            if not EXCEL_AVAILABLE:
+            if not EXCEL_AVAILABLE or pd is None:
                 return "Ошибка: Библиотеки pandas/openpyxl не установлены"
             
             # Пытаемся разобрать контент как табличные данные
@@ -3880,11 +3935,16 @@ class AIOrchestrator:
             if not REPORTLAB_AVAILABLE:
                 return "Ошибка: Библиотека reportlab не установлена"
             
-            # Сохраняем файл - убираем расширение если есть и добавляем .pdf
+            # Убираем расширение если есть и добавляем .pdf
             base_name = filename.replace('.pdf', '')
+            os.makedirs(os.path.join(self.base_dir, "output"), exist_ok=True)
             output_path = os.path.join(self.base_dir, "output", f"{base_name}.pdf")
             
-            # Создаем PDF документ
+            # Создаем PDF документ - импорт во время выполнения
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            
             doc = SimpleDocTemplate(output_path, pagesize=A4)
             styles = getSampleStyleSheet()
             story = []
@@ -3907,9 +3967,6 @@ class AIOrchestrator:
             doc.build(story)
             
             return f"PDF файл успешно создан: {output_path}"
-            
-        except Exception as e:
-            return f"Ошибка при создании PDF файла: {str(e)}"
             
         except Exception as e:
             return f"Ошибка при создании PDF файла: {str(e)}"
@@ -4214,6 +4271,53 @@ class AIOrchestrator:
             logger.error(f"Ошибка создания скриншота: {e}")
             return ""
 
+    def resolve_path(self, path: str) -> str:
+        """
+        Разрешает относительный путь к изображению
+        """
+        if os.path.isabs(path):
+            return path
+        
+        # Проверяем в базовой директории
+        full_path = os.path.join(self.base_dir, path)
+        if os.path.exists(full_path):
+            return full_path
+            
+        # Проверяем в папке Photos
+        photos_path = os.path.join(self.base_dir, "Photos", path)
+        if os.path.exists(photos_path):
+            return photos_path
+            
+        # Проверяем в папке Images
+        images_path = os.path.join(self.base_dir, "Images", path)
+        if os.path.exists(images_path):
+            return images_path
+            
+        return path  # Возвращаем исходный путь если не найден
+
+    def analyze_image_with_vision(self, image_path: str) -> str:
+        """
+        Анализирует изображение с помощью vision модели
+        """
+        try:
+            # Конвертируем изображение в base64
+            image_b64 = image_to_base64_balanced(image_path)
+            if not image_b64:
+                return "Ошибка: не удалось загрузить изображение"
+            
+            # Автоматически включаем vision если не включен
+            if not getattr(self, 'use_vision', False):
+                self.logger.info("🔍 Автоматически включаю анализ изображений...")
+                self.use_vision = True
+                self.auto_disable_tools("vision")
+            
+            # Вызываем vision модель
+            return self.call_vision_model(image_b64)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка анализа изображения: {e}")
+            return f"Ошибка анализа изображения: {str(e)}"
+
     def move_mouse(self, x: int, y: int) -> Dict[str, Any]:
         """Перемещение мыши в координаты (x, y)"""
         try:
@@ -4438,8 +4542,19 @@ class AIOrchestrator:
         """
         start_time = time.time()
         try:
+            # Обрабатываем сообщение плагинами (hook on_message_received)
+            processed_message = user_message
+            if self.plugin_manager:
+                processed_message = self.plugin_manager.call_hook_message_received(user_message, self)
+            
             # Улучшаем промпт с помощью памяти ChromaDB
-            enhanced_system_prompt = self.enhance_prompt_with_memory(user_message, self.system_prompt)
+            enhanced_system_prompt = self.enhance_prompt_with_memory(processed_message, self.system_prompt)
+            
+            # Добавляем информацию о доступных плагинах в системный промпт
+            if self.plugin_manager:
+                plugin_info = self._get_plugin_info_for_prompt()
+                if plugin_info:
+                    enhanced_system_prompt += f"\n\n{plugin_info}"
             
             messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": enhanced_system_prompt}
@@ -4503,16 +4618,21 @@ class AIOrchestrator:
                 
                 # Добавляем в историю разговора (если ответ не пустой)
                 if ai_response and ai_response != "{}":
-                    self.conversation_history.append({"role": "user", "content": user_message})
+                    self.conversation_history.append({"role": "user", "content": processed_message})
                     self.conversation_history.append({"role": "assistant", "content": ai_response})
                     
                     # Автоматически сохраняем диалог в ChromaDB
-                    self.auto_save_conversation(user_message, ai_response, vision_desc)
+                    self.auto_save_conversation(processed_message, ai_response, vision_desc)
                     
                     # Извлекаем предпочтения пользователя из диалога
-                    self.extract_preferences_from_response(user_message, ai_response)
+                    self.extract_preferences_from_response(processed_message, ai_response)
                 
-                return ai_response
+                # Обрабатываем ответ плагинами (hook on_response_generated)
+                final_response = ai_response
+                if self.plugin_manager:
+                    final_response = self.plugin_manager.call_hook_response_generated(ai_response, self)
+                
+                return final_response
             else:
                 error_msg = f"Ошибка brain-модели: {response.status_code} - {response.text}"
                 logger.error(error_msg)
@@ -4916,6 +5036,16 @@ class AIOrchestrator:
         self.last_final_response = content
         logger.info(f"\n🤖 ФИНАЛЬНЫЙ ОТВЕТ:")
         logger.info(content)
+        
+        # Если есть сгенерированный файл, уведомляем об этом в интерактивном режиме
+        if (hasattr(self, 'last_generated_file_path') and self.last_generated_file_path and 
+            getattr(self, 'show_images_locally', True)):
+            logger.info(f"\n📄 Создан файл: {self.last_generated_file_name}")
+            logger.info(f"📂 Расположение: {self.last_generated_file_path}")
+            # Очищаем после показа в интерактивном режиме
+            self.last_generated_file_path = None
+            self.last_generated_file_name = None
+        
         return False
 
     def _handle_list_files(self, action_data: Dict[str, Any]) -> Union[bool, str]:
@@ -5001,6 +5131,11 @@ class AIOrchestrator:
             success = self.generate_file(content, output_path, file_type)
             if success:
                 logger.info(f"✅ Файл успешно создан: {output_path}")
+                
+                # Сохраняем информацию о последнем сгенерированном файле для Telegram
+                self.last_generated_file_path = output_path
+                self.last_generated_file_name = filename
+                
                 follow_up = self.call_brain_model(f"Файл '{filename}' успешно создан в папке output")
             else:
                 logger.error(f"❌ Ошибка при создании файла: {output_path}")
@@ -5151,6 +5286,97 @@ class AIOrchestrator:
         except Exception as e:
             logger.error(f"❌ Ошибка при анализе изображения: {e}")
             return self.call_brain_model(f"❌ Ошибка при анализе изображения: {e}")
+
+    def _handle_plugin_action(self, action: str, action_data: Dict[str, Any]) -> Union[bool, str]:
+        """
+        Обработчик для действий плагинов.
+        
+        Args:
+            action: Строка действия в формате "plugin:plugin_name:action_name"
+            action_data: Данные действия
+        
+        Returns:
+            str: Follow-up для модели с результатами выполнения
+        """
+        try:
+            # Проверяем доступность системы плагинов
+            if not self.plugin_manager:
+                logger.error("❌ Система плагинов недоступна")
+                return self.call_brain_model("❌ Система плагинов недоступна")
+            
+            # Парсим action в формате "plugin:plugin_name:action_name"
+            parts = action.split(":", 2)
+            if len(parts) != 3 or parts[0] != "plugin":
+                logger.error(f"❌ Неверный формат действия плагина: {action}")
+                return self.call_brain_model(f"❌ Неверный формат действия плагина. Ожидается 'plugin:plugin_name:action_name'")
+            
+            plugin_name = parts[1]
+            plugin_action = parts[2]
+            plugin_data = action_data.get("data", {})
+            
+            logger.info(f"🔌 Выполняется действие плагина: {plugin_name}.{plugin_action}")
+            
+            # Выполняем действие плагина
+            result = self.plugin_manager.execute_plugin_action(
+                plugin_name=plugin_name,
+                action=plugin_action,
+                data=plugin_data,
+                orchestrator=self
+            )
+            
+            # Формируем ответ
+            result_text = f"Результат выполнения плагина '{plugin_name}', действие '{plugin_action}':\n\n{result}"
+            
+            logger.info(f"✅ Действие плагина выполнено успешно")
+            
+            follow_up = self.call_brain_model(result_text)
+            return follow_up
+            
+        except PluginError as e:
+            logger.error(f"❌ Ошибка плагина: {e}")
+            return self.call_brain_model(f"❌ Ошибка плагина: {e}")
+        except Exception as e:
+            logger.error(f"❌ Неожиданная ошибка при выполнении действия плагина: {e}")
+            return self.call_brain_model(f"❌ Ошибка при выполнении действия плагина: {e}")
+
+    def _get_plugin_info_for_prompt(self) -> str:
+        """
+        Формирует информацию о доступных плагинах для добавления в системный промпт.
+        
+        Returns:
+            str: Текст с информацией о плагинах
+        """
+        if not self.plugin_manager:
+            return ""
+        
+        try:
+            loaded_plugins = self.plugin_manager.get_loaded_plugins()
+            if not loaded_plugins:
+                return ""
+            
+            plugin_info_parts = ["ДОСТУПНЫЕ ПЛАГИНЫ:"]
+            
+            for plugin_name, plugin in loaded_plugins.items():
+                try:
+                    info = plugin.get_plugin_info()
+                    actions = plugin.get_available_actions()
+                    
+                    plugin_desc = f"\n🔌 {info.get('name', plugin_name)} v{info.get('version', '1.0')}"
+                    plugin_desc += f"\n   Описание: {info.get('description', 'Нет описания')}"
+                    plugin_desc += f"\n   Автор: {info.get('author', 'Неизвестен')}"
+                    plugin_desc += f"\n   Действия: {', '.join(actions)}"
+                    plugin_desc += f"\n   Формат вызова: plugin:{plugin_name}:action_name"
+                    
+                    plugin_info_parts.append(plugin_desc)
+                except Exception as e:
+                    logger.warning(f"Ошибка получения информации о плагине {plugin_name}: {e}")
+                    plugin_info_parts.append(f"\n🔌 {plugin_name} (ошибка получения информации)")
+            
+            return "\n".join(plugin_info_parts)
+            
+        except Exception as e:
+            logger.error(f"Ошибка формирования информации о плагинах: {e}")
+            return ""
 
     def should_use_ocr_intelligently(self, vision_description: str, task_description: str = "") -> bool:
         """
@@ -5337,6 +5563,8 @@ class AIOrchestrator:
                     handler_result = self._handle_analyze_image(action_data)
                 elif action == "response":
                     handler_result = self._handle_response(action_data)
+                elif action.startswith("plugin:"):
+                    handler_result = self._handle_plugin_action(action, action_data)
                 else:
                     logger.warning(f"❓ Неизвестное действие: {action}")
                     return False
@@ -5622,9 +5850,7 @@ class AIOrchestrator:
                                 if getattr(self, 'use_ocr', False):
                                     try:
                                         # Декодируем base64 для OCR
-                                        import base64
                                         from PIL import Image
-                                        import io
                                         
                                         image_data = base64.b64decode(b64)
                                         image = Image.open(io.BytesIO(image_data))
@@ -5839,7 +6065,7 @@ class AIOrchestrator:
             self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._telegram_text_message))
             self.telegram_app.add_handler(MessageHandler(filters.PHOTO, self._telegram_photo_message))
             self.telegram_app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, self._telegram_audio_message))
-            self.telegram_app.add_handler(MessageHandler(filters.Document, self._telegram_document_message))
+            self.telegram_app.add_handler(MessageHandler(filters.Document.ALL, self._telegram_document_message))
             
             # Запускаем бота в фоне в отдельном потоке
             import threading
@@ -5882,16 +6108,21 @@ class AIOrchestrator:
                 logger.debug(f"Telegram bot startup error: {e}")
             return False
 
+    async def _safe_reply(self, update: Update, message: str):
+        """Безопасная отправка сообщения в Telegram"""
+        if update and update.message:
+            await update.message.reply_text(message)
+
     async def _telegram_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         if update is None or update.message is None or update.effective_user is None:
             return
         user_id = str(update.effective_user.id)
         if user_id != self.telegram_allowed_user_id:
-            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+            await self._safe_reply(update, "❌ У вас нет доступа к этому боту.")
             return
         
-        await update.message.reply_text(
+        await self._safe_reply(update,
             "🤖 Привет! Я Нейро - AI оркестратор.\n"
             "Я могу:\n"
             "• Обрабатывать текстовые сообщения\n"
@@ -5909,7 +6140,7 @@ class AIOrchestrator:
             return
         user_id = str(update.effective_user.id)
         if user_id != self.telegram_allowed_user_id:
-            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+            await self._safe_reply(update, "❌ У вас нет доступа к этому боту.")
             return
         
         text = update.message.text if update.message and update.message.text else ""
@@ -5918,13 +6149,11 @@ class AIOrchestrator:
         if any(keyword in text.lower() for keyword in ['ocr', 'распознай текст', 'извлеки текст', 'что написано']):
             # Если есть последнее изображение, применяем к нему OCR
             if hasattr(self, 'last_telegram_image') and self.last_telegram_image:
-                await update.message.reply_text("🔄 Применяю OCR к последнему изображению...")
+                await self._safe_reply(update, "🔄 Применяю OCR к последнему изображению...")
                 try:
                     if getattr(self, 'use_ocr', False):
                         # Конвертируем base64 в PIL Image
-                        import base64
                         from PIL import Image
-                        import io
                         
                         image_data = base64.b64decode(self.last_telegram_image)
                         image = Image.open(io.BytesIO(image_data))
@@ -5985,6 +6214,35 @@ class AIOrchestrator:
                             else:
                                 logger.debug(f"Telegram image send error: {e}")
                             await update.message.reply_text("❌ Ошибка отправки изображения")
+                    
+                    # Если есть сгенерированный файл, отправляем его
+                    if hasattr(self, 'last_generated_file_path') and self.last_generated_file_path:
+                        try:
+                            # Проверяем что файл существует
+                            if os.path.exists(self.last_generated_file_path):
+                                # Отправляем файл как документ
+                                with open(self.last_generated_file_path, 'rb') as file:
+                                    await context.bot.send_document(
+                                        chat_id=update.effective_chat.id,
+                                        document=file,
+                                        filename=self.last_generated_file_name or os.path.basename(self.last_generated_file_path),
+                                        caption="📄 Сгенерированный файл"
+                                    )
+                                
+                                # Очищаем
+                                self.last_generated_file_path = None
+                                self.last_generated_file_name = None
+                                
+                            else:
+                                await update.message.reply_text("❌ Сгенерированный файл не найден")
+                                
+                        except Exception as e:
+                            # В веб-режиме логируем тихо
+                            if not getattr(self, 'show_images_locally', True):
+                                logger.error(f"❌ Ошибка отправки файла: {e}")
+                            else:
+                                logger.debug(f"Telegram file send error: {e}")
+                            await update.message.reply_text("❌ Ошибка отправки файла")
                 else:
                     await update.message.reply_text("✅ Задача выполнена!")
             else:
@@ -6204,7 +6462,8 @@ class AIOrchestrator:
                     
                     if ocr_text and ocr_text.strip():
                         result_message += f"\n\n📖 Извлеченный текст:\n{ocr_text.strip()}"
-                        await update.message.reply_text("✅ Текст успешно извлечен из документа!")
+                        if update.message:
+                            await update.message.reply_text("✅ Текст успешно извлечен из документа!")
                     elif ocr_error:
                         result_message += f"\n\n⚠️ OCR ошибка: {ocr_error}"
                     else:
@@ -6215,10 +6474,12 @@ class AIOrchestrator:
             else:
                 result_message += f"\n\n📖 OCR отключен. Используйте vision описание выше."
             
-            await update.message.reply_text(result_message)
+            if update.message:
+                await update.message.reply_text(result_message)
             
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка обработки изображения: {str(e)}")
+            if update.message:
+                await update.message.reply_text(f"❌ Ошибка обработки изображения: {str(e)}")
 
     async def _process_telegram_text_document(self, update: Update, file, file_name: str):
         """Обработка текстовых документов (DOCX, PDF, Excel)"""
@@ -6237,7 +6498,8 @@ class AIOrchestrator:
             # Обрабатываем документ
             result = self.process_document_request(temp_file)
             
-            await update.message.reply_text(f"📄 Анализ документа '{file_name}':\n\n{result}")
+            if update.message:
+                await update.message.reply_text(f"📄 Анализ документа '{file_name}':\n\n{result}")
             
             # Удаляем временный файл
             try:
@@ -6246,7 +6508,8 @@ class AIOrchestrator:
                 pass
                 
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка обработки документа: {str(e)}")
+            if update.message:
+                await update.message.reply_text(f"❌ Ошибка обработки документа: {str(e)}")
 
     async def _process_telegram_audio_document(self, update: Update, file, file_name: str):
         """Обработка аудио файлов через документы"""
@@ -6266,9 +6529,9 @@ class AIOrchestrator:
             transcript = self.transcribe_audio_whisper(temp_file, use_separator=False)
             
             if transcript and not transcript.startswith("[Whisper error]"):
-                await update.message.reply_text(f"🎤 Транскрипция аудио '{file_name}':\n\n{transcript}")
+                await self._safe_reply(update, f"🎤 Транскрипция аудио '{file_name}':\n\n{transcript}")
             else:
-                await update.message.reply_text("❌ Не удалось распознать аудио")
+                await self._safe_reply(update, "❌ Не удалось распознать аудио")
             
             # Удаляем временный файл
             try:
@@ -6277,12 +6540,12 @@ class AIOrchestrator:
                 pass
                 
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка обработки аудио: {str(e)}")
+            await self._safe_reply(update, f"❌ Ошибка обработки аудио: {str(e)}")
 
     async def _process_telegram_video_document(self, update: Update, file, file_name: str):
         """Обработка видео файлов через документы"""
         try:
-            await update.message.reply_text("🎬 Загружаю видео и извлекаю кадры для анализа...")
+            await self._safe_reply(update, "🎬 Загружаю видео и извлекаю кадры для анализа...")
             
             # Скачиваем видео
             video_bytes = await file.download_as_bytearray()
@@ -6299,7 +6562,7 @@ class AIOrchestrator:
             frames = self.extract_video_frames(temp_file, fps=1)
             
             if frames:
-                await update.message.reply_text(f"🎬 Анализирую {len(frames)} кадров из видео...")
+                await self._safe_reply(update, f"🎬 Анализирую {len(frames)} кадров из видео...")
                 
                 result_message = f"🎬 Анализ видео '{file_name}':\n\n"
                 
@@ -6318,9 +6581,7 @@ class AIOrchestrator:
                         # OCR для кадра
                         if getattr(self, 'use_ocr', False):
                             try:
-                                import base64
                                 from PIL import Image
-                                import io
                                 
                                 image_data = base64.b64decode(b64)
                                 image = Image.open(io.BytesIO(image_data))
@@ -6335,7 +6596,7 @@ class AIOrchestrator:
                     
                     # Прогресс для пользователя
                     if idx == 0:
-                        await update.message.reply_text("🔄 Анализ первого кадра завершен...")
+                        await self._safe_reply(update, "🔄 Анализ первого кадра завершен...")
                 
                 # Проверяем, есть ли аудио дорожка для транскрипции
                 try:
@@ -6348,7 +6609,7 @@ class AIOrchestrator:
                     result = subprocess.run(cmd, capture_output=True, text=True)
                     
                     if result.returncode == 0 and os.path.exists(audio_file):
-                        await update.message.reply_text("🎤 Транскрибирую аудио из видео...")
+                        await self._safe_reply(update, "🎤 Транскрибирую аудио из видео...")
                         transcript = self.transcribe_audio_whisper(audio_file, use_separator=False)
                         
                         if transcript and not transcript.startswith("[Whisper error]"):
@@ -6369,13 +6630,13 @@ class AIOrchestrator:
                     parts = [result_message[i:i+3500] for i in range(0, len(result_message), 3500)]
                     for i, part in enumerate(parts):
                         if i == 0:
-                            await update.message.reply_text(part)
+                            await self._safe_reply(update, part)
                         else:
-                            await update.message.reply_text(f"(продолжение {i+1}):\n{part}")
+                            await self._safe_reply(update, f"(продолжение {i+1}):\n{part}")
                 else:
-                    await update.message.reply_text(result_message)
+                    await self._safe_reply(update, result_message)
             else:
-                await update.message.reply_text("❌ Не удалось извлечь кадры из видео")
+                await self._safe_reply(update, "❌ Не удалось извлечь кадры из видео")
             
             # Удаляем временный файл
             try:
@@ -6384,7 +6645,7 @@ class AIOrchestrator:
                 pass
                 
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка обработки видео: {str(e)}")
+            await self._safe_reply(update, f"❌ Ошибка обработки видео: {str(e)}")
 
     def play_audio_file(self, audio_path: str) -> bool:
         """
@@ -6905,6 +7166,17 @@ def main():
             else:
                 # В веб-режиме логируем тихо
                 logger.debug(f"Telegram bot error: {e}")
+    
+    def __del__(self):
+        """Деструктор для очистки ресурсов плагинов"""
+        try:
+            if hasattr(self, 'plugin_manager') and self.plugin_manager:
+                # Выгружаем все плагины
+                for plugin_name in list(self.plugin_manager.loaded_plugins.keys()):
+                    self.plugin_manager.unload_plugin(plugin_name)
+                logger.info("🔌 Плагины очищены")
+        except Exception as e:
+            logger.error(f"Ошибка очистки плагинов: {e}")
     
     # Запускаем интерактивный режим
     orchestrator.run_interactive()
