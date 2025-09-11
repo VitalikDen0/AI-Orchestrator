@@ -1633,8 +1633,8 @@ class AIOrchestrator:
         payload = {
             "model": image_model,
             "messages": [
-                {"role": "system", "content": "Ты — ассистент для генерации идеальных промтов для Stable Diffusion. Твоя задача — создать идеальный промт для генерации изображения на основе запроса пользователя. ВАЖНО: prompt и negative_prompt должны быть ТОЛЬКО на английском языке, иначе будет ошибка! Формируй промт и настройки строго в формате JSON: {\"prompt\":..., \"negative_prompt\":..., \"params\":{...}}. Не добавляй ничего лишнего!"},
-                {"role": "user", "content": f"Вопрос: {question}\n\nВАЖНО: prompt и negative_prompt должны быть ТОЛЬКО на английском языке! Если они не на английском — это ошибка!"}
+                {"role": "system", "content": "Ты — ассистент для генерации идеальных промтов для Stable Diffusion. Твоя задача — создать идеальный промт для генерации изображения на основе запроса пользователя. ВАЖНО: prompt и negative_prompt должны быть ТОЛЬКО на английском языке, иначе будет ошибка! ВСЕГДА включай negative_prompt - это обязательное поле! Формируй промт и настройки строго в формате JSON: {\"prompt\":..., \"negative_prompt\":..., \"params\":{...}}. Пример negative_prompt: '(worst quality, low quality, normal quality:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy'. Не добавляй ничего лишнего!"},
+                {"role": "user", "content": f"Вопрос: {question}\n\nВАЖНО: prompt и negative_prompt должны быть ТОЛЬКО на английском языке! ОБЯЗАТЕЛЬНО включи negative_prompt в JSON!"}
             ],
             "temperature": 0.2,
             "max_tokens": 1024,
@@ -1757,11 +1757,15 @@ class AIOrchestrator:
             
             # Импортируем необходимые библиотеки (рекомендованные подмодули для совместимости с Pylance)
             from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline  # type: ignore
+            from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline  # type: ignore
             from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler  # type: ignore
             import torch
             
-            # Путь к модели
-            model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH", "J:\\ComfyUI\\models\\checkpoints\\novaAnime_v20.safetensors")
+            # Путь к модели из .env файла
+            model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH")
+            if not model_path:
+                self.logger.error("❌ STABLE_DIFFUSION_MODEL_PATH не указан в .env файле")
+                return None
             
             # Проверяем существование модели
             if not os.path.exists(model_path):
@@ -1770,12 +1774,25 @@ class AIOrchestrator:
             
             self.logger.info(f"📦 Загружаю модель: {model_path}")
             
-            # Загружаем pipeline
-            pipe = StableDiffusionPipeline.from_single_file(
-                model_path,
-                torch_dtype=torch.float16,
-                use_safetensors=True
-            )
+            # Определяем тип модели по имени файла (SDXL модели обычно содержат xl, sdxl, illustrious в названии)
+            model_name = os.path.basename(model_path).lower()
+            is_sdxl = any(keyword in model_name for keyword in ['xl', 'sdxl', 'illustrious', 'pony'])
+            
+            # Загружаем соответствующий pipeline
+            if is_sdxl:
+                self.logger.info("🎯 Обнаружена SDXL модель, использую StableDiffusionXLPipeline")
+                pipe = StableDiffusionXLPipeline.from_single_file(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True
+                )
+            else:
+                self.logger.info("🎯 Обнаружена SD 1.5 модель, использую StableDiffusionPipeline")
+                pipe = StableDiffusionPipeline.from_single_file(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True
+                )
             
             # Перемещаем на GPU если доступен
             if torch.cuda.is_available():
@@ -1783,6 +1800,9 @@ class AIOrchestrator:
                 self.logger.info("🚀 Модель перемещена на GPU")
             else:
                 self.logger.warning("⚠️ GPU недоступен, использую CPU")
+            
+            # Сохраняем pipeline для последующей выгрузки
+            self.current_pipeline = pipe
             
             # Настраиваем scheduler
             if gen_params["sampler_name"] == "dpmpp_2m":
@@ -1944,14 +1964,18 @@ class AIOrchestrator:
             
             # Импортируем необходимые библиотеки (рекомендованные подмодули для совместимости с Pylance)
             from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline  # type: ignore
+            from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline  # type: ignore
             from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler  # type: ignore
             import torch
             from PIL import Image
             import numpy as np
             import imageio  # type: ignore
             
-            # Путь к модели
-            model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH", "J:\\ComfyUI\\models\\checkpoints\\novaAnime_v20.safetensors")
+            # Путь к модели из .env файла
+            model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH")
+            if not model_path:
+                self.logger.error("❌ STABLE_DIFFUSION_MODEL_PATH не указан в .env файле")
+                return None
             
             # Проверяем существование модели
             if not os.path.exists(model_path):
@@ -1960,12 +1984,25 @@ class AIOrchestrator:
             
             self.logger.info(f"📦 Загружаю модель: {model_path}")
             
-            # Загружаем pipeline
-            pipe = StableDiffusionPipeline.from_single_file(
-                model_path,
-                torch_dtype=torch.float16,
-                use_safetensors=True
-            )
+            # Определяем тип модели по имени файла (SDXL модели обычно содержат xl, sdxl, illustrious в названии)
+            model_name = os.path.basename(model_path).lower()
+            is_sdxl = any(keyword in model_name for keyword in ['xl', 'sdxl', 'illustrious', 'pony'])
+            
+            # Загружаем соответствующий pipeline
+            if is_sdxl:
+                self.logger.info("🎯 Обнаружена SDXL модель, использую StableDiffusionXLPipeline")
+                pipe = StableDiffusionXLPipeline.from_single_file(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True
+                )
+            else:
+                self.logger.info("🎯 Обнаружена SD 1.5 модель, использую StableDiffusionPipeline")
+                pipe = StableDiffusionPipeline.from_single_file(
+                    model_path,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True
+                )
             
             # Перемещаем на GPU если доступен
             if torch.cuda.is_available():
@@ -1973,6 +2010,9 @@ class AIOrchestrator:
                 self.logger.info("🚀 Модель перемещена на GPU")
             else:
                 self.logger.warning("⚠️ GPU недоступен, использую CPU")
+            
+            # Сохраняем pipeline для последующей выгрузки
+            self.current_pipeline = pipe
             
             # Настраиваем scheduler
             pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
@@ -3260,12 +3300,13 @@ class AIOrchestrator:
    {
      "action": "generate_image",
      "text": "промпт на английском языке с тегами",
-     "negative_prompt": "негативный промпт (опционально)",
+     "negative_prompt": "негативный промпт ОБЯЗАТЕЛЬНО",
      "description": "краткое описание что генерируешь"
    }
    
    Поле "text" должно содержать основной промпт для Stable Diffusion на английском языке.
-   Поле "negative_prompt" содержит негативный промпт (что НЕ должно быть на изображении).
+   Поле "negative_prompt" ОБЯЗАТЕЛЬНО должно содержать негативный промпт (что НЕ должно быть на изображении).
+   ВСЕГДА включай negative_prompt, например: "(worst quality, low quality, normal quality:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy"
    НИКОГДА не используй теги <think> или другие форматы - только чистый JSON!
 
 7. РАБОТА СО СКРИНШОТАМИ:
@@ -4156,37 +4197,111 @@ class AIOrchestrator:
         """Автоматически выключает инструмент через заданное время после использования"""
         import threading
         import time
+        import gc
         
         def disable_tool(tool_name):
             time.sleep(self.auto_disable_delay)
+            
             if tool_name == 'image_generation':
-                if hasattr(self, 'use_image_generation'):
+                if hasattr(self, 'use_image_generation') and self.use_image_generation:
                     self.use_image_generation = False
-                    logger.info(f"🔧 Автоматически выключил {tool_name}")
+                    
+                    # Выгружаем pipeline из памяти
+                    if hasattr(self, 'current_pipeline') and self.current_pipeline is not None:
+                        try:
+                            # Освобождаем GPU память
+                            if hasattr(self.current_pipeline, 'to'):
+                                self.current_pipeline.to('cpu')
+                            del self.current_pipeline
+                            self.current_pipeline = None
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ Ошибка при выгрузке pipeline: {e}")
+                    
+                    # Принудительная очистка GPU памяти
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Ошибка при очистке GPU памяти: {e}")
+                    
+                    # Сборка мусора
+                    gc.collect()
+                    self.logger.info(f"🔧 Автоматически выключил {tool_name} и освободил память")
+                    
             elif tool_name == 'vision':
-                if hasattr(self, 'use_vision'):
+                if hasattr(self, 'use_vision') and self.use_vision:
                     self.use_vision = False
-                    logger.info(f"🔧 Автоматически выключил {tool_name}")
+                    
+                    # Выгружаем vision модели если они есть
+                    vision_attrs = ['vision_model', 'vision_processor', 'vision_pipeline']
+                    for attr in vision_attrs:
+                        if hasattr(self, attr):
+                            try:
+                                model = getattr(self, attr)
+                                if model is not None and hasattr(model, 'to'):
+                                    model.to('cpu')
+                                delattr(self, attr)
+                            except Exception as e:
+                                self.logger.warning(f"⚠️ Ошибка при выгрузке {attr}: {e}")
+                    
+                    # Очистка GPU памяти
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    
+                    gc.collect()
+                    self.logger.info(f"🔧 Автоматически выключил {tool_name} и освободил память")
+                    
             elif tool_name == 'audio':
-                if hasattr(self, 'use_audio'):
+                if hasattr(self, 'use_audio') and self.use_audio:
                     self.use_audio = False
-                    logger.info(f"🔧 Автоматически выключил {tool_name}")
+                    
+                    # Выгружаем audio модели если они есть
+                    audio_attrs = ['whisper_model', 'audio_model', 'tts_model']
+                    for attr in audio_attrs:
+                        if hasattr(self, attr):
+                            try:
+                                model = getattr(self, attr)
+                                if model is not None and hasattr(model, 'to'):
+                                    model.to('cpu')
+                                delattr(self, attr)
+                            except Exception as e:
+                                self.logger.warning(f"⚠️ Ошибка при выгрузке {attr}: {e}")
+                    
+                    # Очистка GPU памяти
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    
+                    gc.collect()
+                    self.logger.info(f"🔧 Автоматически выключил {tool_name} и освободил память")
         
         # Если указан конкретный инструмент, запускаем таймер только для него
         if tool_name:
-            if tool_name not in self.tool_timers or not self.tool_timers[tool_name].is_alive():
-                timer = threading.Thread(target=disable_tool, args=(tool_name,), daemon=True)
-                self.tool_timers[tool_name] = timer
-                timer.start()
-                logger.info(f"⏰ Запустил таймер автоматического выключения для {tool_name}")
+            # Отменяем предыдущий таймер если он есть
+            if tool_name in self.tool_timers and self.tool_timers[tool_name].is_alive():
+                self.tool_timers[tool_name].cancel() if hasattr(self.tool_timers[tool_name], 'cancel') else None
+                
+            timer = threading.Thread(target=disable_tool, args=(tool_name,), daemon=True)
+            self.tool_timers[tool_name] = timer
+            timer.start()
+            self.logger.info(f"⏰ Запустил таймер автоматического выключения для {tool_name}")
         else:
             # Запускаем таймеры для всех активных инструментов
-            for tool_name in ['image_generation', 'vision', 'audio']:
-                if tool_name not in self.tool_timers or not self.tool_timers[tool_name].is_alive():
-                    timer = threading.Thread(target=disable_tool, args=(tool_name,), daemon=True)
-                    self.tool_timers[tool_name] = timer
+            for tool in ['image_generation', 'vision', 'audio']:
+                if tool not in self.tool_timers or not self.tool_timers[tool].is_alive():
+                    timer = threading.Thread(target=disable_tool, args=(tool,), daemon=True)
+                    self.tool_timers[tool] = timer
                     timer.start()
-                    logger.info(f"⏰ Запустил таймер автоматического выключения для {tool_name}")
+                    self.logger.info(f"⏰ Запустил таймер автоматического выключения для {tool}")
                 
     def _log(self, message: str, level: str = "INFO"):
         """Логирование с временной меткой в файл и консоль"""
@@ -4938,6 +5053,9 @@ class AIOrchestrator:
         neg = negative_prompt.strip() if negative_prompt else ""
         if not neg or not self._is_english_simple(neg):
             neg = "(worst quality, low quality, normal quality:1.4)"
+            self.logger.info(f"⚠️ Используется fallback negative_prompt: {neg}")
+        else:
+            self.logger.info(f"✅ Используется negative_prompt из JSON: {neg}")
 
         # default params and validation (kept simple here)
         default_params = {"seed": -1, "steps": 30, "width": 1024, "height": 1024, "cfg": 4.0}
@@ -5608,7 +5726,7 @@ class AIOrchestrator:
             logger.info("   - Видео: анализ кадров + OCR + извлечение аудио")
             logger.info(f"🧠 Модель: {os.path.basename(self.brain_model)}")
             logger.info(f"📊 {self.get_context_info()}")
-            logger.info("💻 Доступные команды: 'stats' (метрики), 'reset' (сброс), 'logs' (логи), 'export' (экспорт), 'memory' (память), 'gpu' (видеокарта), 'search' (поиск), 'preferences' (предпочтения), 'cleanup' (очистка), 'exit' (выход)")
+            logger.info("💻 Доступные команды: 'stats' (метрики), 'reset' (сброс), 'logs' (логи), 'export' (экспорт), 'memory' (память), 'gpu' (видеокарта), 'search' (поиск), 'preferences' (предпочтения), 'cleanup' (очистка), 'unload' (выгрузка моделей), 'exit' (выход)")
             logger.info("="*60)
 
         vision_desc = ""
@@ -5737,6 +5855,56 @@ class AIOrchestrator:
                             logger.info(f"🧹 Удалено {deleted_count} старых записей из памяти")
                         except Exception as e:
                             logger.error(f"Ошибка очистки памяти: {e}")
+                    continue
+                if user_input.lower() in ['unload', 'выгрузка', 'unload_models']:
+                    # Принудительная выгрузка всех моделей кроме мозга
+                    logger.info("🔧 Принудительная выгрузка всех моделей...")
+                    try:
+                        import gc
+                        import torch
+                        
+                        # Выключаем все системы
+                        self.use_image_generation = False
+                        self.use_vision = False
+                        self.use_audio = False
+                        
+                        # Выгружаем pipeline для генерации изображений
+                        if hasattr(self, 'current_pipeline') and self.current_pipeline is not None:
+                            try:
+                                if hasattr(self.current_pipeline, 'to'):
+                                    self.current_pipeline.to('cpu')
+                                del self.current_pipeline
+                                self.current_pipeline = None
+                                logger.info("✅ Pipeline для генерации изображений выгружен")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Ошибка при выгрузке pipeline: {e}")
+                        
+                        # Выгружаем другие модели
+                        model_attrs = ['vision_model', 'vision_processor', 'vision_pipeline', 
+                                     'whisper_model', 'audio_model', 'tts_model']
+                        for attr in model_attrs:
+                            if hasattr(self, attr):
+                                try:
+                                    model = getattr(self, attr)
+                                    if model is not None and hasattr(model, 'to'):
+                                        model.to('cpu')
+                                    delattr(self, attr)
+                                    logger.info(f"✅ {attr} выгружен")
+                                except Exception as e:
+                                    logger.warning(f"⚠️ Ошибка при выгрузке {attr}: {e}")
+                        
+                        # Очистка GPU памяти
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            logger.info("✅ GPU память очищена")
+                        
+                        # Сборка мусора
+                        gc.collect()
+                        logger.info("✅ Все модели выгружены, память освобождена")
+                        
+                    except Exception as e:
+                        logger.error(f"Ошибка при выгрузке моделей: {e}")
                     continue
                 if user_input.lower() in ['search', 'поиск', 'find']:
                     # Поиск похожих диалогов в памяти
