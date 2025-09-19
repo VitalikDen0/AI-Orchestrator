@@ -1721,6 +1721,9 @@ class AIOrchestrator:
         """Генерация изображения через прямую интеграцию со Stable Diffusion"""
         start_time = time.time()
         
+        # Логируем полученные параметры
+        self.logger.info(f"🔧 Получены параметры генерации: prompt='{prompt[:50]}...', negative_prompt='{negative_prompt}'")
+        
         # Автоматически включаем генерацию изображений при необходимости
         if not getattr(self, 'use_image_generation', False):
             self.logger.info("🔧 Автоматически включаю генерацию изображений")
@@ -1728,12 +1731,12 @@ class AIOrchestrator:
             # Запускаем таймер автоматического выключения
             self.auto_disable_tools("image_generation")
         
-        # Параметры по умолчанию
+        # Параметры по умолчанию (будут обновлены в зависимости от типа модели)
         default_params = {
             "seed": -1,
             "steps": 30,
-            "width": 1024,
-            "height": 1024,
+            "width": 1024,  # Временно, будет обновлено ниже
+            "height": 1024,  # Временно, будет обновлено ниже
             "cfg": 7.0,
             "sampler_name": "dpmpp_2m",
             "scheduler": "karras"
@@ -1748,6 +1751,23 @@ class AIOrchestrator:
             import random
             gen_params["seed"] = random.randint(0, 2**32 - 1)
             self.logger.info(f"🎲 Сгенерирован случайный seed: {gen_params['seed']}")
+        
+        # Определяем тип модели для корректировки размеров
+        model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH")
+        if model_path:
+            model_name = os.path.basename(model_path).lower()
+            is_sdxl = any(keyword in model_name for keyword in ['xl', 'sdxl', 'illustrious', 'pony'])
+            
+            # Обновляем размеры по умолчанию в зависимости от типа модели (только если не заданы пользователем)
+            if not params.get("width") and not params.get("height"):
+                if is_sdxl:
+                    # SDXL модели работают лучше с 1024x1024 (уже установлено по умолчанию)
+                    pass
+                else:
+                    # SD 1.5 модели работают лучше с 512x512
+                    gen_params["width"] = 512
+                    gen_params["height"] = 512
+                    self.logger.info("📐 Автоматически установил размеры для SD 1.5 модели: 512x512")
         
         self.logger.info(f"🔧 Параметры генерации: {gen_params}")
         
@@ -1889,12 +1909,12 @@ class AIOrchestrator:
             except Exception:
                 self.logger.error(f"❌ Не удалось сохранить изображение ни одним из способов")
             
-            # Автоматически открываем изображение
-            try:
-                subprocess.run(["start", output_path], shell=True, check=True)
-                self.logger.info("🖼️ Изображение автоматически открыто")
-            except Exception as e:
-                self.logger.warning(f"⚠️ Не удалось открыть изображение: {e}")
+            # Автоматически открываем изображение (отключено, т.к. открывается через show_image_base64_temp)
+            # try:
+            #     subprocess.run(["start", output_path], shell=True, check=True)
+            #     self.logger.info("🖼️ Изображение автоматически открыто")
+            # except Exception as e:
+            #     self.logger.warning(f"⚠️ Не удалось открыть изображение: {e}")
             
             # Конвертируем в base64
             buf = BytesIO()
@@ -2247,15 +2267,26 @@ class AIOrchestrator:
                 raise
 
     def show_image_base64_temp(self, b64img: str):
-        """Показать изображение из base64 на 5 секунд"""
+        """Показать изображение из base64 через универсальный метод Windows"""
         try:
             # В веб-режиме отключаем всплывающее окно показа
             if not getattr(self, 'show_images_locally', True):
                 return
-            img = Image.open(BytesIO(base64.b64decode(b64img)))
-            img.show()
-            time.sleep(5)
-            img.close()
+            
+            # Создаем временный файл для показа
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+                img_data = base64.b64decode(b64img)
+                tmp_file.write(img_data)
+            
+            # Открываем через универсальный метод Windows
+            try:
+                subprocess.run(["start", tmp_path], shell=True, check=True)
+                self.logger.info("🖼️ Изображение автоматически открыто")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Не удалось открыть изображение: {e}")
+                
         except Exception as e:
             self.logger.error(f"Ошибка показа изображения: {e}")
     def find_new_audio(self) -> Optional[str]:
@@ -5056,6 +5087,8 @@ class AIOrchestrator:
             self.logger.info(f"⚠️ Используется fallback negative_prompt: {neg}")
         else:
             self.logger.info(f"✅ Используется negative_prompt из JSON: {neg}")
+        
+        self.logger.info(f"🎨 Передаем в генерацию - prompt: {prompt[:50]}..., negative_prompt: {neg}")
 
         # default params and validation (kept simple here)
         default_params = {"seed": -1, "steps": 30, "width": 1024, "height": 1024, "cfg": 4.0}
@@ -5099,6 +5132,11 @@ class AIOrchestrator:
         fallback_negative = "(worst quality, low quality, normal quality:1.4), (deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy, text, watermark"
         if not neg or not self._is_english_simple(neg):
             neg = fallback_negative
+            self.logger.info(f"⚠️ Используется fallback negative_prompt для видео: {neg}")
+        else:
+            self.logger.info(f"✅ Используется negative_prompt из JSON для видео: {neg}")
+        
+        self.logger.info(f"🎬 Передаем в генерацию видео - prompt: {prompt[:50]}..., negative_prompt: {neg[:50]}...")
 
         # default video params and validation
         default_params = {"seed": -1, "steps": 20, "width": 512, "height": 512, "cfg": 7.0, "num_frames": 24, "fps": 8}
