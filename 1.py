@@ -5482,7 +5482,8 @@ class AIOrchestrator:
         return follow_up
 
     def _handle_response(self, action_data: Dict[str, Any]) -> Union[bool, str]:
-        content = action_data.get("content", "")
+        # Поддерживаем и "text" и "content" для совместимости
+        content = action_data.get("text", action_data.get("content", ""))
         self.last_final_response = content
         logger.info(f"\n🤖 ФИНАЛЬНЫЙ ОТВЕТ:")
         logger.info(content)
@@ -5788,6 +5789,45 @@ class AIOrchestrator:
         except Exception as e:
             logger.error(f"❌ Неожиданная ошибка при выполнении действия плагина: {e}")
             return self.call_brain_model(f"❌ Ошибка при выполнении действия плагина: {e}")
+
+    def _handle_get_help(self, action: str, action_data: Dict[str, Any]) -> Union[bool, str]:
+        """
+        Обработчик для команд get_*_help - загружает соответствующий модуль.
+        
+        Args:
+            action: Команда типа "get_image_generation_help"
+            action_data: Данные действия
+        
+        Returns:
+            str: Follow-up для модели с загруженным модулем
+        """
+        try:
+            logger.info(f"📚 Загружаю модуль для команды: {action}")
+            
+            # Загружаем модуль через PromptLoader
+            module_content = self.prompt_loader.load_module(action)
+            
+            if module_content is None:
+                logger.warning(f"❌ Модуль для команды {action} не найден")
+                return self.call_brain_model(f"❌ Модуль для команды {action} не найден. Доступные команды: {', '.join(self.prompt_loader.module_commands.keys())}")
+            
+            logger.info(f"✅ Модуль загружен, размер: {len(module_content)} символов")
+            
+            # Отправляем загруженный модуль как контекст для модели
+            follow_up_prompt = f"""
+Загружен модуль по запросу {action}:
+
+{module_content}
+
+Теперь ты можешь использовать эту информацию для ответа пользователю или выполнения соответствующих действий.
+"""
+            
+            follow_up = self.call_brain_model(follow_up_prompt)
+            return follow_up
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при загрузке модуля {action}: {e}")
+            return self.call_brain_model(f"❌ Ошибка при загрузке модуля {action}: {e}")
 
     def _handle_send_email(self, action_data: Dict[str, Any]) -> Union[bool, str]:
         """
@@ -6191,6 +6231,8 @@ class AIOrchestrator:
                     handler_result = self._handle_search_emails(action_data)
                 elif action.startswith("plugin:"):
                     handler_result = self._handle_plugin_action(action, action_data)
+                elif action.startswith("get_") and action.endswith("_help"):
+                    handler_result = self._handle_get_help(action, action_data)
                 else:
                     logger.warning(f"❓ Неизвестное действие: {action}")
                     return False
