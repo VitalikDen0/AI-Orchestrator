@@ -1370,14 +1370,193 @@ class ModelManager:
         return env_path if env_path else ""
     
     def detect_model_type(self, model_path: str) -> str:
-        """Определяет тип модели (sd/sdxl) по пути или имени файла"""
+        """
+        Определяет тип модели (sd/sdxl) по метаданным или имени файла
+        
+        Args:
+            model_path: Путь к checkpoint файлу
+            
+        Returns:
+            Тип модели: 'sd' или 'sdxl'
+        """
+        if not os.path.exists(model_path):
+            logger.warning(f"⚠️ Файл модели не найден: {model_path}")
+            return 'sd'  # По умолчанию SD 1.5
+        
+        file_ext = os.path.splitext(model_path)[1].lower()
         model_name = os.path.basename(model_path).lower()
         
-        # Простая эвристика определения типа модели
-        if 'sdxl' in model_name or 'xl' in model_name:
+        # Сначала пытаемся анализировать метаданные
+        if file_ext == ".safetensors":
+            try:
+                metadata = self.analyze_checkpoint_metadata(model_path)
+                detected_type = metadata.get("model_type", "unknown")
+                
+                if detected_type != "unknown":
+                    logger.info(f"🔍 Тип модели определен по метаданным: {detected_type}")
+                    return detected_type
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка анализа метаданных checkpoint: {e}")
+        
+        # Резервный анализ по имени файла
+        if any(keyword in model_name for keyword in ['sdxl', 'xl', 'illustrious', 'pony']):
+            logger.info(f"🔍 Тип модели определен по имени файла: sdxl")
             return 'sdxl'
         else:
+            logger.info(f"🔍 Тип модели определен по имени файла: sd")
             return 'sd'
+    
+    def analyze_checkpoint_metadata(self, checkpoint_path: str) -> Dict[str, Any]:
+        """
+        Анализирует метаданные checkpoint файла
+        
+        Args:
+            checkpoint_path: Путь к checkpoint файлу
+            
+        Returns:
+            Словарь с метаданными checkpoint
+        """
+        try:
+            from safetensors import safe_open
+            
+            metadata = {
+                "model_type": "unknown",
+                "architecture": "unknown",
+                "base_model": "unknown",
+                "resolution": "unknown",
+                "model_name": "",
+                "author": "",
+                "description": "",
+                "version": ""
+            }
+            
+            file_ext = os.path.splitext(checkpoint_path)[1].lower()
+            
+            if file_ext == ".safetensors":
+                with safe_open(checkpoint_path, framework="pt") as f:
+                    metadata_raw = f.metadata()
+                    tensor_keys = list(f.keys())
+                    
+                    logger.info(f"🔍 Найдено {len(tensor_keys)} тензоров в checkpoint")
+                    if metadata_raw:
+                        logger.info(f"🔍 Найдено {len(metadata_raw)} записей метаданных")
+                    
+                    # Анализируем ключи тензоров для определения архитектуры
+                    sdxl_indicators = [
+                        "conditioner.embedders.1.model.transformer.resblocks",
+                        "conditioner.embedders.0.transformer.text_model",
+                        "first_stage_model.encoder.down.0.block.0.norm1.weight",
+                        "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight"
+                    ]
+                    
+                    sd_indicators = [
+                        "cond_stage_model.transformer.text_model.encoder.layers",
+                        "first_stage_model.encoder.down.0.block.0.norm1.weight",
+                        "model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn1.to_q.weight"
+                    ]
+                    
+                    # Ищем характерные ключи для SDXL
+                    sdxl_score = 0
+                    sd_score = 0
+                    
+                    for key in tensor_keys[:100]:  # Проверяем первые 100 ключей
+                        for indicator in sdxl_indicators:
+                            if indicator in key:
+                                sdxl_score += 1
+                                break
+                        
+                        for indicator in sd_indicators:
+                            if indicator in key and "conditioner.embedders.1" not in key:
+                                sd_score += 1
+                                break
+                    
+                    # Дополнительная проверка по размерам моделей
+                    try:
+                        # Проверяем размер текстового энкодера
+                        text_encoder_keys = [k for k in tensor_keys if "text_model.embeddings.token_embedding.weight" in k]
+                        if text_encoder_keys:
+                            tensor = f.get_tensor(text_encoder_keys[0])
+                            vocab_size = tensor.shape[0]
+                            logger.info(f"🔍 Размер словаря текстового энкодера: {vocab_size}")
+                            
+                            if vocab_size > 50000:  # SDXL обычно имеет больший словарь
+                                sdxl_score += 2
+                            else:
+                                sd_score += 2
+                    except:
+                        pass
+                    
+                    # Проверяем размеры UNet
+                    try:
+                        unet_keys = [k for k in tensor_keys if "model.diffusion_model.input_blocks.0.0.weight" in k]
+                        if unet_keys:
+                            tensor = f.get_tensor(unet_keys[0])
+                            input_channels = tensor.shape[1]
+                            logger.info(f"🔍 Входные каналы UNet: {input_channels}")
+                            
+                            if input_channels == 4:  # Стандартно для обеих архитектур
+                                # Проверяем другие размеры
+                                output_channels = tensor.shape[0]
+                                if output_channels >= 320:
+                                    sdxl_score += 1
+                    except:
+                        pass
+                    
+                    logger.info(f"🔍 Счет определения: SDXL={sdxl_score}, SD={sd_score}")
+                    
+                    # Определяем тип модели на основе счета
+                    if sdxl_score > sd_score:
+                        metadata["model_type"] = "sdxl"
+                        metadata["architecture"] = "SDXL"
+                        metadata["base_model"] = "SDXL"
+                        metadata["resolution"] = "1024x1024"
+                    elif sd_score > 0:
+                        metadata["model_type"] = "sd"
+                        metadata["architecture"] = "SD 1.5"
+                        metadata["base_model"] = "SD 1.5"
+                        metadata["resolution"] = "512x512"
+                    
+                    # Извлекаем метаданные из заголовка файла
+                    if metadata_raw:
+                        # Стандартные поля
+                        standard_fields = {
+                            "modelspec.title": "model_name",
+                            "modelspec.description": "description", 
+                            "modelspec.author": "author",
+                            "modelspec.implementation": "implementation",
+                            "modelspec.architecture": "architecture_info"
+                        }
+                        
+                        for raw_key, meta_key in standard_fields.items():
+                            if raw_key in metadata_raw:
+                                metadata[meta_key] = metadata_raw[raw_key]
+                        
+                        # Ищем другие полезные поля
+                        for key, value in metadata_raw.items():
+                            if "title" in key.lower() and not metadata.get("model_name"):
+                                metadata["model_name"] = value
+                            elif "description" in key.lower() and not metadata.get("description"):
+                                metadata["description"] = value
+                            elif "author" in key.lower() and not metadata.get("author"):
+                                metadata["author"] = value
+                    
+                    logger.info(f"🔍 Финальное определение типа: {metadata['model_type']}")
+                    if metadata["model_type"] != "unknown":
+                        logger.info(f"   📋 Архитектура: {metadata['architecture']}")
+                        logger.info(f"   📐 Разрешение: {metadata['resolution']}")
+                        
+                        if metadata.get("model_name"):
+                            logger.info(f"   📝 Название: {metadata['model_name']}")
+                    
+            return metadata
+            
+        except ImportError:
+            logger.warning("⚠️ safetensors не установлен, анализ checkpoint метаданных недоступен")
+            return {"model_type": "unknown", "error": "safetensors not available"}
+        except Exception as e:
+            logger.error(f"❌ Ошибка анализа метаданных checkpoint {checkpoint_path}: {e}")
+            return {"model_type": "unknown", "error": str(e)}
     
     def get_active_loras(self, model_type: str) -> List[Dict]:
         """Получает список активных LoRA для указанного типа модели"""
@@ -1450,6 +1629,103 @@ class ModelManager:
         
         logger.info(f"✅ Анализ завершен: {len(results)} LoRA файлов")
         return results
+    
+    def update_lora_metadata(self, force_update: bool = False) -> bool:
+        """
+        Обновляет метаданные существующих LoRA в конфигурации
+        
+        Args:
+            force_update: Принудительно обновить все LoRA (даже уже проанализированные)
+            
+        Returns:
+            True если конфигурация была обновлена
+        """
+        try:
+            config = self.get_lora_config(force_reload=True)
+            if "loras" not in config:
+                config["loras"] = {}
+            
+            updated = False
+            
+            for lora_key, lora_config in config["loras"].items():
+                # Пропускаем уже проанализированные LoRA (если не force_update)
+                if not force_update and lora_config.get("metadata_analyzed", False):
+                    continue
+                
+                filename = lora_config.get("filename")
+                model_type = lora_config.get("model_type", "sd")
+                
+                if not filename:
+                    continue
+                
+                # Ищем файл в соответствующей папке
+                lora_path = os.path.join(self.lora_dir, model_type, filename)
+                
+                if not os.path.exists(lora_path):
+                    logger.warning(f"⚠️ LoRA файл не найден: {lora_path}")
+                    continue
+                
+                logger.info(f"🔍 Обновляю метаданные для {filename}")
+                
+                # Анализируем метаданные
+                metadata = self.analyze_lora_metadata(lora_path)
+                
+                # Определяем актуальный тип модели
+                detected_type = metadata.get("model_type", model_type)
+                if detected_type != "unknown" and detected_type != model_type:
+                    logger.warning(f"⚠️ LoRA {filename} в папке {model_type}/, но метаданные указывают на {detected_type}")
+                    actual_model_type = detected_type
+                    
+                    # Создаем новый ключ с правильным типом
+                    new_lora_key = f"{actual_model_type}_{os.path.splitext(filename)[0]}"
+                    if new_lora_key != lora_key:
+                        logger.info(f"🔄 Перемещаю конфигурацию: {lora_key} -> {new_lora_key}")
+                        # Копируем в новый ключ
+                        config["loras"][new_lora_key] = lora_config.copy()
+                        # Удаляем старый ключ
+                        del config["loras"][lora_key]
+                        lora_key = new_lora_key
+                        lora_config = config["loras"][lora_key]
+                else:
+                    actual_model_type = model_type
+                
+                # Сохраняем пользовательские настройки
+                user_enabled = lora_config.get("enabled", True)
+                user_strength = lora_config.get("strength", 1.0)
+                user_triggers = lora_config.get("triggers", [])
+                
+                # Обновляем конфигурацию с метаданными
+                config["loras"][lora_key].update({
+                    "model_type": actual_model_type,
+                    "enabled": user_enabled,  # Сохраняем пользовательскую настройку
+                    "strength": user_strength,  # Сохраняем пользовательскую силу
+                    "triggers": user_triggers if user_triggers else metadata.get("triggers", [])[:3],
+                    "description": metadata.get("description", f"Auto-detected: {metadata.get('base_model', 'Unknown')} LoRA"),
+                    "base_model": metadata.get("base_model", "Unknown"),
+                    "resolution": metadata.get("resolution", "Unknown"),
+                    "author": metadata.get("author", ""),
+                    "metadata_analyzed": True
+                })
+                
+                updated = True
+                
+                logger.info(f"✅ Обновлены метаданные для {filename}")
+                logger.info(f"   🎯 Тип: {actual_model_type} ({metadata.get('base_model', 'Unknown')})")
+                if metadata.get("triggers") and not user_triggers:
+                    logger.info(f"   🔤 Новые триггеры: {', '.join(metadata['triggers'][:3])}")
+            
+            if updated:
+                with open(self.lora_config_path, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+                logger.info(f"✅ Конфигурация LoRA обновлена с метаданными")
+                return True
+            else:
+                logger.info(f"📋 Все LoRA уже имеют актуальные метаданные")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления метаданных LoRA: {e}")
+            return False
 
 class PromptLoader:
     """
