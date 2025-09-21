@@ -1,0 +1,20 @@
+{
+  "loras": {
+    "example_sd_lora": {
+      "filename": "example_lora.safetensors",
+      "model_type": "sd",
+      "enabled": true,
+      "strength": 1.0,
+      "triggers": ["trigger_word", "style_name"],
+      "description": "Пример LoRA для SD 1.5 модели"
+    },
+    "example_sdxl_lora": {
+      "filename": "example_sdxl_lora.safetensors", 
+      "model_type": "sdxl",
+      "enabled": true,
+      "strength": 0.8,
+      "triggers": ["character_name"],
+      "description": "Пример LoRA для SDXL модели"
+    }
+  }
+}
