@@ -11,6 +11,11 @@ AI PowerShell Orchestrator with Google Search Integration
 pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors chromadb sentence-transformers python-docx openpyxl pandas
 """
 
+# Подавляем предупреждения PyTorch для чистого запуска
+import warnings
+warnings.filterwarnings("ignore", message="expandable_segments not supported on this platform")
+warnings.filterwarnings("ignore", message="There is an imbalance between your GPUs")
+
 import requests
 import subprocess
 import json
@@ -2010,6 +2015,21 @@ class AIOrchestrator:
         """Инициализирует OCR для распознавания текста на изображениях (теперь ленивая загрузка)"""
         # OCR теперь загружается в фоне, здесь ничего не делаем
         pass
+
+    def _ensure_chromadb_initialized(self):
+        """Ленивая инициализация ChromaDB - вызывается только при первом использовании"""
+        if not self._chromadb_initialized:
+            try:
+                self.logger.info("🔄 Инициализирую ChromaDB...")
+                self.chromadb_manager = ChromaDBManager(
+                    db_path=self._chromadb_config["db_path"],
+                    use_gpu=self._chromadb_config["use_gpu"]
+                )
+                self._chromadb_initialized = True
+                self.logger.info("✅ ChromaDB инициализирован")
+            except Exception as e:
+                self.logger.error(f"❌ Ошибка инициализации ChromaDB: {e}")
+                self.chromadb_manager = None
     
     def _check_ffmpeg(self):
         """Проверяет наличие ffmpeg в системе для конвертации аудио"""
@@ -3892,11 +3912,13 @@ class AIOrchestrator:
         # Запускаем фоновую загрузку тяжелых компонентов
         self._start_background_loading()
         
-        # Инициализируем ChromaDB для векторного хранилища (теперь с фоновой загрузкой)
-        self.chromadb_manager = ChromaDBManager(
-            db_path=os.path.join(self.base_dir, "chroma_db"),
-            use_gpu=True  # Включаем поддержку GPU
-        )
+        # Инициализируем ChromaDB для векторного хранилища (ленивая инициализация)
+        self.chromadb_manager = None
+        self._chromadb_initialized = False
+        self._chromadb_config = {
+            "db_path": os.path.join(self.base_dir, "chroma_db"),
+            "use_gpu": True
+        }
         
         # OCR будет инициализирован в фоне
         self.ocr_reader = None
@@ -7841,6 +7863,7 @@ class AIOrchestrator:
     
     def add_to_memory(self, user_message: str, ai_response: str, context: str = "", 
                      metadata: Optional[Dict[str, Any]] = None) -> bool:
+        self._ensure_chromadb_initialized()
         """
         Добавляет диалог в векторное хранилище памяти
         
@@ -7853,6 +7876,10 @@ class AIOrchestrator:
         Returns:
             True если успешно добавлено
         """
+        self._ensure_chromadb_initialized()
+        if self.chromadb_manager is None:
+            logger.error("❌ ChromaDB недоступен")
+            return False
         try:
             return self.chromadb_manager.add_conversation_memory(
                 user_message, ai_response, context, metadata
@@ -7874,6 +7901,10 @@ class AIOrchestrator:
         Returns:
             True если успешно добавлено
         """
+        self._ensure_chromadb_initialized()
+        if self.chromadb_manager is None:
+            logger.error("❌ ChromaDB недоступен")
+            return False
         try:
             return self.chromadb_manager.add_user_preference(
                 preference_text, category, metadata
@@ -7893,6 +7924,10 @@ class AIOrchestrator:
         Returns:
             Строка с релевантным контекстом
         """
+        self._ensure_chromadb_initialized()
+        if self.chromadb_manager is None:
+            logger.error("❌ ChromaDB недоступен")
+            return ""
         try:
             return self.chromadb_manager.get_conversation_context(query, max_context_length)
         except Exception as e:
@@ -7909,6 +7944,10 @@ class AIOrchestrator:
         Returns:
             Строка с предпочтениями пользователя
         """
+        self._ensure_chromadb_initialized()
+        if self.chromadb_manager is None:
+            logger.error("❌ ChromaDB недоступен")
+            return ""
         try:
             return self.chromadb_manager.get_user_preferences_summary(query)
         except Exception as e:
@@ -7928,6 +7967,10 @@ class AIOrchestrator:
         Returns:
             Список найденных диалогов
         """
+        self._ensure_chromadb_initialized()
+        if self.chromadb_manager is None:
+            logger.error("❌ ChromaDB недоступен")
+            return []
         try:
             return self.chromadb_manager.search_similar_conversations(
                 query, n_results, similarity_threshold
@@ -7946,6 +7989,10 @@ class AIOrchestrator:
         Returns:
             Количество удаленных записей
         """
+        self._ensure_chromadb_initialized()
+        if self.chromadb_manager is None:
+            logger.error("❌ ChromaDB недоступен")
+            return 0
         try:
             return self.chromadb_manager.cleanup_old_records(days_to_keep)
         except Exception as e:
@@ -7959,6 +8006,10 @@ class AIOrchestrator:
         Returns:
             Словарь со статистикой
         """
+        self._ensure_chromadb_initialized()
+        if self.chromadb_manager is None:
+            logger.error("❌ ChromaDB недоступен")
+            return {"error": "ChromaDB недоступен"}
         try:
             return self.chromadb_manager.get_database_stats()
         except Exception as e:
@@ -7973,10 +8024,11 @@ class AIOrchestrator:
             Словарь с информацией о GPU
         """
         try:
-            if hasattr(self, 'chromadb_manager') and self.chromadb_manager:
-                return self.chromadb_manager.get_gpu_info()
-            else:
-                return {"error": "ChromaDB не инициализирован"}
+            self._ensure_chromadb_initialized()
+            if self.chromadb_manager is None:
+                logger.error("❌ ChromaDB недоступен")
+                return {"error": "ChromaDB недоступен"}
+            return self.chromadb_manager.get_gpu_info()
         except Exception as e:
             logger.error(f"❌ Ошибка получения информации о GPU: {e}")
             return {"error": str(e)}
@@ -8172,22 +8224,21 @@ def test_startup_initialization():
     start_time = time.time()
     
     try:
-        # Ждем фоновой инициализации ChromaDB
-        if orchestrator.chromadb_manager._ensure_initialized(timeout=60):
-            component_times["chromadb"] = time.time() - start_time
-            print(f"   ✅ ChromaDB: {component_times['chromadb']:.2f}с")
-            
-            # Проверяем работу ChromaDB
-            test_memory = orchestrator.chromadb_manager.add_conversation_memory(
-                "Тестовое сообщение", "Тестовый ответ", "Контекст теста"
-            )
-            if test_memory:
-                print("   ✅ ChromaDB функциональность: OK")
-            else:
-                print("   ⚠️ ChromaDB функциональность: Ошибка")
+        # Инициализация ChromaDB через оркестратор
+        orchestrator._ensure_chromadb_initialized()
+        component_times["chromadb"] = time.time() - start_time
+        print(f"   ✅ ChromaDB: {component_times['chromadb']:.2f}с")
+        
+        # Проверяем работу ChromaDB
+        test_memory = orchestrator.add_to_memory(
+            "Тестовое сообщение", "Тестовый ответ", "Контекст теста"
+        )
+        if test_memory:
+            print("   ✅ ChromaDB функциональность: OK")
         else:
-            component_times["chromadb"] = time.time() - start_time
-            print(f"   ❌ ChromaDB: {component_times['chromadb']:.2f}с - Таймаут инициализации")
+            print("   ⚠️ ChromaDB функциональность: Ошибка")
+            
+        component_times["chromadb"] = time.time() - start_time
     except Exception as e:
         component_times["chromadb"] = time.time() - start_time
         print(f"   ❌ ChromaDB: {component_times['chromadb']:.2f}с - {e}")
