@@ -1072,6 +1072,194 @@ def image_to_base64_balanced(image_path: str, max_size=(500, 500), palette_color
         logger.error(f"Ошибка кодирования (balanced) {image_path}: {e}")
         return ""
 
+class ModelManager:
+    """
+    Класс для управления Stable Diffusion моделями и LoRA
+    """
+    
+    def __init__(self, base_dir: str | None = None):
+        if base_dir is None:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        self.base_dir = base_dir
+        self.stable_diff_dir = os.path.join(base_dir, "stable_diff")
+        self.checkpoints_dir = os.path.join(self.stable_diff_dir, "checkpoints")
+        self.lora_dir = os.path.join(self.stable_diff_dir, "lora")
+        self.lora_config_path = os.path.join(self.lora_dir, "lora_config.json")
+        
+        # Кэш для конфигурации LoRA
+        self._lora_config_cache = {}
+        self._lora_config_last_modified = 0
+        
+        # Создаем папки если их нет
+        self._ensure_directories()
+        
+        # Инициализируем конфигурацию LoRA
+        self._init_lora_config()
+    
+    def _ensure_directories(self):
+        """Создает необходимые папки если их нет"""
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.lora_dir, "sd"), exist_ok=True)
+        os.makedirs(os.path.join(self.lora_dir, "sdxl"), exist_ok=True)
+    
+    def _init_lora_config(self):
+        """Инициализирует конфигурацию LoRA"""
+        if not os.path.exists(self.lora_config_path):
+            self._generate_lora_config()
+        else:
+            self._scan_and_update_lora_config()
+    
+    def _scan_lora_files(self) -> Dict[str, List[str]]:
+        """Сканирует папки LoRA и возвращает найденные файлы"""
+        lora_files = {"sd": [], "sdxl": []}
+        
+        for model_type in ["sd", "sdxl"]:
+            lora_type_dir = os.path.join(self.lora_dir, model_type)
+            if os.path.exists(lora_type_dir):
+                for file in os.listdir(lora_type_dir):
+                    if file.lower().endswith(('.safetensors', '.ckpt', '.pt')):
+                        lora_files[model_type].append(file)
+        
+        return lora_files
+    
+    def _generate_lora_config(self):
+        """Генерирует базовую конфигурацию LoRA"""
+        lora_files = self._scan_lora_files()
+        config = {"loras": {}}
+        
+        for model_type, files in lora_files.items():
+            for filename in files:
+                lora_name = os.path.splitext(filename)[0]
+                config["loras"][f"{model_type}_{lora_name}"] = {
+                    "filename": filename,
+                    "model_type": model_type,
+                    "enabled": True,
+                    "strength": 1.0,
+                    "triggers": [],
+                    "description": f"Auto-generated config for {filename}"
+                }
+        
+        with open(self.lora_config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"✅ Создан конфигурационный файл LoRA: {len(config['loras'])} файлов")
+    
+    def _scan_and_update_lora_config(self):
+        """Сканирует LoRA файлы и обновляет конфигурацию новыми"""
+        lora_files = self._scan_lora_files()
+        
+        try:
+            with open(self.lora_config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except:
+            config = {"loras": {}}
+        
+        if "loras" not in config:
+            config["loras"] = {}
+        
+        # Добавляем новые LoRA файлы
+        updated = False
+        for model_type, files in lora_files.items():
+            for filename in files:
+                lora_name = os.path.splitext(filename)[0]
+                lora_key = f"{model_type}_{lora_name}"
+                
+                if lora_key not in config["loras"]:
+                    config["loras"][lora_key] = {
+                        "filename": filename,
+                        "model_type": model_type,
+                        "enabled": True,
+                        "strength": 1.0,
+                        "triggers": [],
+                        "description": f"Auto-generated config for {filename}"
+                    }
+                    updated = True
+        
+        if updated:
+            with open(self.lora_config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            logger.info(f"✅ Обновлен конфигурационный файл LoRA")
+    
+    def get_lora_config(self, force_reload: bool = False) -> Dict:
+        """Получает конфигурацию LoRA с кэшированием"""
+        try:
+            # Проверяем время модификации файла
+            if os.path.exists(self.lora_config_path):
+                mtime = os.path.getmtime(self.lora_config_path)
+                
+                # Если файл изменился или принудительная перезагрузка
+                if force_reload or mtime > self._lora_config_last_modified:
+                    with open(self.lora_config_path, 'r', encoding='utf-8') as f:
+                        self._lora_config_cache = json.load(f)
+                    self._lora_config_last_modified = mtime
+                    logger.info("🔄 Перезагружена конфигурация LoRA")
+                
+                return self._lora_config_cache
+            else:
+                return {"loras": {}}
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки конфигурации LoRA: {e}")
+            return {"loras": {}}
+    
+    def get_model_path(self) -> str:
+        """Получает путь к модели с приоритетом .env > stable_diff"""
+        # Приоритет 1: переменная окружения
+        env_path = os.getenv('STABLE_DIFFUSION_MODEL_PATH', '').strip()
+        if env_path and os.path.exists(env_path):
+            return env_path
+        
+        # Приоритет 2: папка stable_diff/checkpoints
+        if os.path.exists(self.checkpoints_dir):
+            for file in os.listdir(self.checkpoints_dir):
+                if file.lower().endswith(('.safetensors', '.ckpt')):
+                    model_path = os.path.join(self.checkpoints_dir, file)
+                    logger.info(f"🔍 Автоопределена модель: {file}")
+                    return model_path
+        
+        # Fallback: возвращаем путь из .env даже если файл не существует
+        return env_path if env_path else ""
+    
+    def detect_model_type(self, model_path: str) -> str:
+        """Определяет тип модели (sd/sdxl) по пути или имени файла"""
+        model_name = os.path.basename(model_path).lower()
+        
+        # Простая эвристика определения типа модели
+        if 'sdxl' in model_name or 'xl' in model_name:
+            return 'sdxl'
+        else:
+            return 'sd'
+    
+    def get_active_loras(self, model_type: str) -> List[Dict]:
+        """Получает список активных LoRA для указанного типа модели"""
+        config = self.get_lora_config()
+        active_loras = []
+        
+        for lora_key, lora_config in config.get("loras", {}).items():
+            if (lora_config.get("enabled", False) and 
+                lora_config.get("model_type") == model_type):
+                active_loras.append(lora_config)
+        
+        return active_loras
+    
+    def apply_lora_triggers(self, prompt: str, model_type: str) -> str:
+        """Добавляет триггер-слова LoRA к промпту"""
+        active_loras = self.get_active_loras(model_type)
+        triggers = []
+        
+        for lora in active_loras:
+            lora_triggers = lora.get("triggers", [])
+            if lora_triggers:
+                triggers.extend(lora_triggers)
+        
+        if triggers:
+            trigger_text = ", ".join(triggers)
+            enhanced_prompt = f"{prompt}, {trigger_text}"
+            logger.info(f"🎯 Добавлены LoRA триггеры: {trigger_text}")
+            return enhanced_prompt
+        
+        return prompt
+
 class PromptLoader:
     """
     Класс для динамической загрузки системных промптов и модулей из .md файлов
@@ -2389,12 +2577,32 @@ class AIOrchestrator:
         # Логируем полученные параметры
         self.logger.info(f"🔧 Получены параметры генерации: prompt='{prompt[:50]}...', negative_prompt='{negative_prompt}'")
         
+        # Горячая перезагрузка конфигурации LoRA
+        self.model_manager.get_lora_config(force_reload=True)
+        
         # Автоматически включаем генерацию изображений при необходимости
         if not getattr(self, 'use_image_generation', False):
             self.logger.info("🔧 Автоматически включаю генерацию изображений")
             self.use_image_generation = True
             # Запускаем таймер автоматического выключения
             self.auto_disable_tools("image_generation")
+        
+        # Получаем путь к модели через ModelManager (приоритет .env > stable_diff)
+        model_path = self.model_manager.get_model_path()
+        if not model_path:
+            self.logger.error("❌ Не удалось найти Stable Diffusion модель")
+            return None
+        
+        if not os.path.exists(model_path):
+            self.logger.error(f"❌ Модель не найдена: {model_path}")
+            return None
+        
+        # Определяем тип модели
+        model_type = self.model_manager.detect_model_type(model_path)
+        self.logger.info(f"🔍 Определен тип модели: {model_type} для {os.path.basename(model_path)}")
+        
+        # Применяем LoRA триггеры к промпту
+        enhanced_prompt = self.model_manager.apply_lora_triggers(prompt, model_type)
         
         # Параметры по умолчанию (будут обновлены в зависимости от типа модели)
         default_params = {
@@ -2446,24 +2654,10 @@ class AIOrchestrator:
             from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler  # type: ignore
             import torch
             
-            # Путь к модели из .env файла
-            model_path = os.getenv("STABLE_DIFFUSION_MODEL_PATH")
-            if not model_path:
-                self.logger.error("❌ STABLE_DIFFUSION_MODEL_PATH не указан в .env файле")
-                return None
-            
-            # Проверяем существование модели
-            if not os.path.exists(model_path):
-                self.logger.error(f"❌ Модель не найдена: {model_path}")
-                return None
-            
             self.logger.info(f"📦 Загружаю модель: {model_path}")
             
-            # Определяем тип модели по имени файла (SDXL модели обычно содержат xl, sdxl, illustrious в названии)
-            model_name = os.path.basename(model_path).lower()
-            is_sdxl = any(keyword in model_name for keyword in ['xl', 'sdxl', 'illustrious', 'pony'])
-            
             # Загружаем соответствующий pipeline
+            is_sdxl = (model_type == 'sdxl')
             if is_sdxl:
                 self.logger.info("🎯 Обнаружена SDXL модель, использую StableDiffusionXLPipeline")
                 pipe = StableDiffusionXLPipeline.from_single_file(
@@ -2486,6 +2680,37 @@ class AIOrchestrator:
             else:
                 self.logger.warning("⚠️ GPU недоступен, использую CPU")
             
+            # Загружаем активные LoRA для данного типа модели
+            active_loras = self.model_manager.get_active_loras(model_type)
+            if active_loras:
+                self.logger.info(f"🎭 Найдено {len(active_loras)} активных LoRA для типа {model_type}")
+                
+                for lora in active_loras:
+                    try:
+                        lora_filename = lora.get('filename', '')
+                        lora_strength = lora.get('strength', 1.0)
+                        
+                        # Определяем путь к LoRA файлу
+                        lora_path = os.path.join(self.model_manager.lora_dir, model_type, lora_filename)
+                        
+                        if os.path.exists(lora_path):
+                            # Загружаем LoRA в pipeline
+                            pipe.load_lora_weights(lora_path)
+                            self.logger.info(f"✅ Загружена LoRA: {lora_filename} (сила: {lora_strength})")
+                            
+                            # Применяем силу LoRA (если поддерживается)
+                            if hasattr(pipe, 'set_adapters'):
+                                pipe.set_adapters([lora_filename], adapter_weights=[lora_strength])
+                            
+                        else:
+                            self.logger.warning(f"⚠️ LoRA файл не найден: {lora_path}")
+                    
+                    except Exception as e:
+                        self.logger.error(f"❌ Ошибка загрузки LoRA {lora.get('filename', 'unknown')}: {e}")
+                        continue
+            else:
+                self.logger.info(f"📝 Нет активных LoRA для типа модели {model_type}")
+            
             # Сохраняем pipeline для последующей выгрузки
             self.current_pipeline = pipe
             
@@ -2495,10 +2720,10 @@ class AIOrchestrator:
                 self.logger.info("⚙️ Использую DPMSolverMultistepScheduler")
             
             # Генерируем изображение
-            self.logger.info(f"🎨 Генерирую изображение: {prompt[:50]}...")
+            self.logger.info(f"🎨 Генерирую изображение: {enhanced_prompt[:50]}...")
 
             result = pipe(
-                prompt=prompt,
+                prompt=enhanced_prompt,
                 negative_prompt=negative_prompt,
                 num_inference_steps=gen_params["steps"],
                 guidance_scale=gen_params["cfg"],
@@ -3702,6 +3927,9 @@ class AIOrchestrator:
 
         # Инициализируем загрузчик промптов
         self.prompt_loader = PromptLoader(self.base_dir)
+        
+        # Инициализируем менеджер моделей и LoRA
+        self.model_manager = ModelManager(self.base_dir)
         
         # Загружаем базовый системный промпт из файла
         self.system_prompt = self.prompt_loader.load_base_prompt()
