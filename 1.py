@@ -1151,7 +1151,7 @@ class ModelManager:
         logger.info(f"✅ Создан конфигурационный файл LoRA: {len(config['loras'])} файлов")
     
     def _scan_and_update_lora_config(self):
-        """Сканирует LoRA файлы и обновляет конфигурацию новыми"""
+        """Сканирует LoRA файлы и обновляет конфигурацию новыми с анализом метаданных"""
         lora_files = self._scan_lora_files()
         
         try:
@@ -1171,20 +1171,44 @@ class ModelManager:
                 lora_key = f"{model_type}_{lora_name}"
                 
                 if lora_key not in config["loras"]:
+                    # Анализируем метаданные LoRA
+                    lora_path = os.path.join(self.lora_dir, model_type, filename)
+                    metadata = self.analyze_lora_metadata(lora_path)
+                    
+                    # Определяем тип модели из метаданных или используем папку
+                    detected_model_type = metadata.get("model_type", model_type)
+                    if detected_model_type != "unknown" and detected_model_type != model_type:
+                        logger.warning(f"⚠️ LoRA {filename} в папке {model_type}/, но метаданные указывают на {detected_model_type}")
+                        # Используем тип из метаданных как более точный
+                        actual_model_type = detected_model_type
+                        lora_key = f"{actual_model_type}_{lora_name}"
+                    else:
+                        actual_model_type = model_type
+                    
+                    # Создаем конфигурацию с метаданными
                     config["loras"][lora_key] = {
                         "filename": filename,
-                        "model_type": model_type,
+                        "model_type": actual_model_type,
                         "enabled": True,
-                        "strength": 1.0,
-                        "triggers": [],
-                        "description": f"Auto-generated config for {filename}"
+                        "strength": metadata.get("preferred_weight", 1.0),
+                        "triggers": metadata.get("triggers", [])[:3],  # Берем топ-3 триггера
+                        "description": metadata.get("description", f"Auto-detected: {metadata.get('base_model', 'Unknown')} LoRA"),
+                        "base_model": metadata.get("base_model", "Unknown"),
+                        "resolution": metadata.get("resolution", "Unknown"),
+                        "author": metadata.get("author", ""),
+                        "metadata_analyzed": True
                     }
                     updated = True
+                    
+                    logger.info(f"📋 Создана конфигурация для {filename}")
+                    logger.info(f"   🎯 Тип: {actual_model_type} ({metadata.get('base_model', 'Unknown')})")
+                    if metadata.get("triggers"):
+                        logger.info(f"   🔤 Триггеры: {', '.join(metadata['triggers'][:3])}")
         
         if updated:
             with open(self.lora_config_path, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
-            logger.info(f"✅ Обновлен конфигурационный файл LoRA")
+            logger.info(f"✅ Обновлен конфигурационный файл LoRA с анализом метаданных")
     
     def get_lora_config(self, force_reload: bool = False) -> Dict:
         """Получает конфигурацию LoRA с кэшированием"""
@@ -1206,6 +1230,126 @@ class ModelManager:
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки конфигурации LoRA: {e}")
             return {"loras": {}}
+    
+    def analyze_lora_metadata(self, lora_path: str) -> Dict[str, Any]:
+        """
+        Анализирует метаданные LoRA файла для определения совместимости
+        
+        Args:
+            lora_path: Путь к LoRA файлу
+            
+        Returns:
+            Словарь с метаданными LoRA
+        """
+        try:
+            from safetensors import safe_open
+            
+            # Результат анализа
+            metadata = {
+                "model_type": "unknown",
+                "base_model": "unknown", 
+                "resolution": "unknown",
+                "triggers": [],
+                "description": "",
+                "author": "",
+                "version": "",
+                "activation_text": "",
+                "preferred_weight": 1.0
+            }
+            
+            # Анализируем расширение файла
+            file_ext = os.path.splitext(lora_path)[1].lower()
+            
+            if file_ext == ".safetensors":
+                # Читаем метаданные из safetensors
+                with safe_open(lora_path, framework="pt") as f:
+                    metadata_raw = f.metadata()
+                    
+                    if metadata_raw:
+                        # Извлекаем информацию о базовой модели
+                        if "ss_base_model_version" in metadata_raw:
+                            base_version = metadata_raw["ss_base_model_version"]
+                            if "xl" in base_version.lower():
+                                metadata["model_type"] = "sdxl"
+                                metadata["base_model"] = "SDXL"
+                            else:
+                                metadata["model_type"] = "sd"
+                                metadata["base_model"] = "SD 1.5"
+                        
+                        # Разрешение обучения
+                        if "ss_resolution" in metadata_raw:
+                            metadata["resolution"] = metadata_raw["ss_resolution"]
+                        elif "ss_bucket_info" in metadata_raw:
+                            try:
+                                bucket_info = json.loads(metadata_raw["ss_bucket_info"])
+                                if "buckets" in bucket_info:
+                                    resolutions = list(bucket_info["buckets"].keys())
+                                    if resolutions:
+                                        metadata["resolution"] = resolutions[0]
+                            except:
+                                pass
+                        
+                        # Извлекаем теги и триггеры
+                        if "ss_tag_frequency" in metadata_raw:
+                            try:
+                                tag_freq = json.loads(metadata_raw["ss_tag_frequency"])
+                                # Получаем самые частые теги как потенциальные триггеры
+                                all_tags = {}
+                                for dataset_tags in tag_freq.values():
+                                    all_tags.update(dataset_tags)
+                                
+                                # Сортируем по частоте и берем топ-5
+                                sorted_tags = sorted(all_tags.items(), key=lambda x: x[1], reverse=True)
+                                metadata["triggers"] = [tag for tag, _ in sorted_tags[:5]]
+                            except:
+                                pass
+                        
+                        # Другие поля метаданных
+                        metadata_mapping = {
+                            "ss_dataset_dirs": "description",
+                            "modelspec.architecture": "architecture",
+                            "modelspec.implementation": "implementation",
+                            "modelspec.title": "title"
+                        }
+                        
+                        for key, target in metadata_mapping.items():
+                            if key in metadata_raw:
+                                metadata[target] = metadata_raw[key]
+                        
+                        # Пытаемся извлечь автора и описание из названия файла
+                        filename = os.path.basename(lora_path)
+                        if "_" in filename or "-" in filename:
+                            parts = filename.replace("_", " ").replace("-", " ").split()
+                            metadata["author"] = parts[0] if parts else ""
+                        
+                        logger.info(f"🔍 Проанализированы метаданные LoRA: {filename}")
+                        logger.info(f"   📋 Базовая модель: {metadata['base_model']}")
+                        logger.info(f"   📐 Разрешение: {metadata['resolution']}")
+                        if metadata["triggers"]:
+                            logger.info(f"   🎯 Найденные триггеры: {', '.join(metadata['triggers'][:3])}")
+            
+            elif file_ext in [".ckpt", ".pt"]:
+                # Для старых форматов используем эвристический анализ
+                filename = os.path.basename(lora_path).lower()
+                
+                # Определяем тип по имени файла
+                if any(keyword in filename for keyword in ["sdxl", "xl", "illustrious", "pony"]):
+                    metadata["model_type"] = "sdxl"
+                    metadata["base_model"] = "SDXL"
+                else:
+                    metadata["model_type"] = "sd"
+                    metadata["base_model"] = "SD 1.5"
+                
+                logger.info(f"🔍 Анализ LoRA по имени файла: {metadata['base_model']}")
+            
+            return metadata
+            
+        except ImportError:
+            logger.warning("⚠️ safetensors не установлен, анализ метаданных недоступен")
+            return {"model_type": "unknown", "error": "safetensors not available"}
+        except Exception as e:
+            logger.error(f"❌ Ошибка анализа метаданных LoRA {lora_path}: {e}")
+            return {"model_type": "unknown", "error": str(e)}
     
     def get_model_path(self) -> str:
         """Получает путь к модели с приоритетом .env > stable_diff"""
@@ -1264,6 +1408,48 @@ class ModelManager:
             return enhanced_prompt
         
         return prompt
+    
+    def analyze_all_loras(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Анализирует метаданные всех LoRA файлов в системе
+        
+        Returns:
+            Словарь с результатами анализа всех LoRA
+        """
+        results = {}
+        lora_files = self._scan_lora_files()
+        
+        logger.info("🔍 Запускаю анализ метаданных всех LoRA файлов...")
+        
+        for model_type, files in lora_files.items():
+            for filename in files:
+                lora_path = os.path.join(self.lora_dir, model_type, filename)
+                lora_key = f"{model_type}_{os.path.splitext(filename)[0]}"
+                
+                logger.info(f"📋 Анализирую: {filename}")
+                metadata = self.analyze_lora_metadata(lora_path)
+                
+                results[lora_key] = {
+                    "filename": filename,
+                    "path": lora_path,
+                    "folder_type": model_type,
+                    "detected_type": metadata.get("model_type", "unknown"),
+                    "base_model": metadata.get("base_model", "Unknown"),
+                    "resolution": metadata.get("resolution", "Unknown"),
+                    "triggers": metadata.get("triggers", []),
+                    "author": metadata.get("author", ""),
+                    "description": metadata.get("description", ""),
+                    "compatible": metadata.get("model_type", model_type) == model_type,
+                    "analysis_success": "error" not in metadata
+                }
+                
+                # Предупреждение о несоответствии
+                if (metadata.get("model_type", "unknown") != "unknown" and 
+                    metadata.get("model_type") != model_type):
+                    logger.warning(f"⚠️ {filename}: в папке {model_type}/, но предназначен для {metadata.get('model_type')}")
+        
+        logger.info(f"✅ Анализ завершен: {len(results)} LoRA файлов")
+        return results
 
 class PromptLoader:
     """
