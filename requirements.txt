@@ -27,3 +27,4 @@ markdown==3.5.1
 pygame==2.6.1
 imaplib2==3.6
 email-validator==2.1.0
+peft==0.17.1
