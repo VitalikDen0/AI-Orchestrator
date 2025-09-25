@@ -282,10 +282,12 @@
 - **txt** — простой текст
 - **md** — Markdown
 - **html** — HTML страницы
-- **json** — JSON данные
-- **csv** — CSV таблицы
+- **json** — JSON данные с валидацией
+- **csv** — CSV таблицы с правильной кодировкой
+- **xml** — XML документы с декларацией
 - **docx** — Word документы
 - **xlsx** — Excel таблицы
+- **pdf** — PDF документы
 
 ### Примеры создания разных типов:
 ```json
@@ -303,6 +305,22 @@
   "filename": "contacts.csv",
   "file_type": "csv",
   "description": "Создаю CSV таблицу контактов"
+}
+
+{
+  "action": "generate_file",
+  "content": "<!DOCTYPE html>\\n<html>\\n<head><title>Отчет</title></head>\\n<body><h1>Заголовок</h1><p>Содержание отчета</p></body>\\n</html>",
+  "filename": "report.html", 
+  "file_type": "html",
+  "description": "Создаю HTML отчет"
+}
+
+{
+  "action": "generate_file",
+  "content": "<?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<data>\\n  <user name=\\\"Виталий\\\" age=\\\"30\\\"/>\\n  <user name=\\\"Анна\\\" age=\\\"25\\\"/>\\n</data>",
+  "filename": "users.xml",
+  "file_type": "xml", 
+  "description": "Создаю XML файл с данными пользователей"
 }
 ```
 

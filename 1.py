@@ -4,11 +4,6 @@
 AI PowerShell Orchestrator with Google Search Integration
 Интегрирует LM Studio, PowerShell команды и поиск Google
 
-ОБНОВЛЕНО: Теперь использует прямую интеграцию со Stable Diffusion для генерации изображений
-ОБНОВЛЕНО: Добавлено векторное хранилище ChromaDB для преодоления ограничений контекста
-
-ТРЕБУЕМЫЕ БИБЛИОТЕКИ:
-pip install pyautogui mss pillow requests diffusers transformers torch torchvision accelerate safetensors chromadb sentence-transformers python-docx openpyxl pandas
 """
 
 # Подавляем предупреждения PyTorch для чистого запуска
@@ -509,7 +504,8 @@ class ChromaDBManager:
         return gpu_info
     
     def add_conversation_memory(self, user_message: str, ai_response: str,
-                               context: str = "", metadata: Optional[Dict[str, Any]] = None) -> bool:
+                               context: str = "", metadata: Optional[Dict[str, Any]] = None, 
+                               force_add: bool = False) -> bool:
         """
         Добавляет диалог в векторное хранилище
         
@@ -518,17 +514,39 @@ class ChromaDBManager:
             ai_response: Ответ ИИ
             context: Дополнительный контекст
             metadata: Дополнительные метаданные
+            force_add: Принудительно добавить без проверки дубликатов
             
         Returns:
-            True если успешно добавлено, False при ошибке
+            True если успешно добавлено, False при ошибке или дубликате
         """
         if not self._ensure_initialized():
             return False
         
         try:
+            # Проверяем дубликаты, если не принудительное добавление
+            if not force_add:
+                logger.debug(f"🔍 Проверяем дубликаты для сообщения: '{user_message[:50]}...'")
+                similar_conversations = self.search_similar_conversations(
+                    user_message, n_results=1, similarity_threshold=0.7
+                )
+                
+                if similar_conversations and len(similar_conversations) > 0:
+                    similarity = similar_conversations[0].get('similarity', 0)
+                    logger.debug(f"🔍 Найден похожий диалог с similarity={similarity:.3f}")
+                    
+                    # Если similarity больше 0.7 (70%), считаем дубликатом
+                    if similarity > 0.7:
+                        logger.info(f"⚠️ Найден дубликат с similarity={similarity:.3f}, пропускаем добавление")
+                        return False
+                else:
+                    logger.debug("🔍 Похожие диалоги не найдены, можно добавлять")
+            else:
+                logger.debug("🔄 Принудительное добавление, пропускаем проверку дубликатов")
             # Создаем уникальный ID для записи
+            import uuid
             timestamp = int(time.time())
-            record_id = f"conv_{timestamp}_{hash(user_message) % 10000}"
+            unique_suffix = str(uuid.uuid4())[:8]  # Первые 8 символов UUID
+            record_id = f"conv_{timestamp}_{unique_suffix}"
             
             # Объединяем текст для создания эмбеддинга
             combined_text = f"User: {user_message}\nAI: {ai_response}"
@@ -554,17 +572,34 @@ class ChromaDBManager:
                 record_metadata.update(metadata)
             
             # Добавляем в коллекцию
-                if self.collection is None:
-                    logger.warning("⚠️ Коллекция ChromaDB не инициализирована при попытке add")
-                    return False
-                self.collection.add(
+            if self.collection is None:
+                logger.warning("⚠️ Коллекция ChromaDB не инициализирована при попытке add")
+                return False
+            
+            # Проверяем, существует ли уже такой ID (маловероятно с UUID, но проверим)
+            try:
+                existing = self.collection.get(ids=[record_id])
+                if existing and existing.get('ids') and len(existing['ids']) > 0:
+                    # ID уже существует, добавим еще один уникальный суффикс
+                    record_id = f"conv_{timestamp}_{unique_suffix}_{hash(ai_response) % 1000}"
+                    logger.info(f"🔄 ID уже существует, используем новый: {record_id}")
+            except Exception:
+                pass  # Нормально, ID не существует
+            
+            self.collection.add(
                 embeddings=[embedding],
                 documents=[combined_text],
                 metadatas=[record_metadata],
                 ids=[record_id]
             )
             
-            logger.info(f"💾 Добавлена запись в ChromaDB: {record_id}")
+            # Дополнительная проверка - считаем количество записей
+            try:
+                total_count = self.collection.count()
+                logger.info(f"💾 Добавлена запись в ChromaDB: {record_id} (всего записей: {total_count})")
+            except Exception:
+                logger.info(f"💾 Добавлена запись в ChromaDB: {record_id}")
+            
             return True
             
         except Exception as e:
@@ -656,6 +691,13 @@ class ChromaDBManager:
             if self.collection is None:
                 logger.warning("⚠️ Коллекция ChromaDB не доступна, поиск невозможен")
                 return []
+            
+            # Проверяем общее количество записей перед поиском
+            try:
+                total_count = self.collection.count()
+                logger.info(f"🔍 Всего записей в ChromaDB: {total_count}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось получить количество записей: {e}")
             
             # Увеличиваем количество результатов для лучшего поиска
             search_results = max(n_results * 3, 15)
@@ -3167,6 +3209,20 @@ class AIOrchestrator:
             if active_loras:
                 self.logger.info(f"🎭 Найдено {len(active_loras)} активных LoRA для типа {model_type}")
                 
+                # Проверяем доступность PEFT
+                peft_available = False
+                try:
+                    import peft
+                    peft_available = True
+                    self.logger.info(f"✅ PEFT версии {peft.__version__} доступен")
+                except ImportError as e:
+                    self.logger.warning(f"⚠️ PEFT не установлен: {e}")
+                    self.logger.warning("   LoRA файлы в формате safetensors могут не работать")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Ошибка импорта PEFT: {e}")
+                    self.logger.warning("   LoRA файлы в формате safetensors могут не работать")
+                
+                loaded_loras = []
                 for lora in active_loras:
                     try:
                         lora_filename = lora.get('filename', '')
@@ -3176,20 +3232,78 @@ class AIOrchestrator:
                         lora_path = os.path.join(self.model_manager.lora_dir, model_type, lora_filename)
                         
                         if os.path.exists(lora_path):
-                            # Загружаем LoRA в pipeline
-                            pipe.load_lora_weights(lora_path)
-                            self.logger.info(f"✅ Загружена LoRA: {lora_filename} (сила: {lora_strength})")
+                            # Проверяем формат файла
+                            file_ext = os.path.splitext(lora_filename)[1].lower()
                             
-                            # Применяем силу LoRA (если поддерживается)
-                            if hasattr(pipe, 'set_adapters'):
-                                pipe.set_adapters([lora_filename], adapter_weights=[lora_strength])
-                            
+                            if file_ext == '.safetensors':
+                                # Современный формат - используем правильный метод
+                                adapter_name = os.path.splitext(lora_filename)[0]
+                                
+                                if not peft_available:
+                                    self.logger.warning(f"⚠️ Пропускаю LoRA {lora_filename} - PEFT не доступен")
+                                    continue
+                                
+                                try:
+                                    # Метод 1: Пробуем загрузить с указанием папки и имени файла
+                                    try:
+                                        pipe.load_lora_weights(os.path.dirname(lora_path), weight_name=lora_filename, adapter_name=adapter_name)
+                                        loaded_loras.append((adapter_name, lora_strength))
+                                        self.logger.info(f"✅ Загружена LoRA (метод 1/folder): {lora_filename} (сила: {lora_strength})")
+                                    except Exception as e1:
+                                        # Метод 2: Пробуем загрузить напрямую с именем адаптера
+                                        try:
+                                            pipe.load_lora_weights(lora_path, adapter_name=adapter_name)
+                                            loaded_loras.append((adapter_name, lora_strength))
+                                            self.logger.info(f"✅ Загружена LoRA (метод 2/direct): {lora_filename} (сила: {lora_strength})")
+                                        except Exception as e2:
+                                            # Метод 3: Пробуем загрузить без имени адаптера (legacy)
+                                            try:
+                                                pipe.load_lora_weights(lora_path)
+                                                loaded_loras.append((lora_filename, lora_strength))
+                                                self.logger.info(f"✅ Загружена LoRA (метод 3/legacy): {lora_filename} (сила: {lora_strength})")
+                                            except Exception as e3:
+                                                # Все методы не сработали
+                                                self.logger.error(f"❌ Не удалось загрузить safetensors LoRA {lora_filename}")
+                                                self.logger.error(f"   Метод 1 (folder): {str(e1)[:100]}...")
+                                                self.logger.error(f"   Метод 2 (direct): {str(e2)[:100]}...")  
+                                                self.logger.error(f"   Метод 3 (legacy): {str(e3)[:100]}...")
+                                                
+                                                # Дополнительная диагностика
+                                                if "PEFT" in str(e3):
+                                                    self.logger.error("   💡 Рекомендация: убедитесь что PEFT установлен: pip install peft")
+                                                    self.logger.error("   📋 Или попробуйте конвертировать LoRA в формат .ckpt")
+                                                continue
+                                        
+                                except Exception as e:
+                                    self.logger.error(f"❌ Общая ошибка загрузки safetensors LoRA {lora_filename}: {e}")
+                                    continue
+                            else:
+                                # Старый формат (.ckpt, .pt)
+                                try:
+                                    pipe.load_lora_weights(lora_path)
+                                    loaded_loras.append((lora_filename, lora_strength))
+                                    self.logger.info(f"✅ Загружена LoRA (legacy): {lora_filename} (сила: {lora_strength})")
+                                except Exception as e:
+                                    self.logger.error(f"❌ Не удалось загрузить legacy LoRA {lora_filename}: {e}")
+                                    continue
                         else:
                             self.logger.warning(f"⚠️ LoRA файл не найден: {lora_path}")
                     
                     except Exception as e:
                         self.logger.error(f"❌ Ошибка загрузки LoRA {lora.get('filename', 'unknown')}: {e}")
                         continue
+                
+                # Применяем силу LoRA если есть загруженные адаптеры
+                if loaded_loras:
+                    try:
+                        if hasattr(pipe, 'set_adapters') and len(loaded_loras) > 0:
+                            adapter_names = [name for name, _ in loaded_loras]
+                            adapter_weights = [weight for _, weight in loaded_loras]
+                            pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+                            self.logger.info(f"⚙️ Настроены веса адаптеров: {dict(loaded_loras)}")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Не удалось настроить веса адаптеров: {e}")
+                        
             else:
                 self.logger.info(f"📝 Нет активных LoRA для типа модели {model_type}")
             
@@ -3278,6 +3392,25 @@ class AIOrchestrator:
                         import numpy as _np
                         Image.fromarray(_np.array(image).astype('uint8')).save(output_path)
                         self.logger.info(f"💾 Изображение сохранено (converted fallback): {output_path}")
+                        
+                # Выгружаем pipeline сразу после сохранения для освобождения VRAM
+                self._unload_current_pipeline()
+                
+                # Проверяем наличие модели RealESRGAN и применяем апскейл если доступен
+                if self._is_realesrgan_available():
+                    self.logger.info("🔍 Модель RealESRGAN найдена, применяю апскейл...")
+                    upscaled_path = self.upscale_image_realesrgan(output_path)
+                    if upscaled_path and os.path.exists(upscaled_path):
+                        self.logger.info("✨ Использую увеличенное изображение")
+                        # Обновляем img_to_save для финального base64
+                        img_to_save = Image.open(upscaled_path)
+                        # Также показываем пользователю увеличенную версию
+                        output_path = upscaled_path
+                    else:
+                        self.logger.warning("⚠️ Апскейл не удался, использую оригинальное изображение")
+                else:
+                    self.logger.info("ℹ️ Модель RealESRGAN не найдена, пропускаю апскейл")
+                    
             except Exception:
                 self.logger.error(f"❌ Не удалось сохранить изображение ни одним из способов")
             
@@ -3314,6 +3447,196 @@ class AIOrchestrator:
             response_time = time.time() - start_time
             self.add_performance_metric("image_generation", response_time)
             self.logger.info(f"🎨 Изображение сгенерировано за {response_time:.2f} сек")
+
+    def _unload_current_pipeline(self):
+        """Выгружает текущий pipeline для экономии VRAM"""
+        try:
+            if hasattr(self, 'current_pipeline') and self.current_pipeline is not None:
+                self.logger.info("🔄 Выгружаю pipeline для экономии VRAM...")
+                
+                # Перемещаем на CPU
+                if hasattr(self.current_pipeline, 'to'):
+                    self.current_pipeline.to('cpu')
+                
+                # Удаляем pipeline
+                del self.current_pipeline
+                self.current_pipeline = None
+                
+                # Принудительная очистка памяти GPU
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        self.logger.info("🧹 Очищен кэш CUDA")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Не удалось очистить CUDA кэш: {e}")
+                
+                self.logger.info("✅ Pipeline выгружен")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Ошибка выгрузки pipeline: {e}")
+
+    def _is_realesrgan_available(self) -> bool:
+        """Проверяет доступность модели RealESRGAN"""
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(base_dir, "stable_diff", "RealESRGAN_x4.pth")
+            return os.path.exists(model_path)
+        except Exception:
+            return False
+
+    def upscale_image_realesrgan(self, image_path: str, output_path: Optional[str] = None) -> Optional[str]:
+        """
+        Увеличивает изображение в 4 раза с помощью RealESRGAN
+        
+        Args:
+            image_path: Путь к исходному изображению
+            output_path: Путь для сохранения результата (опционально)
+        
+        Returns:
+            Путь к увеличенному изображению или None в случае ошибки
+        """
+        try:
+            self.logger.info(f"📈 Начинаю апскейл изображения: {os.path.basename(image_path)}")
+            
+            # Путь к модели RealESRGAN
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(base_dir, "stable_diff", "RealESRGAN_x4.pth")
+            
+            if not os.path.exists(model_path):
+                self.logger.info(f"ℹ️ Модель RealESRGAN не найдена: {model_path}")
+                self.logger.info("💡 Поместите файл RealESRGAN_x4.pth в папку stable_diff для включения апскейла")
+                return None
+            
+            # Проверяем исходное изображение
+            if not os.path.exists(image_path):
+                self.logger.error(f"❌ Исходное изображение не найдено: {image_path}")
+                return None
+            
+            # Определяем выходной путь
+            if output_path is None:
+                base_name = os.path.splitext(os.path.basename(image_path))[0]
+                output_dir = os.path.dirname(image_path)
+                output_path = os.path.join(output_dir, f"{base_name}_upscaled_4x.png")
+            
+            # Устанавливаем Real-ESRGAN если нужно
+            self._install_realesrgan_dependencies()
+            
+            # Импортируем библиотеки
+            try:
+                import cv2
+                import torch
+                import numpy as np
+                from PIL import Image
+                
+                # Пытаемся импортировать RealESRGAN
+                try:
+                    from realesrgan import RealESRGANer
+                    from basicsr.archs.rrdbnet_arch import RRDBNet
+                except ImportError:
+                    # Если realesrgan не установлен, пытаемся использовать базовую реализацию
+                    self.logger.warning("⚠️ realesrgan пакет не найден, использую альтернативный метод")
+                    return self._upscale_image_alternative(image_path, output_path)
+                
+                # Настраиваем модель
+                model = RRDBNet(
+                    num_in_ch=3, 
+                    num_out_ch=3, 
+                    num_feat=64, 
+                    num_block=23, 
+                    num_grow_ch=32, 
+                    scale=4
+                )
+                
+                # Создаем upsampler
+                upsampler = RealESRGANer(
+                    scale=4,
+                    model_path=model_path,
+                    model=model,
+                    tile=0,
+                    tile_pad=10,
+                    pre_pad=0,
+                    half=torch.cuda.is_available()
+                )
+                
+                # Загружаем изображение
+                img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise ValueError(f"Не удалось загрузить изображение: {image_path}")
+                
+                self.logger.info(f"📐 Исходный размер: {img.shape[1]}x{img.shape[0]}")
+                
+                # Выполняем апскейл
+                self.logger.info("🚀 Выполняю апскейл...")
+                output, _ = upsampler.enhance(img, outscale=4)
+                
+                # Сохраняем результат
+                cv2.imwrite(output_path, output)
+                
+                self.logger.info(f"📐 Результирующий размер: {output.shape[1]}x{output.shape[0]}")
+                self.logger.info(f"💾 Апскейл сохранен: {output_path}")
+                
+                return output_path
+                
+            except Exception as e:
+                self.logger.error(f"❌ Ошибка в процессе апскейла: {e}")
+                return self._upscale_image_alternative(image_path, output_path)
+                
+        except Exception as e:
+            self.logger.error(f"❌ Общая ошибка апскейла: {e}")
+            return None
+    
+    def _upscale_image_alternative(self, image_path: str, output_path: str) -> Optional[str]:
+        """
+        Альтернативный метод апскейла с помощью простого бикубического интерполирования
+        """
+        try:
+            self.logger.info("🔄 Использую альтернативный метод апскейла...")
+            
+            from PIL import Image
+            
+            # Загружаем изображение
+            with Image.open(image_path) as img:
+                original_size = img.size
+                new_size = (original_size[0] * 4, original_size[1] * 4)
+                
+                # Увеличиваем с помощью бикубической интерполяции
+                upscaled = img.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # Сохраняем результат
+                upscaled.save(output_path, "PNG")
+                
+                self.logger.info(f"📐 Увеличено с {original_size} до {new_size}")
+                self.logger.info(f"💾 Альтернативный апскейл сохранен: {output_path}")
+                
+                return output_path
+                
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка альтернативного апскейла: {e}")
+            return None
+    
+    def _install_realesrgan_dependencies(self):
+        """Устанавливает зависимости для RealESRGAN"""
+        try:
+            # Проверяем установлен ли basicsr
+            try:
+                import basicsr
+                self.logger.debug("✅ basicsr уже установлен")
+            except ImportError:
+                self.logger.info("📦 Устанавливаю basicsr...")
+                subprocess.run([_sys.executable, '-m', 'pip', 'install', 'basicsr'], 
+                             check=True, capture_output=True)
+            
+            # Проверяем установлен ли realesrgan
+            try:
+                import realesrgan
+                self.logger.debug("✅ realesrgan уже установлен")
+            except ImportError:
+                self.logger.info("📦 Устанавливаю realesrgan...")
+                subprocess.run([_sys.executable, '-m', 'pip', 'install', 'realesrgan'], 
+                             check=True, capture_output=True)
+                             
+        except Exception as e:
+            self.logger.warning(f"⚠️ Не удалось установить зависимости RealESRGAN: {e}")
 
     def generate_video_stable_diffusion(self, prompt: str, negative_prompt: str, params: dict) -> Optional[str]:
         """Генерация видео через прямую интеграцию со Stable Diffusion"""
@@ -3625,15 +3948,21 @@ class AIOrchestrator:
         try:
             import diffusers
             import torch
-            self.logger.info("✅ diffusers и torch уже установлены")
+            import peft  # Проверяем PEFT также
+            self.logger.info("✅ diffusers, torch и PEFT уже установлены")
+            
+            # Убеждаемся что PEFT backend включен для diffusers
+            os.environ["USE_PEFT_BACKEND"] = "1"
             return
         except ImportError:
             self.logger.info("📦 Устанавливаю зависимости для diffusers...")
             
             try:
-                subprocess.run([_sys.executable, "-m", "pip", "install", "diffusers", "transformers", "torch", "torchvision", "accelerate", "safetensors"], 
+                subprocess.run([_sys.executable, "-m", "pip", "install", "diffusers", "transformers", "torch", "torchvision", "accelerate", "safetensors", "peft"], 
                              check=True, capture_output=True)
                 self.logger.info("✅ Зависимости установлены успешно")
+                # Устанавливаем переменную окружения для PEFT
+                os.environ["USE_PEFT_BACKEND"] = "1"
             except subprocess.CalledProcessError as e:
                 self.logger.error(f"❌ Ошибка установки зависимостей: {e}")
                 raise
@@ -3661,6 +3990,7 @@ class AIOrchestrator:
                 
         except Exception as e:
             self.logger.error(f"Ошибка показа изображения: {e}")
+
     def find_new_audio(self) -> Optional[str]:
         """Находит новый аудиофайл для обработки"""
         audio_extensions = ['.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac']
@@ -4962,6 +5292,152 @@ class AIOrchestrator:
         except Exception as e:
             return f"Ошибка при создании PDF файла: {str(e)}"
 
+    def generate_txt_file(self, content: str, filename: str) -> str:
+        """
+        Генерация простого текстового файла
+        
+        Args:
+            content: Содержимое файла
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            # Убираем расширение если есть и добавляем .txt
+            base_name = filename.replace('.txt', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.txt")
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            return f"Текстовый файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании текстового файла: {str(e)}"
+
+    def generate_json_file(self, content: str, filename: str) -> str:
+        """
+        Генерация JSON файла
+        
+        Args:
+            content: Содержимое файла в формате JSON (строка)
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            # Убираем расширение если есть и добавляем .json
+            base_name = filename.replace('.json', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.json")
+            
+            # Проверяем валидность JSON
+            import json
+            try:
+                json.loads(content)  # Проверяем что content - валидный JSON
+            except json.JSONDecodeError:
+                # Если не JSON, оборачиваем в кавычки как строку
+                content = json.dumps(content, ensure_ascii=False, indent=2)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            return f"JSON файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании JSON файла: {str(e)}"
+
+    def generate_csv_file(self, content: str, filename: str) -> str:
+        """
+        Генерация CSV файла
+        
+        Args:
+            content: Содержимое файла в формате CSV (строка с разделителями)
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            # Убираем расширение если есть и добавляем .csv
+            base_name = filename.replace('.csv', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.csv")
+            
+            with open(output_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(content)
+            
+            return f"CSV файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании CSV файла: {str(e)}"
+
+    def generate_html_file(self, content: str, filename: str) -> str:
+        """
+        Генерация HTML файла
+        
+        Args:
+            content: Содержимое файла в формате HTML
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            # Убираем расширение если есть и добавляем .html
+            base_name = filename.replace('.html', '').replace('.htm', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.html")
+            
+            # Если контент не содержит HTML структуру, добавляем базовую
+            if not content.strip().lower().startswith('<!doctype') and not content.strip().lower().startswith('<html'):
+                content = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{base_name}</title>
+</head>
+<body>
+{content}
+</body>
+</html>"""
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            return f"HTML файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании HTML файла: {str(e)}"
+
+    def generate_xml_file(self, content: str, filename: str) -> str:
+        """
+        Генерация XML файла
+        
+        Args:
+            content: Содержимое файла в формате XML
+            filename: Полное имя файла (с расширением или без)
+        
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            # Убираем расширение если есть и добавляем .xml
+            base_name = filename.replace('.xml', '')
+            output_path = os.path.join(self.base_dir, "output", f"{base_name}.xml")
+            
+            # Если контент не содержит XML декларацию, добавляем
+            if not content.strip().startswith('<?xml'):
+                content = f'<?xml version="1.0" encoding="UTF-8"?>\n{content}'
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            return f"XML файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании XML файла: {str(e)}"
+
     def generate_file(self, content: str, filename: str, file_format: str) -> bool:
         """
         Универсальный метод генерации файлов
@@ -4969,7 +5445,7 @@ class AIOrchestrator:
         Args:
             content: Содержимое файла
             filename: Полное имя файла с расширением
-            file_format: Формат файла (docx, excel, md, pdf)
+            file_format: Формат файла (docx, excel, md, pdf, txt, json, csv, html, xml)
         
         Returns:
             True если файл создан успешно, False иначе
@@ -4992,6 +5468,21 @@ class AIOrchestrator:
                 return "успешно создан" in result.lower()
             elif format_lower in ['pdf']:
                 result = self.generate_pdf_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['txt', 'text']:
+                result = self.generate_txt_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['json']:
+                result = self.generate_json_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['csv']:
+                result = self.generate_csv_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['html', 'htm']:
+                result = self.generate_html_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['xml']:
+                result = self.generate_xml_file(content, filename)
                 return "успешно создан" in result.lower()
             else:
                 logger.error(f"Неподдерживаемый формат файла: {file_format}")
@@ -7548,9 +8039,7 @@ class AIOrchestrator:
         if update is None or update.message is None or update.effective_user is None:
             return
         user_id = str(update.effective_user.id)
-        if user_id != self.telegram_allowed_user_id:
-            await self._safe_reply(update, "❌ У вас нет доступа к этому боту.")
-            return
+        # Разрешаем доступ всем пользователям
         
         await self._safe_reply(update,
             "🤖 Привет! Я Нейро - AI оркестратор.\n"
@@ -7569,9 +8058,7 @@ class AIOrchestrator:
         if update is None or update.message is None or update.effective_user is None or update.effective_chat is None:
             return
         user_id = str(update.effective_user.id)
-        if user_id != self.telegram_allowed_user_id:
-            await self._safe_reply(update, "❌ У вас нет доступа к этому боту.")
-            return
+        # Разрешаем доступ всем пользователям
         
         text = update.message.text if update.message and update.message.text else ""
         
@@ -7692,9 +8179,7 @@ class AIOrchestrator:
         if update is None or update.message is None or update.effective_user is None or update.effective_chat is None:
             return
         user_id = str(update.effective_user.id)
-        if user_id != self.telegram_allowed_user_id:
-            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
-            return
+        # Разрешаем доступ всем пользователям
         
         await update.message.reply_text("🖼️ Обрабатываю изображение...")
         
@@ -7758,9 +8243,7 @@ class AIOrchestrator:
         if update is None or update.message is None or update.effective_user is None or update.effective_chat is None:
             return
         user_id = str(update.effective_user.id)
-        if user_id != self.telegram_allowed_user_id:
-            await update.message.reply_text("❌ У вас нет доступа к этому бота.")
-            return
+        # Разрешаем доступ всем пользователям
         
         await update.message.reply_text("🎵 Обрабатываю аудио...")
         
@@ -7818,9 +8301,7 @@ class AIOrchestrator:
         if update is None or update.message is None or update.effective_user is None or update.effective_chat is None:
             return
         user_id = str(update.effective_user.id)
-        if user_id != self.telegram_allowed_user_id:
-            await update.message.reply_text("❌ У вас нет доступа к этому боту.")
-            return
+        # Разрешаем доступ всем пользователям
         
         await update.message.reply_text("📄 Обрабатываю документ...")
         
