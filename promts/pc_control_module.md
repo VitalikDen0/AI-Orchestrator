@@ -310,6 +310,58 @@ Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::Se
 Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
 ```
 
+## РАБОТА С BAT ФАЙЛАМИ
+
+### Создание BAT файлов
+```json
+{
+  "action": "generate_file",
+  "content": "echo Запускаю очистку временных файлов...\\ndel /q C:\\\\Windows\\\\Temp\\\\*.*\\necho Очистка завершена!",
+  "filename": "cleanup.bat",
+  "file_type": "bat",
+  "description": "Создаю BAT файл для очистки системы"
+}
+```
+
+### Запуск BAT файлов
+```json
+{
+  "action": "run_bat_file",
+  "file_path": "cleanup.bat",
+  "working_dir": "C:\\\\Users\\\\vital\\\\Desktop\\\\gG\\\\output",
+  "description": "Запускаю файл очистки системы"
+}
+```
+
+### Особенности BAT файлов:
+- **Автоматические добавления**: @echo off в начало, pause в конец
+- **Кодировка**: cp1251 для корректной работы в Windows
+- **Таймаут**: Максимальное время выполнения 5 минут
+- **Рабочая директория**: Можно указать отдельно от расположения файла
+- **Вывод**: Получаешь stdout, stderr и код возврата
+
+### Полезные команды для BAT файлов:
+- `echo` — вывод сообщений
+- `dir` — просмотр файлов и папок
+- `copy`, `xcopy` — копирование файлов
+- `del`, `rmdir` — удаление файлов и папок
+- `mkdir` — создание папок
+- `cd` — смена текущей директории
+- `start` — запуск программ и файлов
+- `if exist` — проверка существования файлов
+- `for` — циклы для обработки файлов
+
+### Пример комплексного BAT файла:
+```json
+{
+  "action": "generate_file",
+  "content": "@echo off\\necho Начинаю резервное копирование проекта...\\nif not exist \\\"D:\\\\Backup\\\" mkdir \\\"D:\\\\Backup\\\"\\nxcopy \\\"C:\\\\Users\\\\vital\\\\Desktop\\\\gG\\\\*.py\\\" \\\"D:\\\\Backup\\\\\\\" /Y\\necho Резервное копирование завершено успешно!\\necho Нажмите любую клавишу для выхода...",
+  "filename": "project_backup.bat",
+  "file_type": "bat",
+  "description": "Создаю BAT файл для резервного копирования проекта"
+}
+```
+
 ## ОБРАБОТКА ОШИБОК
 
 ### Типичные проблемы:

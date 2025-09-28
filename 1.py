@@ -5438,6 +5438,116 @@ class AIOrchestrator:
         except Exception as e:
             return f"Ошибка при создании XML файла: {str(e)}"
 
+    def generate_bat_file(self, content: str, filename: str) -> str:
+        """
+        Создает .bat файл с командами для Windows
+        
+        Args:
+            content: Содержимое bat файла (команды)
+            filename: Имя файла (с расширением .bat или без)
+            
+        Returns:
+            Сообщение о результате создания файла
+        """
+        try:
+            # Обеспечиваем правильное расширение
+            if not filename.lower().endswith('.bat'):
+                filename += '.bat'
+            
+            # Путь для сохранения в папку output
+            output_path = os.path.join(self.base_path, "output", filename)
+            
+            # Убеждаемся что папка output существует
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Добавляем @echo off в начало, если его нет
+            if not content.strip().startswith('@echo off'):
+                content = '@echo off\n' + content.strip()
+            
+            # Добавляем pause в конец, если его нет
+            if not content.strip().endswith('pause'):
+                content = content.strip() + '\npause'
+            
+            with open(output_path, 'w', encoding='cp1251') as f:  # cp1251 для Windows bat файлов
+                f.write(content)
+            
+            self.logger.info(f"📄 BAT файл создан: {filename}")
+            return f"BAT файл успешно создан: {output_path}"
+            
+        except Exception as e:
+            return f"Ошибка при создании BAT файла: {str(e)}"
+
+    def run_bat_file(self, file_path: str, working_dir: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Запускает .bat файл
+        
+        Args:
+            file_path: Путь к .bat файлу
+            working_dir: Рабочая директория для выполнения (опционально)
+            
+        Returns:
+            Результат выполнения с выводом и кодом возврата
+        """
+        try:
+            # Разрешаем путь к файлу
+            resolved_path = self.resolve_path(file_path)
+            
+            if not os.path.exists(resolved_path):
+                return {
+                    "success": False,
+                    "error": f"BAT файл не найден: {resolved_path}",
+                    "output": "",
+                    "return_code": -1
+                }
+            
+            # Определяем рабочую директорию
+            if working_dir is None:
+                working_dir = os.path.dirname(resolved_path)
+            else:
+                working_dir = self.resolve_path(working_dir)
+            
+            self.logger.info(f"🚀 Запускаю BAT файл: {os.path.basename(resolved_path)}")
+            
+            # Запускаем bat файл
+            result = subprocess.run(
+                [resolved_path],
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                encoding='cp1251',  # Кодировка для Windows
+                timeout=300  # Таймаут 5 минут
+            )
+            
+            success = result.returncode == 0
+            
+            if success:
+                self.logger.info(f"✅ BAT файл выполнен успешно")
+            else:
+                self.logger.warning(f"⚠️ BAT файл завершился с кодом: {result.returncode}")
+            
+            return {
+                "success": success,
+                "output": result.stdout,
+                "error": result.stderr,
+                "return_code": result.returncode,
+                "working_dir": working_dir
+            }
+            
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "error": "Превышено время ожидания выполнения BAT файла (5 минут)",
+                "output": "",
+                "return_code": -1
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Ошибка при выполнении BAT файла: {str(e)}",
+                "output": "",
+                "return_code": -1
+            }
+
     def generate_file(self, content: str, filename: str, file_format: str) -> bool:
         """
         Универсальный метод генерации файлов
@@ -5445,7 +5555,7 @@ class AIOrchestrator:
         Args:
             content: Содержимое файла
             filename: Полное имя файла с расширением
-            file_format: Формат файла (docx, excel, md, pdf, txt, json, csv, html, xml)
+            file_format: Формат файла (docx, excel, md, pdf, txt, json, csv, html, xml, bat)
         
         Returns:
             True если файл создан успешно, False иначе
@@ -5483,6 +5593,9 @@ class AIOrchestrator:
                 return "успешно создан" in result.lower()
             elif format_lower in ['xml']:
                 result = self.generate_xml_file(content, filename)
+                return "успешно создан" in result.lower()
+            elif format_lower in ['bat', 'batch']:
+                result = self.generate_bat_file(content, filename)
                 return "успешно создан" in result.lower()
             else:
                 logger.error(f"Неподдерживаемый формат файла: {file_format}")
@@ -7200,6 +7313,60 @@ class AIOrchestrator:
         
         return follow_up
 
+    def _handle_run_bat_file(self, action_data: Dict[str, Any]) -> Union[bool, str]:
+        """
+        Обработчик для запуска BAT файлов
+        """
+        file_path = action_data.get("file_path", "")
+        working_dir = action_data.get("working_dir", None)
+        description = action_data.get("description", f"Запуск BAT файла: {file_path}")
+        
+        logger.info(f"\n🚀 ЗАПУСК BAT ФАЙЛА: {description}")
+        logger.info(f"📄 Файл: {file_path}")
+        if working_dir:
+            logger.info(f"📁 Рабочая директория: {working_dir}")
+        
+        if not file_path:
+            error_msg = "❌ Не указан путь к BAT файлу"
+            logger.error(error_msg)
+            follow_up = self.call_brain_model(f"Ошибка: {error_msg}")
+            return follow_up
+        
+        try:
+            result = self.run_bat_file(file_path, working_dir)
+            
+            if result["success"]:
+                # Успешное выполнение
+                output_info = f"✅ BAT файл выполнен успешно!\n"
+                output_info += f"📄 Файл: {os.path.basename(file_path)}\n"
+                output_info += f"📁 Рабочая директория: {result.get('working_dir', 'не указана')}\n"
+                output_info += f"🔢 Код возврата: {result.get('return_code', 0)}\n"
+                
+                if result.get("output"):
+                    output_info += f"\n📝 Вывод:\n{result['output']}"
+                
+                logger.info("✅ BAT файл выполнен успешно")
+                follow_up = self.call_brain_model(output_info)
+            else:
+                # Ошибка выполнения
+                error_info = f"❌ Ошибка выполнения BAT файла!\n"
+                error_info += f"📄 Файл: {os.path.basename(file_path)}\n"
+                error_info += f"🔢 Код возврата: {result.get('return_code', -1)}\n"
+                error_info += f"❌ Ошибка: {result.get('error', 'Неизвестная ошибка')}\n"
+                
+                if result.get("output"):
+                    error_info += f"\n📝 Вывод:\n{result['output']}"
+                
+                logger.error(f"❌ Ошибка выполнения BAT файла: {result.get('error')}")
+                follow_up = self.call_brain_model(error_info)
+                
+        except Exception as e:
+            error_msg = f"❌ Исключение при запуске BAT файла: {str(e)}"
+            logger.error(error_msg)
+            follow_up = self.call_brain_model(f"Ошибка: {error_msg}")
+        
+        return follow_up
+
     def _get_plugin_info_for_prompt(self) -> str:
         """
         Формирует информацию о доступных плагинах для добавления в системный промпт.
@@ -7432,6 +7599,8 @@ class AIOrchestrator:
                     handler_result = self._handle_reply_email(action_data)
                 elif action == "search_emails":
                     handler_result = self._handle_search_emails(action_data)
+                elif action == "run_bat_file":
+                    handler_result = self._handle_run_bat_file(action_data)
                 elif action.startswith("plugin:"):
                     handler_result = self._handle_plugin_action(action, action_data)
                 elif action.startswith("get_") and action.endswith("_help"):
