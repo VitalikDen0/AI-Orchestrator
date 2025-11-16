@@ -80,6 +80,25 @@ LLAMA_CPP_GENERATION_PARAMS = {
 }
 # ============================================================================
 
+# Конфигурация vision-модели (Moondream2)
+VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "moondream2-llamafile")
+VISION_MODEL_LOAD_ARGS = {
+    "n_ctx": 2048,
+    "n_gpu_layers": 24,
+    "n_threads": 8,
+    "n_batch": 512,
+    "offload_kqv": True,
+    "flash_attn": True,
+    "type_k": "q8_0",
+    "type_v": "q8_0",
+}
+VISION_GENERATION_PARAMS = {
+    "temperature": 0.3,
+    "max_tokens": 2048,
+    "stream": False,
+}
+# ============================================================================
+
 # Подавляем предупреждения PyTorch для чистого запуска
 import warnings
 warnings.filterwarnings("ignore", message="expandable_segments not supported on this platform")
@@ -2798,6 +2817,66 @@ class AIOrchestrator:
         except Exception as e:
             self.logger.error(f"❌ Ошибка автозагрузки модели мозга: {e}")
     
+    def _ensure_vision_model_loaded(self):
+        """Гарантирует, что vision-модель в LM Studio загружена перед вызовом."""
+        if self.use_llama_cpp:
+            # Для режима llama.cpp потребуется отдельный путь загрузки vision моделей
+            return
+
+        if self._vision_model_ready or not self.vision_model_id:
+            return
+
+        try:
+            resp = requests.get(f"{self.lm_studio_url}/v1/models", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for model in data.get("data", []):
+                    if self.vision_model_id in model.get("id", "") and model.get("isLoaded", False):
+                        self._vision_model_ready = True
+                        self.logger.info(f"👁️ Vision модель уже загружена: {self.vision_model_id}")
+                        return
+        except Exception as exc:
+            self.logger.debug(f"⚠️ Не удалось проверить статус vision модели: {exc}")
+
+        payload: Dict[str, Any] = {"model": self.vision_model_id, "load": True}
+        if self.vision_model_load_args:
+            payload["args"] = self.vision_model_load_args
+
+        try:
+            self.logger.info(f"👁️ Загружаю vision модель: {self.vision_model_id}")
+            resp = requests.post(
+                f"{self.lm_studio_url}/v1/models/load",
+                json=payload,
+                timeout=60
+            )
+            if resp.status_code == 200:
+                self._vision_model_ready = True
+                self.logger.info("✅ Vision модель загружена")
+            else:
+                self.logger.warning(f"⚠️ Не удалось загрузить vision модель ({resp.status_code}): {resp.text}")
+        except Exception as exc:
+            self.logger.warning(f"⚠️ Ошибка загрузки vision модели: {exc}")
+
+    def _unload_vision_model(self):
+        """Выгружает vision-модель из LM Studio при простое."""
+        if self.use_llama_cpp or not self._vision_model_ready or not self.vision_model_id:
+            return
+
+        try:
+            resp = requests.post(
+                f"{self.lm_studio_url}/v1/models/unload",
+                json={"model": self.vision_model_id},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                self.logger.info("👁️ Vision модель выгружена")
+            else:
+                self.logger.debug(f"⚠️ Не удалось выгрузить vision модель ({resp.status_code}): {resp.text}")
+        except Exception as exc:
+            self.logger.debug(f"⚠️ Ошибка выгрузки vision модели: {exc}")
+        finally:
+            self._vision_model_ready = False
+
     def _update_brain_model_id(self):
         """Обновляет короткий ID модели мозга из API"""
         try:
@@ -5062,6 +5141,11 @@ class AIOrchestrator:
         self.use_ocr = False  # По умолчанию отключен OCR
         # Управление локальным показом изображений (для веб-режима можно отключить)
         self.show_images_locally = True
+    # Конфигурация vision-модели (Moondream2)
+        self.vision_model_id = VISION_MODEL_ID
+        self.vision_model_load_args = dict(VISION_MODEL_LOAD_ARGS)
+        self.vision_generation_params = dict(VISION_GENERATION_PARAMS)
+        self._vision_model_ready = False
         # Хранилище последнего сгенерированного изображения (base64) и ответа
         self.last_generated_image_b64 = None
         self.last_final_response = ""
@@ -6213,6 +6297,7 @@ class AIOrchestrator:
                     
                     gc.collect()
                     self.logger.info(f"🔧 Автоматически выключил {tool_name} и освободил память")
+                    self._unload_vision_model()
                     
             elif tool_name == 'audio':
                 if hasattr(self, 'use_audio') and self.use_audio:
@@ -6574,17 +6659,19 @@ class AIOrchestrator:
             self.auto_disable_tools("vision")
         
         try:
-            payload = {
-                "model": "moondream2-llamafile",
+            self._ensure_vision_model_loaded()
+
+            payload: Dict[str, Any] = {
+                "model": self.vision_model_id or "moondream2-llamafile",
                 "messages": [
                     {"role": "user", "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
                     ]}
                 ],
-                "temperature": 0.0,
-                "max_tokens": 2048,
-                "stream": False
             }
+            for key, value in self.vision_generation_params.items():
+                if value is not None:
+                    payload[key] = value
             logger.info("Отправляю изображение в vision-модель (глаза)")
             response = requests.post(
                 f"{self.lm_studio_url}/v1/chat/completions",
