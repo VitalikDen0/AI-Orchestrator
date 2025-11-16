@@ -2,9 +2,83 @@
 # -*- coding: utf-8 -*-
 """
 AI PowerShell Orchestrator with Google Search Integration
-Интегрирует LM Studio, PowerShell команды и поиск Google
+Интегрирует LM Studio/llama.cpp, PowerShell команды и поиск Google
 
 """
+
+# ============================================================================
+# КОНФИГУРАЦИЯ GPU - ВАЖНО! Выполняется ДО импорта библиотек
+# ============================================================================
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Используем ТОЛЬКО RTX 5060 Ti (device 0)
+print(f"🎮 CUDA устройство: {os.environ.get('CUDA_VISIBLE_DEVICES', 'auto')}")
+print(f"🚀 Форсируем использование GPU: RTX 5060 Ti (compute capability 12.0)")
+# Уменьшаем подробный вывод llama.cpp
+os.environ.setdefault('LLAMA_LOG_LEVEL', '40')  # 40 = ERROR
+# ============================================================================
+
+# ============================================================================
+# ПЕРЕКЛЮЧАТЕЛЬ БЭКЕНДА: LM Studio или llama.cpp
+# ============================================================================
+# True = использовать llama-cpp-python (прямое управление моделью)
+# False = использовать LM Studio (HTTP API сервер)
+USE_LLAMA_CPP = True  # llama-cpp-python установлен и CUDA работает!
+
+# Путь к модели для llama.cpp (используется только если USE_LLAMA_CPP = True)
+LLAMA_CPP_MODEL_PATH = "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
+
+# Значение по умолчанию для типа квантизации KV-кэша (обновим после импорта llama_cpp)
+LLAMA_KV_Q8 = 8
+
+# Параметры llama.cpp
+LLAMA_CPP_PARAMS = {
+    # Основные параметры модели
+    "n_ctx": 32768,                 # Контекст 32K (оптимально для 4B + GPU память)
+    "n_gpu_layers": -1,             # -1 = ВСЕ слои на GPU (максимум производительности!)
+    "n_threads": 4,                 # Минимум CPU потоков (GPU делает всё)
+    "n_batch": 2048,                # Большой батч для GPU (быстрая обработка)
+    
+    # Параметры памяти и производительности - МАКСИМУМ GPU
+    "use_mlock": False,             # НЕ блокировать в RAM - экономия памяти
+    "use_mmap": True,               # Memory mapping (ОБЯЗАТЕЛЬНО для GPU offload!)
+    "offload_kqv": True,            # Offload KV Cache на GPU (критично!)
+    
+    # Экспериментальные функции - ВСЁ НА GPU
+    "flash_attn": True,             # Flash Attention (ускорение на GPU)
+    
+    # Квантизация KV-кэша (экономия VRAM)
+    "type_k": LLAMA_KV_Q8,          # Q8 квантизация K-кэша (официальная константа)
+    "type_v": LLAMA_KV_Q8,          # Q8 квантизация V-кэша
+    
+    # Отладка
+    "verbose": False,               # Подробный вывод отключен для аккуратных логов
+    
+    # Дополнительные параметры
+    "seed": -1,                     # Seed для генерации (-1 = случайный)
+    
+    # Mul Mat Q - оптимизация матричных операций
+    "mul_mat_q": True,              # Оптимизированные CUDA ядра (быстрее!)
+    
+    # Logits All - экономия памяти
+    "logits_all": False,            # Только последний токен (экономия VRAM)
+    
+    # Embedding - режим работы
+    "embedding": False,             # Генерация текста (не эмбеддинги)
+    
+    # Last N Tokens Size
+    "last_n_tokens_size": 64,       # Буфер для repeat penalty
+}
+
+# Параметры генерации текста для llama.cpp
+LLAMA_CPP_GENERATION_PARAMS = {
+    "temperature": 0.7,             # Температура генерации (0.0-2.0, выше = креативнее)
+    "max_tokens": None,             # Без жёсткого лимита, модель сама завершает ответ
+    "top_p": 0.9,                   # Nucleus sampling (0.0-1.0)
+    "top_k": 40,                    # Top-K sampling (количество вариантов)
+    "repeat_penalty": 1.1,          # Наказание за повторения (1.0 = нет наказания)
+    "stream": False,                # Потоковая генерация (пока False)
+}
+# ============================================================================
 
 # Подавляем предупреждения PyTorch для чистого запуска
 import warnings
@@ -17,6 +91,17 @@ import json
 import time
 import sys as _sys
 import os
+
+# Фикс кодировки для Windows терминала (поддержка UTF-8 и эмодзи)
+if _sys.platform == 'win32':
+    try:
+        import codecs
+        _sys.stdout = codecs.getwriter('utf-8')(_sys.stdout.buffer, 'strict')
+        _sys.stderr = codecs.getwriter('utf-8')(_sys.stderr.buffer, 'strict')
+        _sys.stdin = codecs.getreader('utf-8')(_sys.stdin.buffer, 'strict')
+    except:
+        pass
+
 import base64
 import io
 import re
@@ -44,6 +129,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from dotenv import load_dotenv
 import concurrent.futures
 
+# На Windows принудительно используем SelectorEventLoopPolicy, чтобы не ломался stdin
+if _sys.platform == 'win32':
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
+    except Exception as _policy_err:
+        print(f"⚠️ Не удалось установить WindowsSelectorEventLoopPolicy: {_policy_err}")
+
 # Импорты для работы с электронной почтой
 import imaplib
 import smtplib
@@ -57,6 +149,24 @@ from email.header import decode_header
 from email.utils import parseaddr, formataddr
 import email.utils
 import mimetypes
+
+# Импорт llama-cpp-python (опционально)
+try:
+    from llama_cpp import Llama
+    import llama_cpp as llama_cpp_lib  # type: ignore
+    LLAMA_CPP_AVAILABLE = True
+except ImportError:
+    LLAMA_CPP_AVAILABLE = False
+    Llama = None
+    llama_cpp_lib = None
+    print("⚠️ llama-cpp-python не установлен. Используйте только LM Studio режим или установите: pip install llama-cpp-python")
+
+# Константа для квантизации KV-кэша в Q8 (используем официальное значение, если доступно)
+LLAMA_KV_Q8 = getattr(llama_cpp_lib, "GGML_TYPE_Q8_0", LLAMA_KV_Q8) if llama_cpp_lib else LLAMA_KV_Q8
+if 'type_k' in LLAMA_CPP_PARAMS:
+    LLAMA_CPP_PARAMS['type_k'] = LLAMA_KV_Q8
+if 'type_v' in LLAMA_CPP_PARAMS:
+    LLAMA_CPP_PARAMS['type_v'] = LLAMA_KV_Q8
 
 # Глобальные переменные для фоновой загрузки
 _background_loader = None
@@ -284,7 +394,7 @@ log_file = "ai_orchestrator.log"
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 
-# File handler: keep full INFO logs for later inspection
+# File handler: keep INFO logs for later inspection
 file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
 file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -410,6 +520,7 @@ class ChromaDBManager:
         self.collection = None
         self.embedding_model_obj = None
         self.initialized = False
+        self._sync_attempted = False
         
         # Создаем папку для базы данных если её нет
         os.makedirs(db_path, exist_ok=True)
@@ -428,17 +539,41 @@ class ChromaDBManager:
             return True
             
         loader = get_background_loader()
-        chromadb_data = loader.get_component('chromadb', timeout=timeout)
-        
-        if chromadb_data:
-            self.client = chromadb_data['client']
-            self.collection = chromadb_data['collection']
-            self.embedding_model_obj = chromadb_data['model']
-            self.initialized = True
-            return True
-        else:
-            # Fallback к синхронной инициализации
+        future = loader.loading_tasks.get('chromadb') if hasattr(loader, 'loading_tasks') else None
+
+        # Если фоновая загрузка уже завершилась – используем результат
+        if future and future.done():
+            try:
+                chromadb_data = future.result()
+            except Exception as exc:
+                logger.error(f"❌ Фоновая инициализация ChromaDB завершилась с ошибкой: {exc}")
+                if not self._sync_attempted:
+                    self._sync_attempted = True
+                    return self._initialize_chromadb_sync()
+                return False
+
+            if chromadb_data:
+                self.client = chromadb_data['client']
+                self.collection = chromadb_data['collection']
+                self.embedding_model_obj = chromadb_data['model']
+                self.initialized = True
+                return True
+            # Фоновая загрузка завершилась без результата – пробуем один раз синхронно
+            if not self._sync_attempted:
+                self._sync_attempted = True
+                return self._initialize_chromadb_sync()
+            return False
+
+        # Фоновая загрузка ещё идёт – не блокируем основной поток
+        if future and not future.done():
+            logger.info("⌛ ChromaDB ещё инициализируется в фоне, пропускаю использование памяти")
+            return False
+
+        # Если по какой-то причине фон не запускался – пробуем один раз синхронную инициализацию
+        if not self._sync_attempted:
+            self._sync_attempted = True
             return self._initialize_chromadb_sync()
+        return False
     
     def _initialize_chromadb_sync(self):
         """Синхронная инициализация ChromaDB как fallback"""
@@ -1974,6 +2109,210 @@ class PromptLoader:
         """
         return list(self.module_commands.keys())
 
+class LlamaCppWrapper:
+    """
+    Обертка для llama-cpp-python, имитирующая API LM Studio
+    Позволяет использовать llama.cpp вместо LM Studio без изменения остального кода
+    """
+    
+    def __init__(self, model_path: str, params: Dict[str, Any], logger: Optional[logging.Logger] = None):
+        """
+        Инициализация llama.cpp модели
+        
+        Args:
+            model_path: Путь к .gguf файлу модели
+            params: Параметры модели (n_ctx, n_gpu_layers и т.д.)
+            logger: Логгер для вывода информации
+        """
+        self.logger = logger or logging.getLogger(__name__)
+        self.model_path = model_path
+        self.params = params
+        self.llm: Any = None  # type: ignore
+        self.model_id: Optional[str] = None
+        self._is_loading = False
+        self._load_error: Optional[str] = None
+        
+    def load_model(self) -> bool:
+        """Загружает модель в память"""
+        if self._is_loading:
+            self.logger.warning("⚠️ Модель уже загружается...")
+            return False
+            
+        if self.llm is not None:
+            self.logger.info("✅ Модель уже загружена")
+            return True
+            
+        try:
+            self._is_loading = True
+            self._load_error = None
+            
+            if not LLAMA_CPP_AVAILABLE:
+                raise ImportError("llama-cpp-python не установлен")
+            
+            if not os.path.exists(self.model_path):
+                raise FileNotFoundError(f"Модель не найдена: {self.model_path}")
+            
+            self.logger.info(f"🧠 Загружаю модель через llama.cpp: {os.path.basename(self.model_path)}")
+            self.logger.info(f"📊 Параметры: n_ctx={self.params.get('n_ctx')}, "
+                           f"n_gpu_layers={self.params.get('n_gpu_layers')}")
+            
+            # Создаем экземпляр Llama с параметрами
+            if Llama is None:
+                raise ImportError("Llama класс недоступен")
+            
+            # Подготавливаем параметры для Llama строго из LLAMA_CPP_PARAMS
+            llama_params = dict(self.params)
+            llama_params['model_path'] = self.model_path
+            llama_params.setdefault('verbose', False)
+                
+            self.llm = Llama(**llama_params)  # type: ignore
+            
+            self.model_id = os.path.basename(self.model_path)
+            self.logger.info(f"✅ Модель успешно загружена: {self.model_id}")
+            
+            # Выводим информацию о контексте
+            context_size = self.llm.n_ctx()  # type: ignore
+            self.logger.info(f"📊 Размер контекста: {context_size} токенов")
+            
+            return True
+            
+        except Exception as e:
+            self._load_error = str(e)
+            self.logger.error(f"❌ Ошибка загрузки модели: {e}")
+            self.llm = None
+            return False
+        finally:
+            self._is_loading = False
+    
+    def unload_model(self):
+        """Выгружает модель из памяти"""
+        if self.llm is not None:
+            self.logger.info("🔄 Выгружаю модель из памяти...")
+            del self.llm
+            self.llm = None
+            self.model_id = None
+            
+            # Принудительная очистка GPU памяти если доступен torch
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    self.logger.info("🧹 GPU память очищена")
+            except:
+                pass
+    
+    def is_loaded(self) -> bool:
+        """Проверяет, загружена ли модель"""
+        return self.llm is not None
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """Возвращает информацию о модели (имитация /v1/models LM Studio)"""
+        if not self.is_loaded():
+            return {"data": []}
+        
+        return {
+            "data": [{
+                "id": self.model_id,
+                "object": "model",
+                "owned_by": "llama-cpp-python",
+                "permission": [],
+            }]
+        }
+    
+    def get_context_info(self) -> Dict[str, int]:
+        """Возвращает информацию о контексте модели"""
+        if not self.is_loaded():
+            return {"max_context": 0, "safe_context": 0}
+        
+        max_ctx = self.llm.n_ctx()  # type: ignore
+        return {
+            "max_context": max_ctx,
+            "safe_context": int(max_ctx * 0.8)  # 80% от максимума как безопасная зона
+        }
+    
+    def create_chat_completion(self, messages: List[Dict[str, str]], 
+                               temperature: float = 0.7,
+                               max_tokens: Optional[int] = -1,
+                               stream: bool = False,
+                               top_p: float = 0.95,
+                               top_k: int = 40,
+                               repeat_penalty: float = 1.1) -> Dict[str, Any]:
+        """
+        Создает chat completion (имитация /v1/chat/completions LM Studio)
+        
+        Args:
+            messages: Список сообщений в формате OpenAI
+            temperature: Температура генерации (0.0-2.0)
+            max_tokens: Максимальное количество токенов (None или -1 = без ограничений)
+            stream: Потоковая генерация (пока не поддерживается)
+            
+        Returns:
+            Ответ в формате OpenAI API
+        """
+        if not self.is_loaded():
+            raise RuntimeError("Модель не загружена. Вызовите load_model() сначала.")
+        
+        try:
+            start_method = time.time()
+            self.logger.info(f"💭 Начинаю генерацию (temp={temperature}, max_tokens={max_tokens})...")
+            self.logger.info(f"📊 Количество сообщений: {len(messages)}")
+            
+            # Логируем размер промпта
+            total_prompt_size = sum(len(str(m.get('content', ''))) for m in messages)
+            self.logger.info(f"📏 Общий размер промпта: {total_prompt_size} символов")
+            
+            # Вызываем llama.cpp для генерации
+            start_llm_call = time.time()
+            self.logger.info("⏳ НАЧАЛО llm.create_chat_completion()...")
+            
+            # llama.cpp ожидает None для отсутствия ограничения по токенам
+            max_tokens_arg = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else None
+
+            response = self.llm.create_chat_completion(  # type: ignore
+                messages=messages,  # type: ignore
+                temperature=temperature,
+                max_tokens=max_tokens_arg,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                stream=stream
+            )
+            
+            end_llm_call = time.time()
+            llm_duration = end_llm_call - start_llm_call
+            
+            # Получаем информацию о токенах для расчета скорости
+            usage = response.get('usage', {})  # type: ignore
+            completion_tokens = usage.get('completion_tokens', 0)
+            prompt_tokens = usage.get('prompt_tokens', 0)
+            
+            tokens_per_sec = completion_tokens / llm_duration if llm_duration > 0 else 0
+            
+            self.logger.info(f"⏱️ КОНЕЦ llm.create_chat_completion(): {llm_duration:.2f} секунд")
+            self.logger.info(f"📊 Токены: prompt={prompt_tokens}, completion={completion_tokens}")
+            self.logger.info(f"🚀 Скорость генерации: {tokens_per_sec:.1f} токенов/сек")
+            
+            total_duration = time.time() - start_method
+            self.logger.info(f"⏱️ Общее время метода: {total_duration:.2f} секунд")
+            
+            if tokens_per_sec < 50:
+                self.logger.warning(f"⚠️ НИЗКАЯ СКОРОСТЬ! Ожидалось >100 токенов/сек, получили {tokens_per_sec:.1f}")
+                self.logger.warning(f"⚠️ Возможно GPU не используется или большой промпт")
+            else:
+                self.logger.info(f"✅ Скорость нормальная - GPU работает!")
+            
+            return response  # type: ignore
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка генерации: {e}")
+            raise
+    
+    def reconnect(self) -> bool:
+        """Переподключается к модели (перезагрузка)"""
+        self.logger.info("🔄 Переподключение к модели...")
+        self.unload_model()
+        return self.load_model()
+
 class AIOrchestrator:
     def extract_video_frames(self, video_path: str, fps: int = 1) -> list:
         """
@@ -2380,6 +2719,34 @@ class AIOrchestrator:
     def _auto_load_brain_model(self):
         """Автоматически загружает модель мозга при инициализации"""
         try:
+            # Режим llama.cpp - прямая загрузка модели
+            if self.use_llama_cpp:
+                self.logger.info("🔧 Режим: llama-cpp-python (прямое управление)")
+                
+                if not LLAMA_CPP_AVAILABLE:
+                    self.logger.error("❌ llama-cpp-python не установлен!")
+                    self.logger.error("💡 Установите: pip install llama-cpp-python")
+                    self.logger.error("🔄 Или установите из wheel файла в корне проекта")
+                    return
+                
+                # Создаем обертку llama.cpp
+                self.llama_wrapper = LlamaCppWrapper(
+                    model_path=self.brain_model,
+                    params=LLAMA_CPP_PARAMS,
+                    logger=self.logger
+                )
+                
+                # Загружаем модель
+                if self.llama_wrapper.load_model():
+                    self.brain_model_id = self.llama_wrapper.model_id
+                    self.logger.info(f"✅ Модель загружена через llama.cpp: {self.brain_model_id}")
+                else:
+                    self.logger.error("❌ Не удалось загрузить модель через llama.cpp")
+                return
+            
+            # Режим LM Studio - подключение через HTTP API
+            self.logger.info("🔧 Режим: LM Studio (HTTP API)")
+            
             # Проверяем, запущена ли модель через прямой запрос к API
             try:
                 resp = requests.get(f"{self.lm_studio_url}/v1/models", timeout=10)
@@ -2494,6 +2861,13 @@ class AIOrchestrator:
         try:
             self.logger.info("🔄 Переподключение к модели мозга...")
             
+            # Режим llama.cpp
+            if self.use_llama_cpp:
+                if self.llama_wrapper:
+                    return self.llama_wrapper.reconnect()
+                return False
+            
+            # Режим LM Studio
             # Сначала пытаемся загрузить модель
             self._auto_load_brain_model()
             
@@ -2551,9 +2925,14 @@ class AIOrchestrator:
     
     def is_model_running(self, model_name: str) -> bool:
         """
-        Проверяет, запущена ли модель в LM Studio через /v1/models
+        Проверяет, запущена ли модель
         """
         try:
+            # Режим llama.cpp
+            if self.use_llama_cpp:
+                return self.llama_wrapper is not None and self.llama_wrapper.is_loaded()
+            
+            # Режим LM Studio
             resp = requests.get(f"{self.lm_studio_url}/v1/models")
             if resp.status_code == 200:
                 data = resp.json()
@@ -2567,10 +2946,22 @@ class AIOrchestrator:
 
     def get_model_context_info(self) -> Dict[str, int]:
         """
-        Получает информацию о максимальном контексте модели из LM Studio API
+        Получает информацию о максимальном контексте модели
         Возвращает словарь с max_context и safe_context
         """
         try:
+            # Режим llama.cpp
+            if self.use_llama_cpp:
+                if self.llama_wrapper and self.llama_wrapper.is_loaded():
+                    return self.llama_wrapper.get_context_info()
+                else:
+                    self.logger.warning("⚠️ Модель не загружена, используем значения по умолчанию")
+                    return {
+                        "max_context": LLAMA_CPP_PARAMS.get("n_ctx", 262144),
+                        "safe_context": int(LLAMA_CPP_PARAMS.get("n_ctx", 262144) * 0.8)
+                    }
+            
+            # Режим LM Studio
             resp = requests.get(f"{self.lm_studio_url}/v1/models", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
@@ -3523,15 +3914,15 @@ class AIOrchestrator:
             
             # Импортируем библиотеки
             try:
-                import cv2
+                import cv2  # type: ignore
                 import torch
                 import numpy as np
                 from PIL import Image
                 
                 # Пытаемся импортировать RealESRGAN
                 try:
-                    from realesrgan import RealESRGANer
-                    from basicsr.archs.rrdbnet_arch import RRDBNet
+                    from realesrgan import RealESRGANer  # type: ignore
+                    from basicsr.archs.rrdbnet_arch import RRDBNet  # type: ignore
                 except ImportError:
                     # Если realesrgan не установлен, пытаемся использовать базовую реализацию
                     self.logger.warning("⚠️ realesrgan пакет не найден, использую альтернативный метод")
@@ -3619,7 +4010,7 @@ class AIOrchestrator:
         try:
             # Проверяем установлен ли basicsr
             try:
-                import basicsr
+                import basicsr  # type: ignore
                 self.logger.debug("✅ basicsr уже установлен")
             except ImportError:
                 self.logger.info("📦 Устанавливаю basicsr...")
@@ -3628,7 +4019,7 @@ class AIOrchestrator:
             
             # Проверяем установлен ли realesrgan
             try:
-                import realesrgan
+                import realesrgan  # type: ignore
                 self.logger.debug("✅ realesrgan уже установлен")
             except ImportError:
                 self.logger.info("📦 Устанавливаю realesrgan...")
@@ -4643,17 +5034,25 @@ class AIOrchestrator:
         Инициализация оркестратора
         
         Args:
-            lm_studio_url: URL сервера LM Studio
+            lm_studio_url: URL сервера LM Studio (используется только если USE_LLAMA_CPP = False)
             google_api_key: API ключ Google Custom Search
             google_cse_id: ID поисковой системы Google CSE
         """
+        # Определяем режим работы: llama.cpp или LM Studio
+        self.use_llama_cpp = USE_LLAMA_CPP
+        
+        # Инициализация для режима LM Studio
         self.lm_studio_url = lm_studio_url.rstrip("/")
+        
+        # Инициализация для режима llama.cpp
+        self.llama_wrapper: Optional[LlamaCppWrapper] = None
+        
         self.google_api_key = google_api_key
         self.google_cse_id = google_cse_id
         # unify logger usage for instance methods
         self.logger = logger
         self.conversation_history: List[Dict[str, Any]] = []
-        self.brain_model = "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
+        self.brain_model = LLAMA_CPP_MODEL_PATH if USE_LLAMA_CPP else "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
         self.brain_model_id = None  # Короткий ID модели для API вызовов
         self.use_separator = True  # По умолчанию True, чтобы убрать предупреждение Pylance
         self.use_image_generation = False  # По умолчанию отключена генерация изображений
@@ -5455,7 +5854,7 @@ class AIOrchestrator:
                 filename += '.bat'
             
             # Путь для сохранения в папку output
-            output_path = os.path.join(self.base_path, "output", filename)
+            output_path = os.path.join(os.getcwd(), "output", filename)
             
             # Убеждаемся что папка output существует
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -6212,11 +6611,14 @@ class AIOrchestrator:
     def call_brain_model(self, user_message: str, vision_desc: str = "") -> str:
         """
         Отправка текстового запроса (и опционально описания изображения) в "мозг" (текстовая модель)
+        Поддерживает как LM Studio, так и llama.cpp режимы
         """
         start_time = time.time()
         # Инициализируем переменные для использования в except блоке
         processed_message = user_message
         messages = []
+
+        logger.info(f"🧠 call_brain_model старт, длина сообщения {len(user_message)} символов")
         
         try:
             # Проверяем, является ли сообщение командой для загрузки модуля
@@ -6268,14 +6670,125 @@ class AIOrchestrator:
                 messages.append({"role": "user", "content": vision_desc})
             messages.append({"role": "user", "content": user_message})
             
+            logger.info(f"Отправляю запрос в мозг: {user_message[:100]}...")
+            
+            # ===================================================================
+            # РЕЖИМ LLAMA.CPP - прямая работа с моделью через Python API
+            # ===================================================================
+            if self.use_llama_cpp:
+                if not self.llama_wrapper or not self.llama_wrapper.is_loaded():
+                    error_msg = "Модель llama.cpp не загружена"
+                    logger.error(f"❌ {error_msg}")
+                    return f"[Brain error] {error_msg}"
+                
+                try:
+                    # Добавляем детальное логирование
+                    start_total = time.time()
+                    logger.info(f"🚀 Вызываю llama.cpp для генерации...")
+                    logger.info(f"📝 Параметры: messages={len(messages)}, temp={LLAMA_CPP_GENERATION_PARAMS['temperature']}, max_tokens={LLAMA_CPP_GENERATION_PARAMS['max_tokens']}")
+                    
+                    # Показываем размер каждого сообщения для диагностики
+                    total_chars = sum(len(str(msg.get('content', ''))) for msg in messages)
+                    logger.info(f"📊 Размер всех сообщений: {total_chars} символов, {len(messages)} сообщений")
+                    for i, msg in enumerate(messages):
+                        content_len = len(str(msg.get('content', '')))
+                        logger.info(f"  Сообщение {i+1}: роль={msg.get('role', '?')}, длина={content_len} символов")
+                    
+                    # Засекаем время вызова
+                    start_call = time.time()
+                    logger.info("⏱️ НАЧАЛО ВЫЗОВА create_chat_completion...")
+                    
+                    # Вызываем llama.cpp для генерации с параметрами из начала файла
+                    result = self.llama_wrapper.create_chat_completion(  # type: ignore
+                        messages=messages,  # type: ignore
+                        temperature=LLAMA_CPP_GENERATION_PARAMS['temperature'],
+                        max_tokens=LLAMA_CPP_GENERATION_PARAMS['max_tokens'],
+                        top_p=LLAMA_CPP_GENERATION_PARAMS['top_p'],
+                        top_k=LLAMA_CPP_GENERATION_PARAMS['top_k'],
+                        repeat_penalty=LLAMA_CPP_GENERATION_PARAMS['repeat_penalty'],
+                        stream=LLAMA_CPP_GENERATION_PARAMS['stream']
+                    )
+                    
+                    end_call = time.time()
+                    call_duration = end_call - start_call
+                    logger.info(f"⏱️ КОНЕЦ ВЫЗОВА create_chat_completion: {call_duration:.2f} секунд")
+                    logger.info("✅ Генерация завершена успешно")
+                    
+                    ai_response = result["choices"][0]["message"]["content"].strip()
+                    
+                    # Извлекаем информацию о токенах
+                    usage_info = result.get("usage", {})
+                    prompt_tokens = usage_info.get("prompt_tokens", 0)
+                    completion_tokens = usage_info.get("completion_tokens", 0)
+                    total_tokens = usage_info.get("total_tokens", 0)
+                    
+                    if total_tokens > 0:
+                        self.current_context_length = total_tokens
+                        logger.info(f"📊 Токены (llama.cpp): prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
+                        self._trim_context_if_needed()
+                    
+                    # Добавляем в историю разговора
+                    if ai_response and ai_response != "{}":
+                        self.conversation_history.append({"role": "user", "content": processed_message})
+                        self.conversation_history.append({"role": "assistant", "content": ai_response})
+                        self.auto_save_conversation(processed_message, ai_response, vision_desc)
+                        self.extract_preferences_from_response(processed_message, ai_response)
+                    
+                    # Обрабатываем ответ плагинами
+                    final_response = ai_response
+                    if self.plugin_manager:
+                        final_response = self.plugin_manager.call_hook_response_generated(ai_response, self)
+                    
+                    return final_response
+                    
+                except Exception as llama_error:
+                    error_msg = f"Ошибка llama.cpp: {str(llama_error)}"
+                    logger.error(f"❌ {error_msg}")
+                    
+                    # Попытка переподключения
+                    logger.info("🔄 Попытка переподключения к модели llama.cpp...")
+                    if self._reconnect_brain_model():
+                        try:
+                            logger.info("🔄 Повторный запрос после переподключения...")
+                            result = self.llama_wrapper.create_chat_completion(
+                                messages=messages,
+                                temperature=LLAMA_CPP_GENERATION_PARAMS['temperature'],
+                                max_tokens=LLAMA_CPP_GENERATION_PARAMS['max_tokens'],
+                                top_p=LLAMA_CPP_GENERATION_PARAMS['top_p'],
+                                top_k=LLAMA_CPP_GENERATION_PARAMS['top_k'],
+                                repeat_penalty=LLAMA_CPP_GENERATION_PARAMS['repeat_penalty'],
+                                stream=LLAMA_CPP_GENERATION_PARAMS['stream']
+                            )
+                            ai_response = result["choices"][0]["message"]["content"].strip()
+                            logger.info("✅ Повторный запрос после переподключения успешен")
+                            
+                            if ai_response and ai_response != "{}":
+                                self.conversation_history.append({"role": "user", "content": processed_message})
+                                self.conversation_history.append({"role": "assistant", "content": ai_response})
+                                self.auto_save_conversation(processed_message, ai_response, vision_desc)
+                                self.extract_preferences_from_response(processed_message, ai_response)
+                            
+                            final_response = ai_response
+                            if self.plugin_manager:
+                                final_response = self.plugin_manager.call_hook_response_generated(ai_response, self)
+                            
+                            return final_response
+                        except Exception as retry_e:
+                            logger.error(f"❌ Ошибка повторного запроса: {retry_e}")
+                    
+                    return f"[Brain error] {error_msg}"
+            
+            # ===================================================================
+            # РЕЖИМ LM STUDIO - работа через HTTP API
+            # ===================================================================
             payload = {
                 "model": self.brain_model_id if hasattr(self, 'brain_model_id') and self.brain_model_id else self.brain_model,
                 "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": 32767,
-                "stream": False
+                "temperature": LLAMA_CPP_GENERATION_PARAMS['temperature'],
+                "max_tokens": LLAMA_CPP_GENERATION_PARAMS['max_tokens'],
+                "stream": LLAMA_CPP_GENERATION_PARAMS['stream']
             }
-            logger.info(f"Отправляю запрос в мозг: {user_message[:100]}...")
+            
             response = requests.post(
                 f"{self.lm_studio_url}/v1/chat/completions",
                 json=payload,
@@ -6294,7 +6807,7 @@ class AIOrchestrator:
                 # Обновляем текущий размер контекста на основе total_tokens
                 if total_tokens > 0:
                     self.current_context_length = total_tokens
-                    logger.info(f"📊 Реальные токены: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
+                    logger.info(f"📊 Токены (LM Studio): prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
                     
                     # Обрезаем контекст на основе реальных токенов
                     self._trim_context_if_needed()
@@ -6363,20 +6876,32 @@ class AIOrchestrator:
                 if self._reconnect_brain_model():
                     # Повторяем запрос после переподключения
                     try:
-                        payload = {
-                            "model": self.brain_model_id if hasattr(self, 'brain_model_id') and self.brain_model_id else self.brain_model,
-                            "messages": messages,
-                            "temperature": 0.1,
-                            "max_tokens": 32767,
-                            "stream": False
-                        }
-                        retry_response = requests.post(
-                            f"{self.lm_studio_url}/v1/chat/completions",
-                            json=payload,
-                            headers={"Content-Type": "application/json"}
-                        )
-                        if retry_response.status_code == 200:
-                            result = retry_response.json()
+                        if self.use_llama_cpp:
+                            result = self.llama_wrapper.create_chat_completion(  # type: ignore
+                                messages=messages,  # type: ignore
+                                temperature=LLAMA_CPP_GENERATION_PARAMS['temperature'],
+                                max_tokens=LLAMA_CPP_GENERATION_PARAMS['max_tokens'],
+                                top_p=LLAMA_CPP_GENERATION_PARAMS['top_p'],
+                                top_k=LLAMA_CPP_GENERATION_PARAMS['top_k'],
+                                repeat_penalty=LLAMA_CPP_GENERATION_PARAMS['repeat_penalty'],
+                                stream=LLAMA_CPP_GENERATION_PARAMS['stream']
+                            )
+                        else:
+                            payload = {
+                                "model": self.brain_model_id if hasattr(self, 'brain_model_id') and self.brain_model_id else self.brain_model,
+                                "messages": messages,
+                                "temperature": LLAMA_CPP_GENERATION_PARAMS['temperature'],
+                                "max_tokens": LLAMA_CPP_GENERATION_PARAMS['max_tokens'],
+                                "stream": LLAMA_CPP_GENERATION_PARAMS['stream']
+                            }
+                            retry_response = requests.post(
+                                f"{self.lm_studio_url}/v1/chat/completions",
+                                json=payload,
+                                headers={"Content-Type": "application/json"}
+                            )
+                            result = retry_response.json() if retry_response.status_code == 200 else None
+                        
+                        if result:
                             ai_response = result["choices"][0]["message"]["content"].strip()
                             logger.info("✅ Повторный запрос после переподключения успешен")
                             
@@ -7484,7 +8009,12 @@ class AIOrchestrator:
                     logger.info("💬 Модель вернула текстовый ответ без JSON")
                     if len(next_input.strip()) > 5 and not next_input.strip().startswith('{'):
                         logger.info("💬 Использую текстовый ответ как финальный")
-                        self.last_final_response = next_input.strip()
+                        clean_answer = re.sub(r'<think>.*?</think>', '', next_input, flags=re.DOTALL | re.IGNORECASE).strip()
+                        if not clean_answer:
+                            clean_answer = next_input.strip()
+                        self.last_final_response = clean_answer
+                        logger.info("\n🤖 ФИНАЛЬНЫЙ ОТВЕТ (текст):")
+                        logger.info(clean_answer)
                         return False
                     think_content = self.extract_think_content(next_input)
                     if think_content:
@@ -7542,6 +8072,8 @@ class AIOrchestrator:
                     if think_content and len(think_content) > 20:
                         logger.info("💭 Использую содержимое размышлений как ответ")
                         self.last_final_response = think_content
+                        logger.info("\n🤖 ФИНАЛЬНЫЙ ОТВЕТ (из размышлений):")
+                        logger.info(think_content)
                         return False
                     next_input = self.call_brain_model("Модель вернула пустой JSON. Пожалуйста, сформулируй конкретный ответ или действие.")
                     continue
@@ -7631,6 +8163,52 @@ class AIOrchestrator:
         logger.warning("🔄 Превышен цикл попыток обработки follow_up или достигнут лимит. Завершаю.")
         return False
 
+    def _read_user_input(self, prompt_text: str) -> str:
+        """Безопасное чтение ввода пользователя с поддержкой Windows-консоли."""
+        if os.name != 'nt':
+            # На Unix-подобных системах стандартный input работает корректно
+            return input(prompt_text).strip()
+
+        import msvcrt  # type: ignore
+
+        print(prompt_text, end='', flush=True)
+        buffer: List[str] = []
+
+        while True:
+            ch = msvcrt.getwch()
+
+            # Enter / возврат
+            if ch in ('\r', '\n'):
+                print()
+                return ''.join(buffer).strip()
+
+            # Ctrl+C
+            if ch == '\x03':
+                print()
+                raise KeyboardInterrupt()
+
+            # Ctrl+Z (EOF)
+            if ch == '\x1a':
+                print()
+                return ''.join(buffer).strip()
+
+            # Backspace
+            if ch == '\b':
+                if buffer:
+                    buffer.pop()
+                    # Стираем символ в консоли
+                    print('\b \b', end='', flush=True)
+                continue
+
+            # Игнорируем служебные клавиши (стрелки и т.п.)
+            if ch in ('\x00', '\xe0'):
+                # пропускаем следующий код клавиши
+                msvcrt.getwch()
+                continue
+
+            buffer.append(ch)
+            print(ch, end='', flush=True)
+
     def run_interactive(self):
         """Запуск интерактивного режима (глаза, аудио, мозг)"""
         # Показываем сообщения только в консольном режиме
@@ -7663,16 +8241,31 @@ class AIOrchestrator:
                 audio_text = ""
 
                 # 3. Запрашиваем у пользователя текстовый вопрос
+                prompt_text = "\n👤 Ваш вопрос (или Enter для пропуска, либо вставьте ссылку на YouTube): "
+                auto_question = os.getenv("AUTO_QUESTION")
                 try:
-                    if getattr(self, 'show_images_locally', True):
-                        user_input = input("\n👤 Ваш вопрос (или Enter для пропуска, либо вставьте ссылку на YouTube): ").strip()
+                    if auto_question:
+                        user_input = auto_question.strip()
+                        logger.info(f"🤖 AUTO_QUESTION активен, используем запрос: {user_input}")
+                        # Отключаем AUTO_QUESTION после первого использования, чтобы избежать зацикливания
+                        os.environ.pop("AUTO_QUESTION", None)
+                        auto_question = None
+                    elif getattr(self, 'show_images_locally', True) or not IS_WEB:
+                        logger.info("⌛ Жду ввод пользователя...")
+                        logger.debug("➡️ Ожидание input() начато")
+                        user_input = self._read_user_input(prompt_text)
+                        logger.debug("✅ input() завершён")
+                        logger.debug(f"[DEBUG] Получен ввод: {repr(user_input)}")
+                        logger.debug(f"📝 Сырой ввод (repr): {repr(user_input)}")
+                        logger.info(f"📥 Ввод пользователя: {user_input}")
                     else:
-                        # В веб-режиме не запрашиваем ввод
+                        # В веб-режиме локальный ввод отключен
+                        logger.debug("🌐 Веб-режим: локальный ввод отключен, ожидаю события из интерфейса")
                         user_input = ""
                 except EOFError:
                     # Если ввод из файла/pipe, используем пустую строку
                     user_input = ""
-                    if getattr(self, 'show_images_locally', True):
+                    if getattr(self, 'show_images_locally', True) or not IS_WEB:
                         logger.info("📝 Ввод из файла/pipe, продолжаю...")
                 if user_input.lower() in ['exit', 'quit', 'выход']:
                     if getattr(self, 'show_images_locally', True):
@@ -8034,6 +8627,9 @@ class AIOrchestrator:
                         brain_input += f"[Текст из аудио]:\n{audio_text}\n"
                     brain_input += user_input
 
+                    logger.info(f"🧠 Формирую запрос к модели (длина {len(brain_input)} символов)")
+                    logger.debug(f"brain_input (truncated): {brain_input[:200]}")
+
                     # 6. Отправляем запрос в мозг
                     ai_response = self.call_brain_model(brain_input)
                     # Показываем информацию о контексте
@@ -8054,6 +8650,7 @@ class AIOrchestrator:
                 # 3. Запрашиваем у пользователя текстовый вопрос
                 try:
                     user_input = input("\n👤 Ваш вопрос (или Enter для пропуска, либо вставьте ссылку на YouTube): ").strip()
+                    logger.info(f"📥 Ввод пользователя (после ошибки): {user_input}")
                 except EOFError:
                     # Если ввод из файла/pipe, используем пустую строку
                     user_input = ""
