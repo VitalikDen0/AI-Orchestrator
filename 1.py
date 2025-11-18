@@ -136,7 +136,7 @@ import mss
 import queue
 import logging
 import argparse
-from typing import Dict, Any, List, Union, Optional, TYPE_CHECKING, Tuple
+from typing import Dict, Any, List, Union, Optional, TYPE_CHECKING, Tuple, Iterable, cast
 import urllib.parse
 from PIL import Image
 from io import BytesIO
@@ -657,6 +657,25 @@ class ChromaDBManager:
             
         return gpu_info
     
+    def _encode_text_to_embedding(self, text: str) -> List[float]:
+        """Преобразует текст в список float значений для ChromaDB."""
+        if self.embedding_model_obj is None:
+            return []
+
+        vector = self.embedding_model_obj.encode(text, convert_to_numpy=True)
+        vector_any: Any = vector
+
+        if hasattr(vector_any, "tolist"):
+            try:
+                return list(vector_any.tolist())  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        try:
+            return [float(value) for value in cast(Iterable[float], vector_any)]
+        except Exception:
+            return []
+
     def add_conversation_memory(self, user_message: str, ai_response: str,
                                context: str = "", metadata: Optional[Dict[str, Any]] = None, 
                                force_add: bool = False) -> bool:
@@ -711,7 +730,10 @@ class ChromaDBManager:
             if not self.initialized or self.embedding_model_obj is None:
                 logger.warning("⚠️ Эмбеддинговая модель не инициализирована, пропускаю добавление в ChromaDB")
                 return False
-            embedding = self.embedding_model_obj.encode(combined_text).tolist()
+            embedding = self._encode_text_to_embedding(combined_text)
+            if not embedding:
+                logger.warning("⚠️ Не удалось создать эмбеддинг для диалога")
+                return False
             
             # Подготавливаем метаданные
             record_metadata = {
@@ -785,7 +807,10 @@ class ChromaDBManager:
             if not self.initialized or self.embedding_model_obj is None:
                 logger.warning("⚠️ Эмбеддинговая модель не инициализирована, пропускаю добавление предпочтения")
                 return False
-            embedding = self.embedding_model_obj.encode(preference_text).tolist()
+            embedding = self._encode_text_to_embedding(preference_text)
+            if not embedding:
+                logger.warning("⚠️ Не удалось создать эмбеддинг для предпочтения")
+                return False
             
             # Подготавливаем метаданные
             record_metadata = {
@@ -839,7 +864,10 @@ class ChromaDBManager:
                 return []
             
             logger.info(f"🔍 Ищем похожие диалоги для запроса: '{query}'")
-            query_embedding = self.embedding_model_obj.encode(query).tolist()
+            query_embedding = self._encode_text_to_embedding(query)
+            if not query_embedding:
+                logger.warning("⚠️ Не удалось создать эмбеддинг для запроса")
+                return []
             
             # Ищем похожие записи (если коллекция доступна)
             if self.collection is None:
@@ -985,7 +1013,10 @@ class ChromaDBManager:
             if not self.initialized or self.embedding_model_obj is None:
                 logger.warning("⚠️ Эмбеддинговая модель не инициализирована, поиск предпочтений невозможен")
                 return []
-            query_embedding = self.embedding_model_obj.encode(query).tolist()
+            query_embedding = self._encode_text_to_embedding(query)
+            if not query_embedding:
+                logger.warning("⚠️ Не удалось создать эмбеддинг для запроса предпочтений")
+                return []
             
             # Формируем условия поиска
             where_condition = {"type": "preference"}
@@ -4530,7 +4561,7 @@ class AIOrchestrator:
                     out_dir = os.path.join(base_dir, "separated")
                     os.makedirs(out_dir, exist_ok=True)
                     separator = Separator(output_dir=out_dir)
-                    separator.load_model(model_filename='htdemucs_ft.yaml')
+                    separator.load_model(model_name='UVR-MDX-NET-Inst_HQ_3')
                     output_files = separator.separate(audio_path)
                     vocals_path = None
                     for file_path in output_files:
@@ -4555,7 +4586,7 @@ class AIOrchestrator:
                         out_dir = os.path.join(base_dir, "separated")
                         os.makedirs(out_dir, exist_ok=True)
                         separator = Separator(output_dir=out_dir)
-                        separator.load_model(model_filename='htdemucs_ft.yaml')
+                        separator.load_model(model_name='UVR-MDX-NET-Inst_HQ_3')
                         output_files = separator.separate(audio_path)
                         vocals_path = None
                         for file_path in output_files:
@@ -6119,7 +6150,11 @@ class AIOrchestrator:
             extracted_text = []
             for (bbox, text, confidence) in results:
                 # Фильтруем результаты с низкой уверенностью
-                if confidence > 0.3:  # Порог уверенности 30%
+                try:
+                    confidence_value = float(confidence)
+                except (TypeError, ValueError):
+                    confidence_value = 0.0
+                if confidence_value > 0.3:  # Порог уверенности 30%
                     extracted_text.append(text.strip())
             
             if not extracted_text:
@@ -6168,7 +6203,11 @@ class AIOrchestrator:
             extracted_text = []
             for (bbox, text, confidence) in results:
                 # Фильтруем результаты с низкой уверенностью
-                if confidence > 0.3:  # Порог уверенности 30%
+                try:
+                    confidence_value = float(confidence)
+                except (TypeError, ValueError):
+                    confidence_value = 0.0
+                if confidence_value > 0.3:  # Порог уверенности 30%
                     extracted_text.append(text.strip())
             
             if not extracted_text:
