@@ -4,12 +4,13 @@ import json
 import base64
 import time
 import logging
-from typing import Optional
+from typing import Optional, Any
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+from fastapi.staticfiles import StaticFiles
 
 # Import orchestrator from 1.py
 import importlib.util
@@ -17,6 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ONE_PY = ROOT / "1.py"
+FRONTEND_DIST = ROOT / "webui" / "frontend" / "dist"
 
 spec = importlib.util.spec_from_file_location("one_module", str(ONE_PY))
 if spec is None or spec.loader is None:
@@ -41,6 +43,29 @@ orchestrator = None  # type: ignore
 event_log = []  # simple in-memory log
 history = []    # simple in-memory history (last 200 items)
 performance_metrics = []  # Метрики производительности
+
+FILE_CATEGORIES = {
+    "output": {
+        "title": "Генерированные файлы",
+        "path": ROOT / "output"
+    },
+    "images": {
+        "title": "Сгенерированные изображения",
+        "path": ROOT / "Images" / "generated"
+    },
+    "audio": {
+        "title": "Аудио",
+        "path": ROOT / "Audio" / "generated_speech"
+    },
+    "video": {
+        "title": "Видео",
+        "path": ROOT / "generated_videos"
+    },
+    "export": {
+        "title": "Прочие результаты",
+        "path": ROOT / "test_output"
+    }
+}
 
 def log(msg: str, level: str = "INFO"):
     """Логирование с временной меткой в файл и память"""
@@ -89,6 +114,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if (FRONTEND_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="frontend-assets")
+
 # Модели данных для FastAPI
 class AskPayload(BaseModel):
     message: str
@@ -108,12 +136,58 @@ def add_history(event_type: str, request: str, response: str):
     if len(history) > 200:
         del history[:len(history)-200]
 
+
+def build_file_catalog() -> list[dict[str, Any]]:
+    categories: list[dict[str, Any]] = []
+    for category_id, info in FILE_CATEGORIES.items():
+        base_path: Path = info["path"]
+        if not base_path.exists():
+            continue
+
+        files: list[dict[str, Any]] = []
+        try:
+            sorted_paths = sorted(
+                (p for p in base_path.rglob("*") if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            for file_path in sorted_paths[:200]:
+                stat = file_path.stat()
+                files.append({
+                    "name": file_path.name,
+                    "relative_path": file_path.relative_to(base_path).as_posix(),
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime
+                })
+        except Exception as exc:
+            log(f"Files catalog error for {category_id}: {exc}", "ERROR")
+
+        categories.append({
+            "id": category_id,
+            "title": info["title"],
+            "files": files
+        })
+
+    return categories
+
 @app.get("/")
 def index():
-    index_path = ROOT / "webui" / "static" / "index.html"
-    if not index_path.exists():
+    frontend_index = FRONTEND_DIST / "index.html"
+    if frontend_index.exists():
+        return HTMLResponse(frontend_index.read_text(encoding="utf-8"))
+
+    legacy_index = ROOT / "webui" / "static" / "index.html"
+    if not legacy_index.exists():
         raise HTTPException(status_code=404, detail="index.html not found")
-    return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    return HTMLResponse(legacy_index.read_text(encoding="utf-8"))
+
+
+@app.get("/favicon.svg")
+def favicon():
+    favicon_path = FRONTEND_DIST / "favicon.svg"
+    if favicon_path.exists():
+        return FileResponse(favicon_path)
+    raise HTTPException(status_code=404, detail="favicon not found")
 
 @app.post("/api/ask")
 def api_ask(payload: AskPayload):
@@ -311,6 +385,36 @@ def api_reset():
     log("RESET: new chat started")
     return {"ok": True}
 
+
+@app.get("/api/files")
+def api_files():
+    return {"categories": build_file_catalog()}
+
+
+@app.get("/api/files/download")
+def api_files_download(category: str, file_path: str):
+    info = FILE_CATEGORIES.get(category)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Неизвестная категория")
+
+    base_path: Path = info["path"]
+    if not base_path.exists():
+        raise HTTPException(status_code=404, detail="Каталог отсутствует")
+
+    try:
+        target_path = (base_path / file_path).resolve()
+        base_resolved = base_path.resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Некорректный путь")
+
+    if not str(target_path).startswith(str(base_resolved)):
+        raise HTTPException(status_code=400, detail="Недопустимый путь файла")
+
+    if not target_path.exists() or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден")
+
+    return FileResponse(target_path, filename=target_path.name)
+
 @app.post("/api/upload/photo")
 async def upload_photo(file: UploadFile = File(...), context: str = Form("")):
     try:
@@ -333,6 +437,7 @@ async def upload_photo(file: UploadFile = File(...), context: str = Form("")):
             raise HTTPException(status_code=400, detail="Ошибка кодирования изображения (base64 пустой)")
         
         desc = ""
+        vision_time = 0.0
         if getattr(orchestrator, 'use_vision', False) and img_b64:
             vision_start = time.time()
             desc = orchestrator.call_vision_model(img_b64)
@@ -363,7 +468,7 @@ async def upload_photo(file: UploadFile = File(...), context: str = Form("")):
             "has_image": orchestrator.last_generated_image_b64 is not None,
             "performance": {
                 "total_time": total_time,
-                "vision_time": vision_time if desc else 0,
+                "vision_time": vision_time,
                 "brain_time": brain_time
             }
         }
@@ -483,6 +588,7 @@ async def upload_video(file: UploadFile = File(...), context: str = Form("")):
         log(f"Video uploaded: {file.filename}")
         
         frames_desc = ''
+        vision_time = 0.0
         if getattr(orchestrator, 'use_vision', False):
             vision_start = time.time()
             frames = orchestrator.extract_video_frames(out_path, fps=1)
@@ -522,7 +628,7 @@ async def upload_video(file: UploadFile = File(...), context: str = Form("")):
             "final": orchestrator.last_final_response,
             "performance": {
                 "total_time": total_time,
-                "vision_time": vision_time if frames_desc else 0,
+                "vision_time": vision_time,
                 "brain_time": brain_time
             }
         }
