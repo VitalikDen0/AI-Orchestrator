@@ -331,6 +331,9 @@ p.s. **abliterated** по причине того, что она будет ме
 
 - **[moondream2-050824](https://huggingface.co/cjpais/moondream2-llamafile/blob/main/moondream2-050824-q8.gguf)**
 - Требования: ~2GB VRAM
+- Так же для любителей NSFW изображений или просто более четкого определения изображений, рекомендую к использованию:
+- **[llama-joycaption-beta-one-hf-llava-mmproj](https://huggingface.co/concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf)**
+- Требования: При Q8 - ~10GB VRAM, при Q4_K - ~6GB VRAM
 
 #### Stable Diffusion модель (аниме модели)
 
