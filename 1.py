@@ -1962,8 +1962,9 @@ class PromptLoader:
     def __init__(self, base_dir: str | None = None):
         if base_dir is None:
             base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.prompts_dir = os.path.join(base_dir, "promts")
+        self.prompts_dir = os.path.join(base_dir, "prompt")
         self.base_prompt_file = os.path.join(self.prompts_dir, "PROMPT_SYSTEM.md")
+        self.vision_prompt_file = os.path.join(self.prompts_dir, "vision_analysis_prompt.md")
         
         # Карта команд к файлам модулей
         self.module_commands = {
@@ -1985,6 +1986,7 @@ class PromptLoader:
         # Кэш загруженных модулей
         self._module_cache = {}
         self._base_prompt_cache = None
+        self._vision_prompt_cache = None
     
     def load_base_prompt(self) -> str:
         """
@@ -2009,6 +2011,31 @@ class PromptLoader:
         except Exception as e:
             logger.error(f"Ошибка загрузки базового промпта: {e}")
             return self._get_fallback_prompt()
+
+    def load_vision_prompt(self) -> str:
+        """Загружает специальный промпт для vision-модели."""
+        if self._vision_prompt_cache is not None:
+            return self._vision_prompt_cache
+
+        try:
+            if not os.path.exists(self.vision_prompt_file):
+                logger.warning("⚠️ Vision-промпт не найден, использую запасной вариант")
+                self._vision_prompt_cache = self._get_default_vision_prompt()
+                return self._vision_prompt_cache
+
+            with open(self.vision_prompt_file, "r", encoding="utf-8") as file:
+                content = file.read().strip()
+
+            if not content:
+                self._vision_prompt_cache = self._get_default_vision_prompt()
+            else:
+                self._vision_prompt_cache = content
+
+            return self._vision_prompt_cache
+        except Exception as exc:
+            logger.error(f"Ошибка загрузки vision-промпта: {exc}")
+            self._vision_prompt_cache = self._get_default_vision_prompt()
+            return self._vision_prompt_cache
     
     def _extract_base_section(self, content: str) -> str:
         """
@@ -2146,6 +2173,14 @@ class PromptLoader:
 - get_pc_control_help
 - get_file_processing_help
 - get_error_handling_help"""
+
+    def _get_default_vision_prompt(self) -> str:
+        """Запасной промпт для vision, если файл отсутствует."""
+        return (
+            "Ты анализируешь изображение. Опиши ключевые объекты, их расположение," \
+            " цвета и текст. Будь краток, но информативен. Не делай выводов, которых не видно." \
+            " Если что-то непонятно, честно сообщи об этом."
+        )
 
     def is_module_command(self, message: str) -> bool:
         """
@@ -6700,13 +6735,36 @@ class AIOrchestrator:
         try:
             self._ensure_vision_model_loaded()
 
+            vision_prompt = ""
+            if getattr(self, "prompt_loader", None) is not None:
+                try:
+                    vision_prompt = self.prompt_loader.load_vision_prompt()
+                except Exception as exc:
+                    logger.debug(f"Vision prompt load error: {exc}")
+
+            messages: List[Dict[str, Any]] = []
+            if vision_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": [{"type": "text", "text": vision_prompt}]
+                })
+
+            user_content: List[Dict[str, Any]] = []
+            if vision_prompt:
+                user_content.append({
+                    "type": "text",
+                    "text": "Проанализируй изображение согласно инструкциям."
+                })
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+            })
+
+            messages.append({"role": "user", "content": user_content})
+
             payload: Dict[str, Any] = {
                 "model": self.vision_model_id or "moondream2-llamafile",
-                "messages": [
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
-                    ]}
-                ],
+                "messages": messages,
             }
             for key, value in self.vision_generation_params.items():
                 if value is not None:
