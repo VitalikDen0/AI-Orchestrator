@@ -10,93 +10,58 @@ AI PowerShell Orchestrator with Google Search Integration
 # КОНФИГУРАЦИЯ GPU - ВАЖНО! Выполняется ДО импорта библиотек
 # ============================================================================
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Используем ТОЛЬКО RTX 5060 Ti (device 0)
+import copy
+
+from config import (
+    GPU_CONFIG,
+    USE_LLAMA_CPP,
+    LLAMA_CPP_MODEL_PATH,
+    LLAMA_KV_Q8_DEFAULT,
+    LLAMA_CPP_PARAMS as CONFIG_LLAMA_CPP_PARAMS,
+    LLAMA_CPP_GENERATION_PARAMS as CONFIG_LLAMA_CPP_GENERATION_PARAMS,
+    VISION_MODEL_ID,
+    VISION_MODEL_LOAD_ARGS as CONFIG_VISION_MODEL_LOAD_ARGS,
+    VISION_GENERATION_PARAMS as CONFIG_VISION_GENERATION_PARAMS,
+    VISION_PROMPT_FILENAME,
+    VISION_FALLBACK_PROMPT,
+    CHROMA_DB_PATH,
+    CHROMADB_DEFAULT_COLLECTION_NAME,
+    CHROMADB_DEFAULT_COLLECTION_METADATA,
+    CHROMADB_BACKGROUND_COLLECTION_NAME,
+    CHROMADB_EMBEDDING_MODEL,
+    CHROMADB_USE_GPU_BY_DEFAULT,
+    DEFAULT_MAX_CONTEXT_LENGTH,
+    DEFAULT_SAFE_CONTEXT_LENGTH,
+    DEFAULT_MAX_RETRIES,
+    AUTO_DISABLE_DELAY_SECONDS,
+    DEFAULT_SIMILARITY_THRESHOLD,
+    PROMPTS_DIR_NAME,
+    PLUGINS_DIR_NAME,
+    DEFAULT_LM_STUDIO_URL,
+    OUTPUT_DIR_NAME,
+    LOG_FILE_NAME,
+    FILE_LOG_FORMAT,
+    CONSOLE_LOG_LEVEL,
+    OCR_AVAILABLE_DEFAULT,
+    CHROMADB_AVAILABLE_DEFAULT,
+    TORCH_AVAILABLE_DEFAULT,
+)
+
+os.environ['CUDA_VISIBLE_DEVICES'] = GPU_CONFIG.get('cuda_visible_devices', '0')
 print(f"🎮 CUDA устройство: {os.environ.get('CUDA_VISIBLE_DEVICES', 'auto')}")
-print(f"🚀 Форсируем использование GPU: RTX 5060 Ti (compute capability 12.0)")
+print(f"🚀 Форсируем использование GPU: {GPU_CONFIG.get('force_gpu_message', 'GPU')}")
 # Уменьшаем подробный вывод llama.cpp
-os.environ.setdefault('LLAMA_LOG_LEVEL', '40')  # 40 = ERROR
+os.environ.setdefault('LLAMA_LOG_LEVEL', GPU_CONFIG.get('llama_log_level', '40'))
 # ============================================================================
 
+LLAMA_CPP_PARAMS = copy.deepcopy(CONFIG_LLAMA_CPP_PARAMS)
+LLAMA_CPP_GENERATION_PARAMS = copy.deepcopy(CONFIG_LLAMA_CPP_GENERATION_PARAMS)
+VISION_MODEL_LOAD_ARGS = copy.deepcopy(CONFIG_VISION_MODEL_LOAD_ARGS)
+VISION_GENERATION_PARAMS = copy.deepcopy(CONFIG_VISION_GENERATION_PARAMS)
+LLAMA_KV_Q8 = LLAMA_KV_Q8_DEFAULT
+
 # ============================================================================
-# ПЕРЕКЛЮЧАТЕЛЬ БЭКЕНДА: LM Studio или llama.cpp
-# ============================================================================
-# True = использовать llama-cpp-python (прямое управление моделью)
-# False = использовать LM Studio (HTTP API сервер)
-USE_LLAMA_CPP = True  # llama-cpp-python установлен и CUDA работает!
-
-# Путь к модели для llama.cpp (используется только если USE_LLAMA_CPP = True)
-LLAMA_CPP_MODEL_PATH = "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
-
-# Значение по умолчанию для типа квантизации KV-кэша (обновим после импорта llama_cpp)
-LLAMA_KV_Q8 = 8
-
-# Параметры llama.cpp
-LLAMA_CPP_PARAMS = {
-    # Основные параметры модели
-    "n_ctx": 32768,                 # Контекст 32K (оптимально для 4B + GPU память)
-    "n_gpu_layers": -1,             # -1 = ВСЕ слои на GPU (максимум производительности!)
-    "n_threads": 4,                 # Минимум CPU потоков (GPU делает всё)
-    "n_batch": 2048,                # Большой батч для GPU (быстрая обработка)
-    
-    # Параметры памяти и производительности - МАКСИМУМ GPU
-    "use_mlock": False,             # НЕ блокировать в RAM - экономия памяти
-    "use_mmap": True,               # Memory mapping (ОБЯЗАТЕЛЬНО для GPU offload!)
-    "offload_kqv": True,            # Offload KV Cache на GPU (критично!)
-    
-    # Экспериментальные функции - ВСЁ НА GPU
-    "flash_attn": True,             # Flash Attention (ускорение на GPU)
-    
-    # Квантизация KV-кэша (экономия VRAM)
-    "type_k": LLAMA_KV_Q8,          # Q8 квантизация K-кэша (официальная константа)
-    "type_v": LLAMA_KV_Q8,          # Q8 квантизация V-кэша
-    
-    # Отладка
-    "verbose": False,               # Подробный вывод отключен для аккуратных логов
-    
-    # Дополнительные параметры
-    "seed": -1,                     # Seed для генерации (-1 = случайный)
-    
-    # Mul Mat Q - оптимизация матричных операций
-    "mul_mat_q": True,              # Оптимизированные CUDA ядра (быстрее!)
-    
-    # Logits All - экономия памяти
-    "logits_all": False,            # Только последний токен (экономия VRAM)
-    
-    # Embedding - режим работы
-    "embedding": False,             # Генерация текста (не эмбеддинги)
-    
-    # Last N Tokens Size
-    "last_n_tokens_size": 64,       # Буфер для repeat penalty
-}
-
-# Параметры генерации текста для llama.cpp
-LLAMA_CPP_GENERATION_PARAMS = {
-    "temperature": 0.7,             # Температура генерации (0.0-2.0, выше = креативнее)
-    "max_tokens": None,             # Без жёсткого лимита, модель сама завершает ответ
-    "top_p": 0.9,                   # Nucleus sampling (0.0-1.0)
-    "top_k": 40,                    # Top-K sampling (количество вариантов)
-    "repeat_penalty": 1.1,          # Наказание за повторения (1.0 = нет наказания)
-    "stream": False,                # Потоковая генерация (пока False)
-}
-# ============================================================================
-
-# Конфигурация vision-модели (Moondream2)
-VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "moondream2-llamafile")
-VISION_MODEL_LOAD_ARGS = {
-    "n_ctx": 2048,
-    "n_gpu_layers": 24,
-    "n_threads": 8,
-    "n_batch": 512,
-    "offload_kqv": True,
-    "flash_attn": True,
-    "type_k": "q8_0",
-    "type_v": "q8_0",
-}
-VISION_GENERATION_PARAMS = {
-    "temperature": 0.3,
-    "max_tokens": 2048,
-    "stream": False,
-}
+# ПЕРЕКЛЮЧАТЕЛЬ БЭКЕНДА и параметры моделей теперь берутся из config.py
 # ============================================================================
 
 # Подавляем предупреждения PyTorch для чистого запуска
@@ -254,7 +219,7 @@ def get_background_loader():
     return _background_loader
 
 # Функции для фоновой загрузки тяжелых компонентов
-def load_chromadb(embedding_model="all-MiniLM-L6-v2"):
+def load_chromadb(embedding_model: str = CHROMADB_EMBEDDING_MODEL):
     """Загружает ChromaDB"""
     try:
         print("Загружаем ChromaDB...")
@@ -262,10 +227,10 @@ def load_chromadb(embedding_model="all-MiniLM-L6-v2"):
         import chromadb
         from sentence_transformers import SentenceTransformer
         
-        client = chromadb.PersistentClient(path="./chroma_db")
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         collection = client.get_or_create_collection(
-            name="ai_memories",
-            metadata={"hnsw:space": "cosine"}
+            name=CHROMADB_BACKGROUND_COLLECTION_NAME,
+            metadata=CHROMADB_DEFAULT_COLLECTION_METADATA
         )
         
         # Используем переданную модель
@@ -368,13 +333,13 @@ except ImportError:
     markdown = None
 
 # Импорты для OCR - теперь ленивые
-OCR_AVAILABLE = True  # Будем проверять при первом использовании
+OCR_AVAILABLE = OCR_AVAILABLE_DEFAULT  # Будем проверять при первом использовании
 
 # Импорты для ChromaDB и векторного поиска - теперь ленивые
-CHROMADB_AVAILABLE = True  # Будем проверять при первом использовании
+CHROMADB_AVAILABLE = CHROMADB_AVAILABLE_DEFAULT  # Будем проверять при первом использовании
 
 # Импорты для Torch - теперь ленивые
-TORCH_AVAILABLE = True  # Будем проверять при первом использовании
+TORCH_AVAILABLE = TORCH_AVAILABLE_DEFAULT  # Будем проверять при первом использовании
 
 # Проверки доступности опциональных модулей
 try:
@@ -409,20 +374,21 @@ load_dotenv(override=True)
 IS_WEB = any(arg == '--web' for arg in _sys.argv)
 
 # Настройка логирования: всегда пишем подробный файл, но в консоль показываем INFO только в --web
-log_file = "ai_orchestrator.log"
+log_file = LOG_FILE_NAME
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 
 # File handler: keep INFO logs for later inspection
 file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
 file_handler.setLevel(logging.INFO)
-file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_formatter = logging.Formatter(FILE_LOG_FORMAT)
 file_handler.setFormatter(file_formatter)
 root_logger.addHandler(file_handler)
 
 # Console handler: verbose only for --web, otherwise warnings+ only
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+console_level = getattr(logging, CONSOLE_LOG_LEVEL.upper(), logging.INFO)
+console_handler.setLevel(console_level)
 console_handler.setFormatter(file_formatter)
 root_logger.addHandler(console_handler)
 
@@ -523,7 +489,8 @@ class ChromaDBManager:
     и обучения на предпочтениях пользователя
     """
     
-    def __init__(self, db_path: str = "chroma_db", embedding_model: str = "all-MiniLM-L6-v2", use_gpu: bool = True):
+    def __init__(self, db_path: str = CHROMA_DB_PATH, embedding_model: str = CHROMADB_EMBEDDING_MODEL,
+                 use_gpu: bool = CHROMADB_USE_GPU_BY_DEFAULT):
         """
         Инициализация ChromaDB менеджера
         
@@ -613,8 +580,8 @@ class ChromaDBManager:
             
             # Создаем или получаем коллекцию
             self.collection = self.client.get_or_create_collection(
-                name="conversation_memory",
-                metadata={"description": "Векторное хранилище диалогов и предпочтений пользователя"}
+                name=CHROMADB_DEFAULT_COLLECTION_NAME,
+                metadata=CHROMADB_DEFAULT_COLLECTION_METADATA
             )
             
             # Инициализируем модель эмбеддингов
@@ -700,7 +667,7 @@ class ChromaDBManager:
             if not force_add:
                 logger.debug(f"🔍 Проверяем дубликаты для сообщения: '{user_message[:50]}...'")
                 similar_conversations = self.search_similar_conversations(
-                    user_message, n_results=1, similarity_threshold=0.7
+                    user_message, n_results=1, similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD
                 )
                 
                 if similar_conversations and len(similar_conversations) > 0:
@@ -708,7 +675,7 @@ class ChromaDBManager:
                     logger.debug(f"🔍 Найден похожий диалог с similarity={similarity:.3f}")
                     
                     # Если similarity больше 0.7 (70%), считаем дубликатом
-                    if similarity > 0.7:
+                    if similarity > DEFAULT_SIMILARITY_THRESHOLD:
                         logger.info(f"⚠️ Найден дубликат с similarity={similarity:.3f}, пропускаем добавление")
                         return False
                 else:
@@ -1962,9 +1929,9 @@ class PromptLoader:
     def __init__(self, base_dir: str | None = None):
         if base_dir is None:
             base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.prompts_dir = os.path.join(base_dir, "prompt")
+        self.prompts_dir = os.path.join(base_dir, PROMPTS_DIR_NAME)
         self.base_prompt_file = os.path.join(self.prompts_dir, "PROMPT_SYSTEM.md")
-        self.vision_prompt_file = os.path.join(self.prompts_dir, "vision_analysis_prompt.md")
+        self.vision_prompt_file = os.path.join(self.prompts_dir, VISION_PROMPT_FILENAME)
         
         # Карта команд к файлам модулей
         self.module_commands = {
@@ -2176,11 +2143,7 @@ class PromptLoader:
 
     def _get_default_vision_prompt(self) -> str:
         """Запасной промпт для vision, если файл отсутствует."""
-        return (
-            "Ты анализируешь изображение. Опиши ключевые объекты, их расположение," \
-            " цвета и текст. Будь краток, но информативен. Не делай выводов, которых не видно." \
-            " Если что-то непонятно, честно сообщи об этом."
-        )
+        return VISION_FALLBACK_PROMPT
 
     def is_module_command(self, message: str) -> bool:
         """
@@ -2456,10 +2419,8 @@ class AIOrchestrator:
         
         # Проверяем наличие cookies
         cookies_path = self.get_youtube_cookies_path()
-        use_cookies = False
         
         if cookies_path and self.check_cookies_validity(cookies_path):
-            use_cookies = True
             self.logger.info("🍪 Использую cookies для аутентификации YouTube")
         else:
             self.logger.info("ℹ️ Cookies не найдены или невалидны, использую базовые параметры")
@@ -2568,51 +2529,43 @@ class AIOrchestrator:
                         "-o", out_path
                     ]
                     # Добавляем cookies если доступны
-                    if use_cookies and cookies_path:
+                    if cookies_path:
                         simple_cmd.extend(["--cookies", str(cookies_path)])  # type: ignore[arg-type]
 
                     simple_cmd.append(url)
-                    
-                    # Логируем команду в одну строку
-                    simple_cmd_str = " ".join(simple_cmd)
-                    self.logger.info(f"Третий метод: {simple_cmd_str}")
-                    result = subprocess.run(simple_cmd, check=True, capture_output=True, text=True, timeout=300)
-                    
-                    # Найти скачанный файл
+
+                    self.logger.info(f"Третий метод: {' '.join(simple_cmd)}")
+                    subprocess.run(simple_cmd, check=True, capture_output=True, text=True, timeout=300)
+
                     for fname in os.listdir(out_dir):
                         if fname.startswith("yt_video") and fname.endswith('.mp4'):
                             self.logger.info(f"✅ Видео успешно скачано третьим методом: {fname}")
                             return os.path.join(out_dir, fname)
-                            
+
                 except Exception as simple_e:
                     self.logger.error(f"❌ Третий метод также не сработал: {simple_e}")
-            
-            return ""
-    
+
+        return ""
+
     def check_vpn_status(self) -> bool:
-        """
-        Проверяет статус VPN соединения
-        """
+        """Проверяет, изменился ли IP-адрес (эмуляция проверки работы VPN)."""
         try:
-            import requests
-            # Пробуем получить IP адрес
             response = requests.get("https://ifconfig.me", timeout=10)
             if response.status_code == 200:
                 ip = response.text.strip()
                 self.logger.info(f"🌐 Текущий IP адрес: {ip}")
-                
-                # Проверяем, не из РФ ли IP
+
                 ru_ips = ["185.", "31.", "46.", "37.", "95.", "178.", "79.", "5.", "176.", "195."]
                 if any(ip.startswith(prefix) for prefix in ru_ips):
                     self.logger.warning("⚠️ IP адрес похож на российский. VPN может не работать корректно.")
                     return False
-                else:
-                    self.logger.info("✅ IP адрес не из РФ. VPN работает.")
-                    return True
-            else:
-                self.logger.warning(f"⚠️ Не удалось проверить IP: {response.status_code}")
-                return False
-                
+
+                self.logger.info("✅ IP адрес не из РФ. VPN работает.")
+                return True
+
+            self.logger.warning(f"⚠️ Не удалось проверить IP: {response.status_code}")
+            return False
+
         except Exception as e:
             self.logger.error(f"❌ Ошибка проверки VPN: {e}")
             return False
@@ -5173,7 +5126,7 @@ class AIOrchestrator:
             fixes.append(f"Не удалось распарсить даже после исправлений: {e2}")
 
         return None, fixes
-    def __init__(self, lm_studio_url: str = "http://localhost:1234", 
+    def __init__(self, lm_studio_url: str = DEFAULT_LM_STUDIO_URL, 
                  google_api_key: str = "", google_cse_id: str = ""):
         """
         Инициализация оркестратора
@@ -5197,7 +5150,7 @@ class AIOrchestrator:
         # unify logger usage for instance methods
         self.logger = logger
         self.conversation_history: List[Dict[str, Any]] = []
-        self.brain_model = LLAMA_CPP_MODEL_PATH if USE_LLAMA_CPP else "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
+        self.brain_model = LLAMA_CPP_MODEL_PATH
         self.brain_model_id = None  # Короткий ID модели для API вызовов
         self.use_separator = True  # По умолчанию True, чтобы убрать предупреждение Pylance
         self.use_image_generation = False  # По умолчанию отключена генерация изображений
@@ -5221,8 +5174,8 @@ class AIOrchestrator:
         self.last_generated_file_name = None
         
         # Динамическое управление контекстом
-        self.max_context_length = 262144  # Максимальный контекст (временно)
-        self.safe_context_length = 32768   # Безопасный контекст (временно)
+        self.max_context_length = DEFAULT_MAX_CONTEXT_LENGTH
+        self.safe_context_length = DEFAULT_SAFE_CONTEXT_LENGTH
         self.current_context_length = 0    # Текущий размер контекста
         
         # Метрики производительности
@@ -5230,7 +5183,7 @@ class AIOrchestrator:
         
         # Счетчик попыток для предотвращения зацикливания
         self.retry_count = 0
-        self.max_retries = 3
+        self.max_retries = DEFAULT_MAX_RETRIES
         
         # Постоянная голосовая запись
         self.continuous_recording = False
@@ -5239,7 +5192,7 @@ class AIOrchestrator:
         
         # Таймеры для автоматического выключения инструментов
         self.tool_timers = {}
-        self.auto_disable_delay = 300  # Выключать инструменты через 5 минут после использования
+        self.auto_disable_delay = AUTO_DISABLE_DELAY_SECONDS
         
         # Автоматически запускаем модель мозга при инициализации
         self._auto_load_brain_model()
@@ -5256,9 +5209,12 @@ class AIOrchestrator:
         # Инициализируем ChromaDB для векторного хранилища (ленивая инициализация)
         self.chromadb_manager = None
         self._chromadb_initialized = False
+        chroma_path = CHROMA_DB_PATH
+        if not os.path.isabs(chroma_path):
+            chroma_path = os.path.join(self.base_dir, os.path.normpath(chroma_path))
         self._chromadb_config = {
-            "db_path": os.path.join(self.base_dir, "chroma_db"),
-            "use_gpu": True
+            "db_path": chroma_path,
+            "use_gpu": CHROMADB_USE_GPU_BY_DEFAULT
         }
         
         # OCR будет инициализирован в фоне
@@ -5276,7 +5232,7 @@ class AIOrchestrator:
         self.plugin_manager = None
         if PLUGINS_AVAILABLE and PluginManager is not None:
             try:
-                self.plugin_manager = PluginManager(plugins_dir="plugins")
+                self.plugin_manager = PluginManager(plugins_dir=PLUGINS_DIR_NAME)
                 self.plugin_manager.load_all_plugins(orchestrator=self)
                 logger.info("✅ Система плагинов инициализирована")
             except Exception as e:
@@ -5716,11 +5672,11 @@ class AIOrchestrator:
                         doc.add_paragraph(paragraph_text.strip())
             
             # Создаем папку если не существует
-            os.makedirs(os.path.join(self.base_dir, "output"), exist_ok=True)
+            os.makedirs(os.path.join(self.base_dir, OUTPUT_DIR_NAME), exist_ok=True)
             
             # Сохраняем файл - убираем расширение если есть и добавляем .docx
             base_name = filename.replace('.docx', '').replace('.doc', '')
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.docx")
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.docx")
             doc.save(output_path)
             
             return f"Документ успешно создан: {output_path}"
@@ -5758,7 +5714,7 @@ class AIOrchestrator:
             
             # Сохраняем файл - убираем расширение если есть и добавляем .xlsx
             base_name = filename.replace('.xlsx', '').replace('.xls', '')
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.xlsx")
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.xlsx")
             df.to_excel(output_path, index=False)
             
             return f"Excel файл успешно создан: {output_path}"
@@ -5780,7 +5736,7 @@ class AIOrchestrator:
         try:
             # Сохраняем файл - убираем расширение если есть и добавляем .md
             base_name = filename.replace('.md', '').replace('.markdown', '')
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.md")
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.md")
             
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(content)
@@ -5807,8 +5763,8 @@ class AIOrchestrator:
             
             # Убираем расширение если есть и добавляем .pdf
             base_name = filename.replace('.pdf', '')
-            os.makedirs(os.path.join(self.base_dir, "output"), exist_ok=True)
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.pdf")
+            os.makedirs(os.path.join(self.base_dir, OUTPUT_DIR_NAME), exist_ok=True)
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.pdf")
             
             # Создаем PDF документ - импорт во время выполнения
             from reportlab.lib.pagesizes import A4  # type: ignore
@@ -5855,7 +5811,7 @@ class AIOrchestrator:
         try:
             # Убираем расширение если есть и добавляем .txt
             base_name = filename.replace('.txt', '')
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.txt")
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.txt")
             
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(content)
@@ -5879,7 +5835,7 @@ class AIOrchestrator:
         try:
             # Убираем расширение если есть и добавляем .json
             base_name = filename.replace('.json', '')
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.json")
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.json")
             
             # Проверяем валидность JSON
             import json
@@ -5911,7 +5867,7 @@ class AIOrchestrator:
         try:
             # Убираем расширение если есть и добавляем .csv
             base_name = filename.replace('.csv', '')
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.csv")
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.csv")
             
             with open(output_path, 'w', encoding='utf-8', newline='') as f:
                 f.write(content)
@@ -5935,7 +5891,7 @@ class AIOrchestrator:
         try:
             # Убираем расширение если есть и добавляем .html
             base_name = filename.replace('.html', '').replace('.htm', '')
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.html")
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.html")
             
             # Если контент не содержит HTML структуру, добавляем базовую
             if not content.strip().lower().startswith('<!doctype') and not content.strip().lower().startswith('<html'):
@@ -5973,7 +5929,7 @@ class AIOrchestrator:
         try:
             # Убираем расширение если есть и добавляем .xml
             base_name = filename.replace('.xml', '')
-            output_path = os.path.join(self.base_dir, "output", f"{base_name}.xml")
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, f"{base_name}.xml")
             
             # Если контент не содержит XML декларацию, добавляем
             if not content.strip().startswith('<?xml'):
@@ -6004,7 +5960,7 @@ class AIOrchestrator:
                 filename += '.bat'
             
             # Путь для сохранения в папку output
-            output_path = os.path.join(os.getcwd(), "output", filename)
+            output_path = os.path.join(os.getcwd(), OUTPUT_DIR_NAME, filename)
             
             # Убеждаемся что папка output существует
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -6111,7 +6067,7 @@ class AIOrchestrator:
         """
         try:
             # Создаем папку output если её нет
-            output_dir = os.path.join(self.base_dir, "output")
+            output_dir = os.path.join(self.base_dir, OUTPUT_DIR_NAME)
             os.makedirs(output_dir, exist_ok=True)
             
             format_lower = file_format.lower()
@@ -7601,7 +7557,7 @@ class AIOrchestrator:
             return follow_up
         
         # Определяем путь в папку output
-        output_path = os.path.join(self.base_dir, "output", filename)
+        output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, filename)
         
         try:
             success = self.generate_file(content, output_path, file_type)
@@ -9974,7 +9930,7 @@ def main():
     logger.info("="*50)
     
     # Настройки (можно вынести в конфиг файл)
-    LM_STUDIO_URL = "http://localhost:1234"  # URL вашего LM Studio сервера
+    LM_STUDIO_URL = DEFAULT_LM_STUDIO_URL  # URL вашего LM Studio сервера
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()  # Ваш Google API ключ
     GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "").strip()   # Ваш Google CSE ID
     
@@ -10095,7 +10051,7 @@ def test_startup_initialization():
     print("\n📦 Инициализация основного оркестратора...")
     start_time = time.time()
     
-    LM_STUDIO_URL = "http://localhost:1234"
+    LM_STUDIO_URL = DEFAULT_LM_STUDIO_URL
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
     GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "").strip()
     
