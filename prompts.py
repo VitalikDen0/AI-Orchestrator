@@ -42,6 +42,7 @@ class PromptLoader:
             "get_speech_help": "additional_modules.md",
             "get_workflow_help": "additional_modules.md",
             "get_strategy_help": "additional_modules.md",
+            "get_ui_automation_help": "ui_automation_module.md",
         }
         
         # Caches for loaded content

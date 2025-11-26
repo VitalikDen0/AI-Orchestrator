@@ -94,6 +94,7 @@ from resource_manager import (
     load_easyocr,
     load_torch,
 )
+from ui_automation_utils import get_ui_tree_as_text
 
 os.environ['CUDA_VISIBLE_DEVICES'] = GPU_CONFIG.get('cuda_visible_devices', '0')
 print(f"🎮 CUDA устройство: {os.environ.get('CUDA_VISIBLE_DEVICES', 'auto')}")
@@ -3795,6 +3796,32 @@ class AIOrchestrator:
             logger.error(f"❌ Ошибка при анализе изображения: {e}")
             return self.call_brain_model(f"❌ Ошибка при анализе изображения: {e}")
 
+    def _handle_inspect_ui(self, action_data: Dict[str, Any]) -> Union[bool, str]:
+        """
+        Обработчик для инспекции UI приложений
+        """
+        window_name = action_data.get("window_name", "")
+        max_depth = action_data.get("max_depth", 5)
+        description = action_data.get("description", f"Инспекция UI окна '{window_name}'")
+        
+        logger.info(f"\n🔍 ИНСПЕКЦИЯ UI: {description}")
+        logger.info(f"🪟 Окно: {window_name}")
+        
+        if not window_name:
+            # Если имя окна не указано, пробуем активное окно, но лучше предупредить
+            logger.warning("⚠️ Имя окна не указано, будет использовано активное окно")
+        
+        ui_tree = get_ui_tree_as_text(window_name, max_depth)
+        
+        # Ограничиваем размер вывода, чтобы не перегрузить контекст
+        if len(ui_tree) > 10000:
+            ui_tree = ui_tree[:10000] + "\n... (truncated)"
+            
+        logger.info(f"📋 Результат UI Tree (первые 500 символов):\n{ui_tree[:500]}...")
+        
+        follow_up = self.call_brain_model(f"Результат инспекции UI окна '{window_name}':\n\n{ui_tree}")
+        return follow_up
+
     def _handle_plugin_action(self, action: str, action_data: Dict[str, Any]) -> Union[bool, str]:
         """
         Обработчик для действий плагинов.
@@ -4346,6 +4373,8 @@ class AIOrchestrator:
                     handler_result = self._handle_extract_text(action_data)
                 elif action == "analyze_image":
                     handler_result = self._handle_analyze_image(action_data)
+                elif action == "inspect_ui":
+                    handler_result = self._handle_inspect_ui(action_data)
                 elif action == "response":
                     handler_result = self._handle_response(action_data)
                 elif action == "send_email":
