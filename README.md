@@ -377,8 +377,8 @@ p.s. **abliterated** по причине того, что она будет ме
 #### Stable Diffusion модель (аниме модели)
 
 - **novaAnime_v20**: [CivitAI](https://civitai.com/models/328365) (~4GB VRAM) (проблема с пальцами, SD 1.5)
-- **Альтернативная улучшенная**: [CivitAI](https://civitai.com/models/827184) (~8GB VRAM) (мой личный фаворит, очень нравится, SDXL)
-- **LoRA для улучшения**: [Hands XL + SD 1.5 + FLUX.1-dev + Pony + Illustrious](https://civitai.com/models/200255) (настройки: strength=1) (можно и без нее, результат вряд ли заметите, используйте еще LoRA на фикс пальцев)
+- **Альтернативная улучшенная**: [CivitAI](https://civitai.com/models/827184) (~8GB VRAM) (мой личный фаворит, очень нравится, IL модель)
+- **LoRA для улучшения**: [Hands XL + SD 1.5 + FLUX.1-dev + Pony + Illustrious](https://civitai.com/models/200255) (настройки: strength=1)
 
 <table>
   <tr>
