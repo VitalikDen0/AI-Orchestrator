@@ -207,3 +207,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+plugins/__pycache__/
+plugins/**/__pycache__/

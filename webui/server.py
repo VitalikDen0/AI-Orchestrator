@@ -4,7 +4,7 @@ import json
 import base64
 import time
 import logging
-from typing import Optional, Any
+from typing import Optional, Any, Type, cast
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,19 +12,50 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from fastapi.staticfiles import StaticFiles
 
-# Import orchestrator from 1.py
+# Импорт оркестратора из основного entry-файла (поддержка 1.py и main.py)
 import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ONE_PY = ROOT / "1.py"
 FRONTEND_DIST = ROOT / "webui" / "frontend" / "dist"
 
-spec = importlib.util.spec_from_file_location("one_module", str(ONE_PY))
+ENTRY_CANDIDATES = ("1.py", "main.py")
+ENTRY_PATH = None
+for candidate in ENTRY_CANDIDATES:
+    path = ROOT / candidate
+    if path.exists():
+        ENTRY_PATH = path
+        break
+
+if ENTRY_PATH is None:
+    raise FileNotFoundError(
+        "Не найден файл с классом AIOrchestrator (ожидались 1.py или main.py)."
+    )
+
+spec = importlib.util.spec_from_file_location("ai_orchestrator_entry", str(ENTRY_PATH))
 if spec is None or spec.loader is None:
-    raise RuntimeError("Failed to load 1.py module spec")
-one = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(one)  # type: ignore
+    raise RuntimeError(f"Не удалось загрузить модуль: {ENTRY_PATH.name}")
+
+ENTRY_MODULE = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ENTRY_MODULE)  # type: ignore
+
+_ai_class = getattr(ENTRY_MODULE, "AIOrchestrator", None)
+if _ai_class is None:
+    raise AttributeError(
+        f"Файл {ENTRY_PATH.name} не содержит класс AIOrchestrator"
+    )
+AI_ORCHESTRATOR_CLASS: Type[Any] = cast(Type[Any], _ai_class)
+
+IMAGE_TO_BASE64 = getattr(ENTRY_MODULE, "image_to_base64_balanced", None)
+if IMAGE_TO_BASE64 is None:
+    try:
+        from media_processing import image_to_base64_balanced as _default_image_to_base64
+        IMAGE_TO_BASE64 = _default_image_to_base64
+    except ImportError as import_error:
+        raise AttributeError(
+            f"Файл {ENTRY_PATH.name} не содержит функцию image_to_base64_balanced, "
+            "а импорт media_processing завершился ошибкой"
+        ) from import_error
 
 # Настройка логирования в файл
 log_file = ROOT / "ai_orchestrator.log"
@@ -98,7 +129,7 @@ def add_performance_metric(action: str, response_time: float, context_length: in
 @asynccontextmanager
 async def lifespan(app):
     global orchestrator
-    orchestrator = one.AIOrchestrator()
+    orchestrator = AI_ORCHESTRATOR_CLASS()
     # do not pop up windows in web mode
     if hasattr(orchestrator, 'show_images_locally'):
         orchestrator.show_images_locally = False
@@ -431,7 +462,7 @@ async def upload_photo(file: UploadFile = File(...), context: str = Form("")):
             f.write(await file.read())
         log(f"Photo uploaded: {file.filename}")
         
-        img_b64 = one.image_to_base64_balanced(out_path)
+        img_b64 = IMAGE_TO_BASE64(out_path)  # type: ignore[arg-type]
         if not img_b64:
             log(f"upload_photo: image_to_base64_balanced вернул пустую строку для {out_path}")
             raise HTTPException(status_code=400, detail="Ошибка кодирования изображения (base64 пустой)")
