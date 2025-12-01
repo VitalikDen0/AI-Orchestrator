@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Dict
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # GPU / аппаратная конфигурация
@@ -31,11 +32,10 @@ GPU_CONFIG: Dict[str, Any] = {
 # Если False — используем LM Studio HTTP API, а не локальную сборку llama.cpp
 USE_LLAMA_CPP: bool = True
 
-# Полный путь к GGUF-файлу модели. Перенесите в отдельный диск/каталог, если нужно.
-LLAMA_CPP_MODEL_PATH: str = (
-    "J:/models-LM Studio/mradermacher/"
-    "Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/"
-    "Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
+# Путь к GGUF-файлу модели в локальной папке проекта (models/).
+BASE_DIR = Path(__file__).resolve().parent
+LLAMA_CPP_MODEL_PATH: str = str(
+    BASE_DIR / "models" / "nvidia_Orchestrator-8B-Q4_K_M.gguf"
 )
 
 # Базовый тип квантизации KV-кэша, пока не проверили доступные форматы у llama_cpp.

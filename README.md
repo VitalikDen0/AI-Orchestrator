@@ -164,9 +164,9 @@
 
 - Отслеживание `usage.total_tokens` из ответа LM Studio
 - Три уровня обрезки истории:
-    - Агрессивная: обрезка до последних 2 сообщений при превышении `max_context`
-    - Средняя: обрезка до последних 5 при достижении `safe_context`
-    - Мягкая: обрезка до последних 10 при 80% от `safe_context`
+- Агрессивная: обрезка до последних 2 сообщений при превышении `max_context`
+- Средняя: обрезка до последних 5 при достижении `safe_context`
+- Мягкая: обрезка до последних 10 при 80% от `safe_context`
 - Оценка `safe_context` (80% от `max_context`) и адаптивная пересборка
 - Логирование состояния контекста на каждом шаге
 
@@ -361,6 +361,11 @@ pip install -r requirements.txt
 - Требования: ~4GB VRAM
 p.s. **abliterated** по причине того, что она будет меньше отказывать в действиях
 
+- Так же мною в тестирование взята случайно найденная новинка ввиде Orchestrator-8B от Nvidia, должна быть гораздо лучше обычной модели.
+- **[Orchestrator-8B](https://huggingface.co/nvidia/Orchestrator-8B)**
+- GGUF версию найдете на: **[тык](https://huggingface.co/bartowski/nvidia_Orchestrator-8B-GGUF)** (Использовал Q4_K_M)
+- Требования: ~6GB VRAM
+
 #### Audio модель
 
 - **[whisper-large-v3-q8_0](https://huggingface.co/vonjack/whisper-large-v3-gguf)** (Использовал Q8)
@@ -413,11 +418,7 @@ STABLE_DIFFUSION_MODEL_PATH=J:\ComfyUI\models\checkpoints\novaAnime_v20.safetens
 
 ### 3. Настройка путей в коде
 
-Обновите пути к моделям в файле `1.py`:
-
-```python
-self.brain_model = "путь_к_вашей_qwen_модели.gguf"
-```
+Обновите пути к моделям в файле `config.py`
 
 Создайте структуру папок:
 
@@ -449,20 +450,20 @@ self.brain_model = "путь_к_вашей_qwen_модели.gguf"
 ### Консольный режим
 
 ```bash
-python 1.py
+python main.py
 ```
 
 ### Веб-интерфейс
 
 ```bash
-python 1.py --web
+python main.py --web
 ```
 Затем откройте http://127.0.0.1:8001/
 
 ### Тест на инициализацию
 
 ```bash
-python 1.py --test-startup
+python main.py --test-startup
 ```
 
 ### Telegram бот
