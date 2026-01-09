@@ -211,3 +211,6 @@ marimo/_lsp/
 __marimo__/
 plugins/__pycache__/
 plugins/**/__pycache__/
+
+# Beta outputs (оставляем папку beta в репозитории)
+beta/output/
