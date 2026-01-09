@@ -120,6 +120,11 @@ CHROMADB_DEFAULT_COLLECTION_METADATA: Dict[str, Any] = {
     "hnsw:space": "cosine",
 }
 
+# Флаг включения сохранения диалогов в ChromaDB
+CHROMADB_ENABLE_MEMORY: bool = False
+# Сколько дней хранить записи по умолчанию при очистке
+CHROMADB_CLEANUP_DEFAULT_DAYS: int = 30
+
 # Коллекция, которую использует вспомогательная функция load_chromadb.
 CHROMADB_BACKGROUND_COLLECTION_NAME: str = "ai_memories"
 
@@ -188,6 +193,8 @@ __all__ = [
     "CHROMADB_BACKGROUND_COLLECTION_NAME",
     "CHROMADB_EMBEDDING_MODEL",
     "CHROMADB_USE_GPU_BY_DEFAULT",
+    "CHROMADB_ENABLE_MEMORY",
+    "CHROMADB_CLEANUP_DEFAULT_DAYS",
     "DEFAULT_MAX_CONTEXT_LENGTH",
     "DEFAULT_SAFE_CONTEXT_LENGTH",
     "DEFAULT_MAX_RETRIES",

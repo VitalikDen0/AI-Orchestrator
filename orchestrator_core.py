@@ -30,6 +30,7 @@ from config import (
     CHROMADB_BACKGROUND_COLLECTION_NAME,
     CHROMADB_EMBEDDING_MODEL,
     CHROMADB_USE_GPU_BY_DEFAULT,
+    CHROMADB_ENABLE_MEMORY,
     DEFAULT_MAX_CONTEXT_LENGTH,
     DEFAULT_SAFE_CONTEXT_LENGTH,
     DEFAULT_MAX_RETRIES,
@@ -3618,23 +3619,37 @@ class AIOrchestrator:
         """
         content = action_data.get("content", "")
         filename = action_data.get("filename", "")
+        file_path_param = action_data.get("file_path") or action_data.get("path") or ""
         file_type = action_data.get("file_type", "").lower()
-        description = action_data.get("description", f"Генерация файла {filename}")
+        description = action_data.get("description", f"Генерация файла {filename or file_path_param}")
         
         logger.info(f"\n📝 ГЕНЕРАЦИЯ ФАЙЛА: {description}")
         logger.info(f"📁 Имя файла: {filename}")
+        if file_path_param:
+            logger.info(f"📂 Путь из JSON: {file_path_param}")
         logger.info(f"📄 Тип файла: {file_type}")
         
         if not content:
             follow_up = self.call_brain_model("Ошибка: не указано содержимое для генерации файла")
             return follow_up
         
+        output_path = None
         if not filename:
-            follow_up = self.call_brain_model("Ошибка: не указано имя файла")
-            return follow_up
-        
-        # Определяем путь в папку output
-        output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, filename)
+            if file_path_param:
+                normalized_path = os.path.expanduser(file_path_param)
+                filename = os.path.basename(normalized_path) or ""
+                logger.info(f"🔄 Использую имя из пути: {filename}")
+                if os.path.isabs(normalized_path):
+                    output_path = normalized_path
+                else:
+                    output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, file_path_param)
+            if not filename:
+                follow_up = self.call_brain_model("Ошибка: не указано имя файла")
+                return follow_up
+        if output_path is None:
+            output_path = os.path.join(self.base_dir, OUTPUT_DIR_NAME, filename)
+        output_path = os.path.expanduser(output_path)
+        logger.info(f"🛣️ Путь сохранения: {output_path}")
         
         try:
             success = self.generate_file(content, output_path, file_type)
@@ -5738,6 +5753,9 @@ class AIOrchestrator:
             True если успешно добавлено
         """
         self._ensure_chromadb_initialized()
+        if not CHROMADB_ENABLE_MEMORY:
+            logger.debug("ChromaDB memory storage is disabled by configuration")
+            return False
         if self.chromadb_manager is None:
             logger.error("❌ ChromaDB недоступен")
             return False
@@ -5758,10 +5776,13 @@ class AIOrchestrator:
             preference_text: Текст предпочтения
             category: Категория предпочтения
             metadata: Дополнительные метаданные
-            
+        
         Returns:
             True если успешно добавлено
         """
+        if not CHROMADB_ENABLE_MEMORY:
+            logger.debug("ChromaDB memory storage is disabled, skipping preference save")
+            return False
         self._ensure_chromadb_initialized()
         if self.chromadb_manager is None:
             logger.error("❌ ChromaDB недоступен")
