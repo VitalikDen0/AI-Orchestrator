@@ -1,3 +1,9 @@
+![Python](https://img.shields.io/badge/python-3.10+-blue?logo=python) ![License](https://img.shields.io/badge/license-Dual%20NCAL-brightgreen) ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078d4?logo=windows) ![Status](https://img.shields.io/badge/status-Active-success) ![FastAPI](https://img.shields.io/badge/FastAPI-v0.100+-009485) ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?logo=pytorch) ![ChromaDB](https://img.shields.io/badge/ChromaDB-vector%20DB-FF6B6B)
+
+**[🇷🇺 Русский](README.md) | [🇬🇧 English](README.en.md)**
+
+
+
 # AI Orchestrator
 
 **Интеллектуальный мультимодальный AI-помощник с системной интеграцией**
