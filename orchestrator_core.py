@@ -1109,7 +1109,7 @@ class AIOrchestrator:
             transcript = result.stdout.strip() if result.stdout else ""
             if transcript:
                 self.logger.info("\n=== ТРАНСКРИПТ АУДИО ===\n" + transcript)
-                return transcript
+                return self._wrap_info_if_needed(transcript, source="audio")
             
             # Очистка временных файлов если был separator
             if use_separator and 'separated' in audio_for_whisper:
@@ -1469,6 +1469,49 @@ class AIOrchestrator:
         # Загружаем базовый системный промпт из файла
         self.system_prompt = self.prompt_loader.load_base_prompt()
 
+    # ------------------------------------------------------------------
+    # Вспомогательные утилиты для безопасной передачи данных в модель
+    # ------------------------------------------------------------------
+    def _wrap_info_block(self, content: str, source: str = "") -> str:
+        """Оборачивает произвольный текст в тег <INFO> для защиты от jailbreak.
+
+        Args:
+            content: Текст, который нужно передать в модель.
+            source:  Необязательный маркер источника (file/audio/video).
+        """
+        if content is None:
+            content = ""
+        source_clean = re.sub(r"[^a-zA-Z0-9_-]+", "", source or "")
+        source_attr = f" source=\"{source_clean}\"" if source_clean else ""
+        return f"<INFO{source_attr}>\n{content}\n</INFO>"
+
+    def _wrap_info_if_needed(self, content: str, source: str = "") -> str:
+        """Оборачивает текст в <INFO>, если он ещё не обёрнут."""
+        if not content:
+            return content
+        if "<INFO" in content:
+            return content
+        return self._wrap_info_block(content, source)
+
+    def _strip_info_tags(self, content: str, highlight: bool = True) -> str:
+        """Удаляет <INFO> теги из финального ответа и подсвечивает содержимое.
+
+        По умолчанию подсвечивает ANSI-жёлтым. Если терминал не поддерживает ANSI,
+        текст останется без цвета, но теги всё равно будут убраны.
+        """
+        if not content:
+            return content
+
+        def _repl(match: re.Match) -> str:
+            inner = match.group(1).strip()
+            if not inner:
+                return ""
+            if not highlight:
+                return inner
+            return f"\033[43m{inner}\033[0m"
+
+        return re.sub(r"<INFO[^>]*>(.*?)</INFO>", _repl, content, flags=re.IGNORECASE | re.DOTALL)
+
     def list_folder_contents(self, folder_name: str) -> str:
         """
         Получение списка файлов в указанной папке
@@ -1739,7 +1782,8 @@ class AIOrchestrator:
                 
                 # RAG обработка для больших документов
                 processed_content = self.rag_process_large_content(content)
-                return f"Содержимое DOCX документа:\n\n{processed_content}"
+                wrapped = self._wrap_info_if_needed(processed_content, source="docx")
+                return f"Содержимое DOCX документа:\n\n{wrapped}"
                 
             elif file_lower.endswith(('.xlsx', '.xls')):
                 content, error = self.extract_excel_content(file_path)
@@ -1748,7 +1792,8 @@ class AIOrchestrator:
                 
                 # RAG обработка для больших таблиц
                 processed_content = self.rag_process_large_content(content)
-                return f"Содержимое Excel файла:\n\n{processed_content}"
+                wrapped = self._wrap_info_if_needed(processed_content, source="excel")
+                return f"Содержимое Excel файла:\n\n{wrapped}"
                 
             elif file_lower.endswith('.pdf'):
                 content, error = self.extract_pdf_content(file_path)
@@ -1757,7 +1802,8 @@ class AIOrchestrator:
                 
                 # RAG обработка для больших PDF документов
                 processed_content = self.rag_process_large_content(content)
-                return f"Содержимое PDF документа:\n\n{processed_content}"
+                wrapped = self._wrap_info_if_needed(processed_content, source="pdf")
+                return f"Содержимое PDF документа:\n\n{wrapped}"
                 
             elif file_lower.endswith('.csv'):
                 # Для CSV используем pandas
@@ -1766,7 +1812,8 @@ class AIOrchestrator:
                     df = pd.read_csv(file_path)
                     content = df.to_string(index=False)
                     processed_content = self.rag_process_large_content(content)
-                    return f"Содержимое CSV файла:\n\n{processed_content}"
+                    wrapped = self._wrap_info_if_needed(processed_content, source="csv")
+                    return f"Содержимое CSV файла:\n\n{wrapped}"
                 except Exception as e:
                     return f"Ошибка при чтении CSV: {str(e)}"
                     
@@ -1776,8 +1823,9 @@ class AIOrchestrator:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read()
                     processed_content = self.rag_process_large_content(content)
+                    wrapped = self._wrap_info_if_needed(processed_content, source="text")
                     file_type = "Markdown" if file_lower.endswith('.md') else "текстового"
-                    return f"Содержимое {file_type} файла:\n\n{processed_content}"
+                    return f"Содержимое {file_type} файла:\n\n{wrapped}"
                 except UnicodeDecodeError:
                     # Попробуем другие кодировки
                     for encoding in ['cp1251', 'latin1']:
@@ -1785,7 +1833,8 @@ class AIOrchestrator:
                             with open(file_path, 'r', encoding=encoding) as f:
                                 content = f.read()
                             processed_content = self.rag_process_large_content(content)
-                            return f"Содержимое текстового файла (кодировка {encoding}):\n\n{processed_content}"
+                            wrapped = self._wrap_info_if_needed(processed_content, source="text")
+                            return f"Содержимое текстового файла (кодировка {encoding}):\n\n{wrapped}"
                         except:
                             continue
                     return f"Ошибка: не удалось определить кодировку файла {file_path}"
@@ -1804,7 +1853,8 @@ class AIOrchestrator:
                     content = re.sub(r'[{}]', '', content)  # Убираем фигурные скобки
                     content = content.strip()
                     processed_content = self.rag_process_large_content(content)
-                    return f"Содержимое RTF файла:\n\n{processed_content}"
+                    wrapped = self._wrap_info_if_needed(processed_content, source="rtf")
+                    return f"Содержимое RTF файла:\n\n{wrapped}"
                 except Exception as e:
                     return f"Ошибка при обработке RTF: {str(e)}"
                     
@@ -1816,7 +1866,8 @@ class AIOrchestrator:
                     # Преобразуем JSON в читаемый формат
                     content = json.dumps(data, indent=2, ensure_ascii=False)
                     processed_content = self.rag_process_large_content(content)
-                    return f"Содержимое JSON файла:\n\n{processed_content}"
+                    wrapped = self._wrap_info_if_needed(processed_content, source="json")
+                    return f"Содержимое JSON файла:\n\n{wrapped}"
                 except json.JSONDecodeError as e:
                     return f"Ошибка в формате JSON: {str(e)}"
                 except Exception as e:
@@ -1845,8 +1896,9 @@ class AIOrchestrator:
                             content = re.sub('<[^<]+?>', '', content)
                     
                     processed_content = self.rag_process_large_content(content)
+                    wrapped = self._wrap_info_if_needed(processed_content, source="html" if file_lower.endswith(('.html', '.htm')) else "xml")
                     file_type = "HTML" if file_lower.endswith(('.html', '.htm')) else "XML"
-                    return f"Содержимое {file_type} файла:\n\n{processed_content}"
+                    return f"Содержимое {file_type} файла:\n\n{wrapped}"
                 except Exception as e:
                     return f"Ошибка при обработке XML/HTML: {str(e)}"
                     
@@ -2780,7 +2832,8 @@ class AIOrchestrator:
                         vision_desc = self.call_vision_model(screenshot_b64)
                     
                     # Формируем запрос для мозга
-                    brain_input = f"[Скриншот экрана]: {vision_desc}\n\nГолосовая команда: {transcript}"
+                    safe_transcript = self._wrap_info_if_needed(transcript, source="audio")
+                    brain_input = f"[Скриншот экрана]: {vision_desc}\n\nГолосовая команда: {safe_transcript}"
                     
                     # Отправляем в мозг
                     ai_response = self.call_brain_model(brain_input)
@@ -3542,10 +3595,12 @@ class AIOrchestrator:
 
     def _handle_response(self, action_data: Dict[str, Any]) -> Union[bool, str]:
         # Поддерживаем и "text" и "content" для совместимости
-        content = action_data.get("text", action_data.get("content", ""))
-        self.last_final_response = content
+        raw_content = action_data.get("text", action_data.get("content", ""))
+        # Удаляем служебные <INFO> теги перед выводом пользователю и подсвечиваем содержимое
+        display_content = self._strip_info_tags(raw_content, highlight=True)
+        self.last_final_response = display_content
         logger.info(f"\n🤖 ФИНАЛЬНЫЙ ОТВЕТ:")
-        logger.info(content)
+        logger.info(display_content)
         
         # Если есть сгенерированный файл, уведомляем об этом в интерактивном режиме
         if (hasattr(self, 'last_generated_file_path') and self.last_generated_file_path and 
@@ -3722,7 +3777,8 @@ class AIOrchestrator:
         )
         
         if extracted_text:
-            result_text = f"Извлеченный текст из изображения '{image_path}':{extracted_text}"
+            wrapped_text = self._wrap_info_if_needed(extracted_text, source="image_ocr")
+            result_text = f"Извлеченный текст из изображения '{image_path}':\n{wrapped_text}"
         elif ocr_error:
             result_text = f"Ошибка при обработке изображения '{image_path}':\n\n{ocr_error}\n\nОписание изображения (если доступно):\n{vision_description}"
         else:
@@ -4872,9 +4928,11 @@ class AIOrchestrator:
                         brain_input = ""
                         brain_input += user_input_no_url
                         if vision_frames_desc:
-                            brain_input += f"\n[Покадровое описание видео]:\n{vision_frames_desc}"
+                            wrapped_frames = self._wrap_info_if_needed(vision_frames_desc, source="video_frames")
+                            brain_input += f"\n[Покадровое описание видео]:\n{wrapped_frames}"
                         if audio_text:
-                            brain_input += f"\n[Текст из аудио]:\n{audio_text}"
+                            wrapped_audio = self._wrap_info_if_needed(audio_text, source="audio")
+                            brain_input += f"\n[Текст из аудио]:\n{wrapped_audio}"
                         # Отправляем в мозг и обрабатываем ответ
                         ai_response = self.call_brain_model(brain_input)
                         # Показываем информацию о контексте
@@ -4893,7 +4951,8 @@ class AIOrchestrator:
                     if vision_desc:
                         brain_input += f"[Описание изображения]:\n{vision_desc}\n"
                     if audio_text:
-                        brain_input += f"[Текст из аудио]:\n{audio_text}\n"
+                        wrapped_audio = self._wrap_info_if_needed(audio_text, source="audio")
+                        brain_input += f"[Текст из аудио]:\n{wrapped_audio}\n"
                     brain_input += user_input
 
                     logger.info(f"🧠 Формирую запрос к модели (длина {len(brain_input)} символов)")

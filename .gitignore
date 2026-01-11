@@ -212,5 +212,9 @@ __marimo__/
 plugins/__pycache__/
 plugins/**/__pycache__/
 
+# Тесты (директорию игнорируем, но оставляем README)
+tests/
+!tests/README.md
+
 # Beta outputs (оставляем папку beta в репозитории)
 beta/output/
