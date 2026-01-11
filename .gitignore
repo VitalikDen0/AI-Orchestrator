@@ -218,3 +218,6 @@ tests/
 
 # Beta outputs (оставляем папку beta в репозитории)
 beta/output/
+
+# Локальные бинарники/артефакты (whisper.cpp и пр.)
+Release/
