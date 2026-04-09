@@ -180,6 +180,7 @@ def drag_and_drop(x1: int, y1: int, x2: int, y2: int) -> Dict[str, Any]:
         if not PYAUTOGUI_AVAILABLE:
             return {"success": False, "error": "pyautogui не установлен"}
             
+        pyautogui.moveTo(x1, y1, duration=0.2)  # type: ignore
         pyautogui.dragTo(x2, y2, duration=0.5, button='left')  # type: ignore
         return {"success": True, "message": f"Перетаскивание из ({x1}, {y1}) в ({x2}, {y2})"}
     except Exception as e:

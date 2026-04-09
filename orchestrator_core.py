@@ -2776,22 +2776,38 @@ class AIOrchestrator:
     # Mouse/Keyboard methods moved to automation.py
     # move_mouse, left_click, right_click, scroll, mouse_down, mouse_up, drag_and_drop, type_text
 
-    def start_continuous_recording(self):
-        """Запуск постоянной голосовой записи"""
+    def start_continuous_recording(self) -> bool:
+        """Запуск постоянной голосовой записи."""
         if self.continuous_recording:
-            return
-        
-        self.continuous_recording = True
-        self.recording_thread = threading.Thread(target=self._continuous_recording_worker, daemon=True)
-        self.recording_thread.start()
-        logger.info("Постоянная голосовая запись запущена")
+            logger.info("Постоянная голосовая запись уже активна")
+            return True
 
-    def stop_continuous_recording(self):
-        """Остановка постоянной голосовой записи"""
-        self.continuous_recording = False
-        if self.recording_thread:
-            self.recording_thread.join(timeout=2)
-        logger.info("Постоянная голосовая запись остановлена")
+        try:
+            self.continuous_recording = True
+            self.recording_thread = threading.Thread(target=self._continuous_recording_worker, daemon=True)
+            self.recording_thread.start()
+            logger.info("Постоянная голосовая запись запущена")
+            return True
+        except Exception as e:
+            self.continuous_recording = False
+            logger.error(f"Ошибка запуска постоянной голосовой записи: {e}")
+            return False
+
+    def stop_continuous_recording(self) -> bool:
+        """Остановка постоянной голосовой записи."""
+        try:
+            if not self.continuous_recording:
+                logger.info("Постоянная голосовая запись уже остановлена")
+                return True
+
+            self.continuous_recording = False
+            if self.recording_thread:
+                self.recording_thread.join(timeout=2)
+            logger.info("Постоянная голосовая запись остановлена")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка остановки постоянной голосовой записи: {e}")
+            return False
 
     def _continuous_recording_worker(self):
         """Воркер для постоянной голосовой записи (заглушка - нужна реализация через веб-интерфейс)"""
@@ -2807,21 +2823,41 @@ class AIOrchestrator:
             except Exception as e:
                 logger.error(f"Ошибка в continuous recording worker: {e}")
 
-    def _process_audio_chunk(self, audio_data: bytes):
-        """Обработка чанка аудио из постоянной записи"""
+    def _process_audio_chunk(self, audio_source: Union[bytes, str], lang: str = "ru", cleanup_source: bool = False) -> Optional[Dict[str, Any]]:
+        """Обработка чанка аудио из постоянной записи или веб-API.
+
+        Поддерживает как байты аудио, так и путь к уже сохраненному временному файлу.
+        """
+        temp_file: Optional[str] = None
+        source_path: Optional[str] = None
         try:
-            # Сохраняем чанк во временный файл
-            temp_dir = os.path.join(os.path.dirname(__file__), "temp_audio")
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_file = os.path.join(temp_dir, f"chunk_{int(time.time())}.wav")
-            
-            with open(temp_file, 'wb') as f:
-                f.write(audio_data)
+            if isinstance(audio_source, (bytes, bytearray)):
+                temp_dir = os.path.join(os.path.dirname(__file__), "temp_audio")
+                os.makedirs(temp_dir, exist_ok=True)
+                temp_file = os.path.join(temp_dir, f"chunk_{int(time.time())}.wav")
+                with open(temp_file, 'wb') as f:
+                    f.write(audio_source)
+                source_path = temp_file
+            elif isinstance(audio_source, str):
+                source_path = audio_source
+            else:
+                logger.error("Неподдерживаемый тип аудио для _process_audio_chunk")
+                return None
+
+            if not source_path or not os.path.exists(source_path):
+                logger.error(f"Аудиоисточник не найден: {source_path}")
+                return None
             
             # Распознаём аудио
-            transcript = self.transcribe_audio_whisper(temp_file, use_separator=False)
+            transcript = self.transcribe_audio_whisper(source_path, lang=lang, use_separator=False)
             
             if transcript and not transcript.startswith("[Whisper error]"):
+                result_payload: Dict[str, Any] = {
+                    "text": transcript,
+                    "continue": False,
+                    "response": ""
+                }
+
                 # Проверяем, содержит ли текст команду или имя "Алиса"
                 if self._is_valid_command(transcript):
                     logger.info(f"Получена команда из голоса: {transcript}")
@@ -2837,19 +2873,34 @@ class AIOrchestrator:
                     
                     # Отправляем в мозг
                     ai_response = self.call_brain_model(brain_input)
-                    self.process_ai_response(ai_response)
+                    continue_dialog = self.process_ai_response(ai_response)
+                    result_payload["continue"] = continue_dialog
+                    result_payload["response"] = getattr(self, 'last_final_response', '')
+                    return result_payload
                 else:
                     # Игнорируем бессмысленные фразы
-                    pass
-            
-            # Удаляем временный файл
-            try:
-                os.remove(temp_file)
-            except Exception:
-                pass
+                    result_payload["response"] = transcript
+                    return result_payload
+
+            logger.warning("Не удалось получить валидную транскрипцию аудиочанка")
+            return None
                 
         except Exception as e:
             logger.error(f"Ошибка обработки аудиочанка: {e}")
+            return None
+        finally:
+            cleanup_targets = []
+            if temp_file:
+                cleanup_targets.append(temp_file)
+            if cleanup_source and isinstance(audio_source, str):
+                cleanup_targets.append(audio_source)
+
+            for cleanup_target in cleanup_targets:
+                try:
+                    if cleanup_target and os.path.exists(cleanup_target):
+                        os.remove(cleanup_target)
+                except Exception as cleanup_error:
+                    logger.debug(f"Не удалось удалить временный аудиофайл {cleanup_target}: {cleanup_error}")
 
     def _is_valid_command(self, text: str) -> bool:
         """Всегда возвращает True — фильтрация отключена, все команды проходят к нейросети"""

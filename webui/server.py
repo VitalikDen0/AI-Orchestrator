@@ -387,8 +387,8 @@ def get_continuous_recording_status():
     try:
         if orchestrator is None:
             raise HTTPException(status_code=500, detail="Orchestrator not initialized")
-        if hasattr(orchestrator, 'continuous_recording_active'):
-            return {"active": getattr(orchestrator, 'continuous_recording_active', False)}
+        if hasattr(orchestrator, 'continuous_recording'):
+            return {"active": getattr(orchestrator, 'continuous_recording', False)}
         else:
             return {"active": False, "message": "Непрерывная запись не поддерживается"}
     except Exception as e:
@@ -526,7 +526,7 @@ async def upload_audio(file: UploadFile = File(...), context: str = Form(""), us
         if continuous:
             log(f"Continuous audio chunk uploaded: {file.filename}")
             if hasattr(orchestrator, '_process_audio_chunk'):
-                result = await orchestrator._process_audio_chunk(out_path, lang=lang)
+                result = orchestrator._process_audio_chunk(out_path, lang=lang, cleanup_source=True)
                 if result:
                     log(f"Continuous audio processed: {result['text'][:50]}...")
                     add_history("continuous", f"chunk | {result['text'][:80]}", result.get('response', ''))

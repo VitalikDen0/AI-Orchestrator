@@ -14,6 +14,7 @@ from typing import Dict, Any
 # Import configuration
 from config import (
     DEFAULT_LM_STUDIO_URL,
+    LLAMA_CPP_MODEL_PATH,
 )
 
 # Import core orchestrator
@@ -34,6 +35,29 @@ from resource_manager import get_background_loader
 from logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_brain_model_path() -> str:
+    """Возвращает путь к модели мозга с приоритетом .env -> config.py."""
+    env_model_path = os.getenv("BRAIN_MODEL_PATH", "").strip()
+    if env_model_path:
+        return env_model_path
+    return LLAMA_CPP_MODEL_PATH
+
+
+def _cleanup_plugins(orchestrator: "AIOrchestrator") -> None:
+    """Аккуратно выгружает плагины при завершении приложения."""
+    try:
+        plugin_manager = getattr(orchestrator, 'plugin_manager', None)
+        if not plugin_manager:
+            return
+
+        loaded_plugins = getattr(plugin_manager, 'loaded_plugins', {})
+        for plugin_name in list(loaded_plugins.keys()):
+            plugin_manager.unload_plugin(plugin_name)
+        logger.info("🔌 Плагины очищены")
+    except Exception as e:
+        logger.error(f"Ошибка очистки плагинов: {e}")
 
 def test_startup_initialization():
     """Тестирует инициализацию всех компонентов системы"""
@@ -128,7 +152,7 @@ def test_startup_initialization():
     start_time = time.time()
     
     try:
-        brain_model = "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
+        brain_model = _resolve_brain_model_path()
         orchestrator.brain_model = brain_model
         
         # Проверяем доступность LM Studio
@@ -262,7 +286,7 @@ def main():
     use_ocr = False              # Включается автоматически при извлечении текста из изображений
 
     # Мозг по умолчанию - используем указанную вами модель
-    brain_model = "J:/models-LM Studio/mradermacher/Huihui-Qwen3-4B-Thinking-2507-abliterated-GGUF/Huihui-Qwen3-4B-Thinking-2507-abliterated.Q4_K_S.gguf"
+    brain_model = _resolve_brain_model_path()
     logger.info(f"🧠 Используется модель мозга: {os.path.basename(brain_model)}")
     logger.info("🔧 Инструменты будут автоматически включаться по требованию для экономии ресурсов")
 
@@ -326,19 +350,11 @@ def main():
                 # В веб-режиме логируем тихо
                 logger.debug(f"Telegram bot error: {e}")
     
-    def __del__(self):
-        """Деструктор для очистки ресурсов плагинов"""
-        try:
-            if hasattr(self, 'plugin_manager') and self.plugin_manager:
-                # Выгружаем все плагины
-                for plugin_name in list(self.plugin_manager.loaded_plugins.keys()):
-                    self.plugin_manager.unload_plugin(plugin_name)
-                logger.info("🔌 Плагины очищены")
-        except Exception as e:
-            logger.error(f"Ошибка очистки плагинов: {e}")
-    
     # Запускаем интерактивный режим
-    orchestrator.run_interactive()
+    try:
+        orchestrator.run_interactive()
+    finally:
+        _cleanup_plugins(orchestrator)
 
 if __name__ == "__main__":
     main()

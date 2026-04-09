@@ -87,7 +87,11 @@ class EmailManager:
                           {'provider_name': {'email':..., 'app_password':..., 'smtp_server':..., ...}}
         """
         self.email_config = email_config
-        self.available_providers = list(email_config.keys())
+        self.available_providers = [
+            provider
+            for provider, config in email_config.items()
+            if config.get('email') and config.get('app_password')
+        ]
         
         if self.available_providers:
             logger.info(f"📧 Почтовая система инициализирована. Доступные провайдеры: {', '.join(self.available_providers)}")
